@@ -46,11 +46,9 @@ func run() error {
 	region := fs.String("region", "", "AWS region (defaults to AWS_REGION env)")
 	resumeKey := fs.String("resume", "", "S3 URI for checkpoint file")
 	maxWorkers := fs.Int("workers", 10, "Maximum number of concurrent workers")
-	readAheadParts := fs.Int("read-ahead", 5, "Number of S3 parts to read ahead")
 	batchSize := fs.Int("batch", 25, "Batch size for DynamoDB writes (max 25)")
 	reportS3URI := fs.String("report", "", "S3 URI for the final report")
 	dryRun := fs.Bool("dry-run", false, "Validate configuration without restoring")
-	manageCapacity := fs.Bool("manage-capacity", false, "Automatically manage table capacity")
 	shutdownTimeout := fs.Duration("shutdown-timeout", 5*time.Minute, "Graceful shutdown timeout")
 
 	// Parse flags as specified in section 7
@@ -67,11 +65,9 @@ func run() error {
 		Region:          *region,
 		ResumeKey:       *resumeKey,
 		MaxWorkers:      *maxWorkers,
-		ReadAheadParts:  *readAheadParts,
 		BatchSize:       *batchSize,
 		ReportS3URI:     *reportS3URI,
 		DryRun:          *dryRun,
-		ManageCapacity:  *manageCapacity,
 		ShutdownTimeout: *shutdownTimeout,
 	}
 

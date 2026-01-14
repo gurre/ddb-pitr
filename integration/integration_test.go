@@ -35,7 +35,6 @@ func TestFullIntegrationFlow(t *testing.T) {
 		ViewType:        "NEW",
 		Region:          "us-west-2",
 		MaxWorkers:      1,
-		ReadAheadParts:  2,
 		BatchSize:       25,
 		ShutdownTimeout: 5 * time.Second,
 	}
@@ -122,7 +121,6 @@ func TestEndToEndWithCoordinator(t *testing.T) {
 		ViewType:        "NEW",
 		Region:          "us-west-2",
 		MaxWorkers:      1,
-		ReadAheadParts:  2,
 		BatchSize:       25,
 		ShutdownTimeout: 1 * time.Second,
 		DryRun:          true,

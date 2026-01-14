@@ -108,7 +108,6 @@ func TestCoordinatorHappyPath(t *testing.T) {
 		ViewType:        "NEW",
 		Region:          "us-west-2",
 		MaxWorkers:      1,
-		ReadAheadParts:  1,
 		BatchSize:       10,
 		ShutdownTimeout: time.Second,
 	}

@@ -20,13 +20,11 @@ type Config struct {
 	ViewType        string        // "NEW"|"NEW_AND_OLD" - matches DynamoDB view types
 	Region          string        // AWS region for the operation
 	ResumeKey       string        // S3 URI for checkpoint file (s3://bucket/key)
-	MaxWorkers      int           // Maximum number of concurrent workers
-	ReadAheadParts  int           // Number of S3 parts to read ahead
-	BatchSize       int           // Batch size for DynamoDB writes (≤25)
 	ReportS3URI     string        // S3 URI for the final report
-	DryRun          bool          // If true, don't actually write to DynamoDB
-	ManageCapacity  bool          // If true, manage table capacity
 	ShutdownTimeout time.Duration // Graceful shutdown timeout
+	MaxWorkers      int           // Maximum number of concurrent workers
+	BatchSize       int           // Batch size for DynamoDB writes (≤25)
+	DryRun          bool          // If true, don't actually write to DynamoDB
 
 	// Internal fields
 	exportBucketName string // Bucket name parsed from ExportS3URI
@@ -75,10 +73,6 @@ func (c *Config) Validate() error {
 
 	if c.MaxWorkers < 1 {
 		return fmt.Errorf("max workers must be at least 1")
-	}
-
-	if c.ReadAheadParts < 1 {
-		return fmt.Errorf("read ahead parts must be at least 1")
 	}
 
 	if c.BatchSize < 1 || c.BatchSize > 25 {

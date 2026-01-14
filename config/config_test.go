@@ -13,7 +13,6 @@ func validConfig() *Config {
 		ViewType:        "NEW",
 		Region:          "us-west-2",
 		MaxWorkers:      10,
-		ReadAheadParts:  5,
 		BatchSize:       25,
 		ShutdownTimeout: time.Minute,
 	}
@@ -130,19 +129,6 @@ func TestInvalidMaxWorkers(t *testing.T) {
 			cfg.MaxWorkers = workers
 			if err := cfg.Validate(); err == nil {
 				t.Errorf("expected error for invalid max workers: %d", workers)
-			}
-		})
-	}
-}
-
-func TestInvalidReadAheadParts(t *testing.T) {
-	testCases := []int{0, -1, -100}
-	for _, parts := range testCases {
-		t.Run("parts", func(t *testing.T) {
-			cfg := validConfig()
-			cfg.ReadAheadParts = parts
-			if err := cfg.Validate(); err == nil {
-				t.Errorf("expected error for invalid read ahead parts: %d", parts)
 			}
 		})
 	}

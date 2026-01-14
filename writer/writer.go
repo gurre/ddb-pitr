@@ -4,7 +4,9 @@ package writer
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -35,6 +37,47 @@ func NewDynamoDBWriter(client aws.DynamoDBClient, tableName string, batchSize in
 		client:    client,
 		tableName: tableName,
 		batchSize: batchSize,
+	}
+}
+
+// isThrottlingError returns true if the error is a DynamoDB throughput throttling error.
+// These errors indicate temporary capacity constraints and should trigger backoff and retry.
+//
+// DynamoDB throttles in four scenarios:
+//  1. Key range throughput exceeded - hot partition, affects both provisioned and on-demand
+//  2. Provisioned throughput exceeded - RCU/WCU exhausted in provisioned mode
+//  3. Account-level service quotas exceeded - per-table limits in on-demand mode
+//  4. On-demand maximum throughput exceeded - configured cost control limits
+//
+// All scenarios return ProvisionedThroughputExceededException or RequestLimitExceeded.
+// These are recoverable by waiting - capacity refills over time.
+func isThrottlingError(err error) bool {
+	var throughputErr *types.ProvisionedThroughputExceededException
+	var requestLimitErr *types.RequestLimitExceeded
+	return errors.As(err, &throughputErr) || errors.As(err, &requestLimitErr)
+}
+
+// backoffWait sleeps for an exponentially increasing duration with jitter.
+// Returns false if the context is cancelled during the wait.
+func backoffWait(ctx context.Context, attempt int) bool {
+	// Base delay 100ms, max delay 30s
+	base := 100 * time.Millisecond
+	maxDelay := 30 * time.Second
+
+	delay := base * time.Duration(1<<uint(attempt))
+	if delay > maxDelay {
+		delay = maxDelay
+	}
+
+	// Add jitter: random value between 0 and delay
+	jitter := time.Duration(rand.Int64N(int64(delay)))
+	delay = delay + jitter
+
+	select {
+	case <-time.After(delay):
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -100,33 +143,44 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 			},
 		}
 
-		// Retry with exponential backoff
-		var lastErr error
-		retriesExhausted := true
-		for retries := 0; retries < 5; retries++ {
+		// Retry with exponential backoff.
+		// Throttling errors retry indefinitely until context is cancelled.
+		// Other errors fail after maxRetries attempts.
+		const maxRetries = 5
+		attempt := 0
+		for {
 			output, err := w.client.BatchWriteItem(ctx, input)
 			if err != nil {
-				lastErr = err
-				time.Sleep(time.Duration(1<<uint(retries)) * 100 * time.Millisecond)
-				continue
+				if isThrottlingError(err) {
+					// Throttling: wait and retry indefinitely
+					if !backoffWait(ctx, attempt) {
+						return ctx.Err()
+					}
+					attempt++
+					continue
+				}
+				// Non-throttling error: retry up to maxRetries
+				if attempt < maxRetries {
+					if !backoffWait(ctx, attempt) {
+						return ctx.Err()
+					}
+					attempt++
+					continue
+				}
+				return fmt.Errorf("failed to write batch after %d retries: %w", maxRetries, err)
 			}
 
-			// Handle unprocessed items
+			// Handle unprocessed items (indicates throttling)
 			if len(output.UnprocessedItems) > 0 {
 				input.RequestItems = output.UnprocessedItems
-				time.Sleep(time.Duration(1<<uint(retries)) * 100 * time.Millisecond)
+				if !backoffWait(ctx, attempt) {
+					return ctx.Err()
+				}
+				attempt++
 				continue
 			}
 
-			retriesExhausted = false
 			break
-		}
-
-		if retriesExhausted {
-			if lastErr != nil {
-				return fmt.Errorf("failed to write batch after retries: %w", lastErr)
-			}
-			return fmt.Errorf("failed to write batch: unprocessed items remain after retries")
 		}
 	}
 
@@ -208,9 +262,32 @@ func (w *DynamoDBWriter) updateItem(ctx context.Context, op itemimage.Operation)
 		input.ExpressionAttributeValues = values
 	}
 
-	_, err := w.client.UpdateItem(ctx, input)
-	if err != nil {
-		return fmt.Errorf("failed to update item: %w", err)
+	// Retry with exponential backoff.
+	// Throttling errors retry indefinitely until context is cancelled.
+	const maxRetries = 5
+	attempt := 0
+	for {
+		_, err := w.client.UpdateItem(ctx, input)
+		if err != nil {
+			if isThrottlingError(err) {
+				// Throttling: wait and retry indefinitely
+				if !backoffWait(ctx, attempt) {
+					return ctx.Err()
+				}
+				attempt++
+				continue
+			}
+			// Non-throttling error: retry up to maxRetries
+			if attempt < maxRetries {
+				if !backoffWait(ctx, attempt) {
+					return ctx.Err()
+				}
+				attempt++
+				continue
+			}
+			return fmt.Errorf("failed to update item after %d retries: %w", maxRetries, err)
+		}
+		break
 	}
 
 	return nil

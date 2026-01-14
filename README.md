@@ -9,6 +9,7 @@ AWS DynamoDB Point-in-Time Recovery can export table data to S3, but provides no
 - Stream multi-terabyte exports without loading into memory
 - Parallel workers with configurable concurrency
 - Checkpoint to S3 for safe resume after interruption
+- Automatic throttling handling with exponential backoff
 - Dry-run mode for validation before restore
 
 ## Supported Operations
@@ -56,8 +57,7 @@ ddb-pitr restore \
   --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef/ \
   --region us-west-2 \
   --workers 50 \
-  --batch 25 \
-  --manage-capacity
+  --batch 25
 
 # Restore incremental export (applies PUT and DELETE operations)
 ddb-pitr restore \
@@ -88,11 +88,9 @@ ddb-pitr restore \
 - `--region`: AWS region (defaults to AWS_REGION env)
 - `--resume`: S3 URI for checkpoint file
 - `--workers`: Maximum number of concurrent workers (default: 10)
-- `--read-ahead`: Number of S3 parts to read ahead (default: 5)
 - `--batch`: Batch size for DynamoDB writes (max 25, default: 25)
 - `--report`: S3 URI for the final report
 - `--dry-run`: Validate configuration without restoring
-- `--manage-capacity`: Automatically manage table capacity
 - `--shutdown-timeout`: Graceful shutdown timeout (default: 5m)
 
 ## Architecture
