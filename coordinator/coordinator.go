@@ -35,17 +35,23 @@ type WorkerStatus struct {
 	ID            int       // Worker identifier (8 bytes on 64-bit)
 }
 
+// ReportUploader uploads reports to S3.
+type ReportUploader interface {
+	UploadReport(ctx context.Context, uri string, report metrics.Report) error
+}
+
 // Coordinator implements the worker pool pattern from section 5.
 // It manages the restore process, including worker coordination,
 // checkpoint management, and progress reporting.
 type Coordinator struct {
-	cfg      *config.Config
-	manifest manifest.Loader
-	streamer s3streamer.Streamer
-	parser   itemimage.Decoder
-	writer   writer.Writer
-	store    checkpoint.Store
-	metrics  *metrics.Metrics
+	cfg            *config.Config
+	manifest       manifest.Loader
+	streamer       s3streamer.Streamer
+	parser         itemimage.Decoder
+	writer         writer.Writer
+	store          checkpoint.Store
+	metrics        *metrics.Metrics
+	reportUploader ReportUploader
 
 	// Worker management as specified in section 5
 	workerStatus map[int]*WorkerStatus
@@ -60,16 +66,18 @@ func NewCoordinator(
 	parser itemimage.Decoder,
 	writer writer.Writer,
 	store checkpoint.Store,
+	reportUploader ReportUploader,
 ) *Coordinator {
 	return &Coordinator{
-		cfg:          cfg,
-		manifest:     manifest,
-		streamer:     streamer,
-		parser:       parser,
-		writer:       writer,
-		store:        store,
-		metrics:      metrics.NewMetrics(),
-		workerStatus: make(map[int]*WorkerStatus),
+		cfg:            cfg,
+		manifest:       manifest,
+		streamer:       streamer,
+		parser:         parser,
+		writer:         writer,
+		store:          store,
+		metrics:        metrics.NewMetrics(),
+		reportUploader: reportUploader,
+		workerStatus:   make(map[int]*WorkerStatus),
 	}
 }
 
@@ -188,6 +196,14 @@ finish:
 	// Generate and print report
 	report := c.metrics.GenerateReport()
 	fmt.Println(report)
+
+	// Upload report to S3 if configured
+	if c.cfg.ReportS3URI != "" && c.reportUploader != nil {
+		if err := c.reportUploader.UploadReport(ctx, c.cfg.ReportS3URI, report); err != nil {
+			return fmt.Errorf("failed to upload report: %w", err)
+		}
+		fmt.Printf("Report uploaded to %s\n", c.cfg.ReportS3URI)
+	}
 
 	return nil
 }

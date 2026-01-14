@@ -118,7 +118,7 @@ func TestCoordinatorHappyPath(t *testing.T) {
 		t.Fatalf("failed to validate config: %v", err)
 	}
 
-	coord := NewCoordinator(cfg, loader, streamer, decoder, writer, store)
+	coord := NewCoordinator(cfg, loader, streamer, decoder, writer, store, nil)
 
 	// Run coordinator
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

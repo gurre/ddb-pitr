@@ -145,6 +145,7 @@ func TestEndToEndWithCoordinator(t *testing.T) {
 		jsonDecoder,
 		ddbWriter,
 		checkpointStore,
+		nil, // no report uploader in tests
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

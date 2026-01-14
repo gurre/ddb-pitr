@@ -116,6 +116,12 @@ func run() error {
 		checkpointStore = checkpoint.NewMemoryStore()
 	}
 
+	// Create report uploader if report URI is provided
+	var reportUploader *aws.S3ReportUploader
+	if cfg.ReportS3URI != "" {
+		reportUploader = aws.NewS3ReportUploader(s3Client)
+	}
+
 	// Create the coordinator with all dependencies
 	coord := coordinator.NewCoordinator(
 		cfg,
@@ -124,6 +130,7 @@ func run() error {
 		jsonDecoder,
 		ddbWriter,
 		checkpointStore,
+		reportUploader,
 	)
 
 	// Run the coordinator

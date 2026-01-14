@@ -4,11 +4,17 @@
 package aws
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"net/url"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	json "github.com/goccy/go-json"
+	"github.com/gurre/ddb-pitr/metrics"
 )
 
 // DynamoDBClientImpl implements DynamoDBClient using the AWS SDK as specified in section 4.6.
@@ -72,4 +78,47 @@ func NewIAMClient(client *iam.Client) *IAMClientImpl {
 // SimulatePrincipalPolicy implements the IAMClient interface for permission simulation
 func (c *IAMClientImpl) SimulatePrincipalPolicy(ctx context.Context, params *iam.SimulatePrincipalPolicyInput, optFns ...func(*iam.Options)) (*iam.SimulatePrincipalPolicyOutput, error) {
 	return c.client.SimulatePrincipalPolicy(ctx, params, optFns...)
+}
+
+// S3ReportUploader uploads metrics reports to S3.
+type S3ReportUploader struct {
+	client S3Client
+}
+
+// NewS3ReportUploader creates a new S3ReportUploader instance.
+func NewS3ReportUploader(client S3Client) *S3ReportUploader {
+	return &S3ReportUploader{client: client}
+}
+
+// UploadReport uploads a metrics report to the specified S3 URI.
+// The URI must be in the format s3://bucket/key.
+func (u *S3ReportUploader) UploadReport(ctx context.Context, uri string, report metrics.Report) error {
+	parsed, err := url.Parse(uri)
+	if err != nil {
+		return fmt.Errorf("invalid S3 URI: %w", err)
+	}
+	if parsed.Scheme != "s3" {
+		return fmt.Errorf("invalid S3 URI scheme: %s", parsed.Scheme)
+	}
+
+	bucket := parsed.Host
+	key := strings.TrimPrefix(parsed.Path, "/")
+
+	data, err := json.Marshal(report)
+	if err != nil {
+		return fmt.Errorf("failed to marshal report: %w", err)
+	}
+
+	contentType := "application/json"
+	_, err = u.client.PutObject(ctx, &s3.PutObjectInput{
+		Bucket:      &bucket,
+		Key:         &key,
+		Body:        bytes.NewReader(data),
+		ContentType: &contentType,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to upload report: %w", err)
+	}
+
+	return nil
 }
