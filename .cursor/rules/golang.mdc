@@ -1,0 +1,28 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+- EVERYTIME you have changed the implementation run tests.
+- Do not use testing helping libraries such as testify except for integration tests with third parties.
+- Do not use t.Run in tests instead use a single function per scenario.
+- Don't implement smart fallbacks, instead return an error using fmt.Errorf.
+
+
+# AWS Service Abstraction Pattern
+- **Interface Layers**
+  - Define a low-level client interface that wraps required AWS SDK operations (PutItem, GetItem, etc.) Example: DynamoDBTableClient.
+  - Create a domain-focused interface with business operations (GetByID, Create, Update, etc.) Example: DynamoDBTableIface.
+  - Use compile-time checks to ensure implementations satisfy interfaces.
+- **Implementation Structure**
+  - Implement a table struct that holds the client interface and table name. Example: IdentityTable.
+  - Use a single data model for domain objects and AWS SDK items.
+  - Create separate files for each access pattern implementation.
+- **Testing Support**
+  - Provide a mock client implementation of the low-level interface.
+  - Test AWS SDK error scenarios thoroughly.
+  - Create comprehensive unit tests for each access pattern.
+- **Server Integration**
+  - Inject the table abstraction into service implementations.
+  - Convert DynamoDB errors to appropriate service-level errors.
+  - Validate inputs before passing to the table layer.
