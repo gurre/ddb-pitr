@@ -10,6 +10,7 @@ import (
 	"github.com/gurre/ddb-pitr/config"
 	"github.com/gurre/ddb-pitr/itemimage"
 	"github.com/gurre/ddb-pitr/manifest"
+	"github.com/gurre/ddb-pitr/metrics"
 )
 
 type mockLoader struct {
@@ -117,7 +118,7 @@ func TestCoordinatorHappyPath(t *testing.T) {
 		t.Fatalf("failed to validate config: %v", err)
 	}
 
-	coord := NewCoordinator(cfg, loader, streamer, decoder, writer, store, nil)
+	coord := NewCoordinator(cfg, loader, streamer, decoder, writer, store, nil, metrics.NewMetrics())
 
 	// Run coordinator
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

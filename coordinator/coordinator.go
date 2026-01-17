@@ -56,6 +56,12 @@ type Coordinator struct {
 	// Worker management as specified in section 5
 	workerStatus map[int]*WorkerStatus
 	statusMu     sync.RWMutex
+
+	// Progress tracking for percentage and throughput calculation
+	totalExpectedItems int64     // Total items expected from manifest
+	lastReportTime     time.Time // Last progress report timestamp
+	lastReportItems    int64     // Items count at last report
+	lastReportBytes    int64     // Bytes count at last report
 }
 
 // NewCoordinator creates a new Coordinator instance with all required dependencies
@@ -67,6 +73,7 @@ func NewCoordinator(
 	writer writer.Writer,
 	store checkpoint.Store,
 	reportUploader ReportUploader,
+	m *metrics.Metrics,
 ) *Coordinator {
 	return &Coordinator{
 		cfg:            cfg,
@@ -75,7 +82,7 @@ func NewCoordinator(
 		parser:         parser,
 		writer:         writer,
 		store:          store,
-		metrics:        metrics.NewMetrics(),
+		metrics:        m,
 		reportUploader: reportUploader,
 		workerStatus:   make(map[int]*WorkerStatus),
 	}
@@ -103,6 +110,10 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to load manifest: %w", err)
 	}
+
+	// Store total expected items for progress percentage calculation
+	c.totalExpectedItems = summary.ItemCount
+	c.lastReportTime = time.Now()
 
 	// Load checkpoint
 	state, err := c.store.Load(ctx)
@@ -229,14 +240,15 @@ func (c *Coordinator) updateWorkerStatus(id int, fn func(*WorkerStatus)) {
 }
 
 // reportProgress implements the progress reporting requirements from section 5.
-// It periodically reports progress to stdout.
+// It periodically reports progress to stdout, overwriting the same line.
 func (c *Coordinator) reportProgress(ctx context.Context) {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
+			// Gather worker status
 			c.statusMu.RLock()
 			var totalItems, totalBatches int64
 			activeWorkers := 0
@@ -249,10 +261,45 @@ func (c *Coordinator) reportProgress(ctx context.Context) {
 			}
 			c.statusMu.RUnlock()
 
-			fmt.Printf("Progress: %d items written in %d batches (%d active workers)\n",
-				totalItems, totalBatches, activeWorkers)
+			// Get metrics
+			now := time.Now()
+			bytesWritten := c.metrics.BytesWritten()
+			throttles := c.metrics.Throttles()
+			retries := c.metrics.Retries()
+			lostItems := c.metrics.LostItems()
+			errors := c.metrics.Errors()
+
+			// Calculate rolling throughput since last report
+			elapsed := now.Sub(c.lastReportTime).Seconds()
+			var itemsPerSec, mbPerSec float64
+			if elapsed > 0 {
+				itemsDelta := totalItems - c.lastReportItems
+				bytesDelta := bytesWritten - c.lastReportBytes
+				itemsPerSec = float64(itemsDelta) / elapsed
+				mbPerSec = float64(bytesDelta) / (1024 * 1024) / elapsed
+			}
+
+			// Calculate percentage
+			var percent float64
+			if c.totalExpectedItems > 0 {
+				percent = float64(totalItems) / float64(c.totalExpectedItems) * 100
+				if percent > 100 {
+					percent = 100
+				}
+			}
+
+			// Update last report values
+			c.lastReportTime = now
+			c.lastReportItems = totalItems
+			c.lastReportBytes = bytesWritten
+
+			// Print progress overwriting the same line
+			fmt.Printf("\rProgress: %.1f%% (%.0f/s, %.1f MB/s) | %d batches | %d workers | %d throttles | %d retries | %d lost | %d errors",
+				percent, itemsPerSec, mbPerSec, totalBatches, activeWorkers, throttles, retries, lostItems, errors)
 
 		case <-ctx.Done():
+			// Print newline before exit so final output appears on new line
+			fmt.Println()
 			return
 		}
 	}

@@ -43,6 +43,7 @@ type Config struct {
 	Seed        int64
 	EnableGSI   bool
 	EnableLSI   bool
+	ItemSize    int // Target item size in bytes (adds padding if > 0)
 }
 
 func randomString(r *rand.Rand, n int) string {
@@ -126,7 +127,8 @@ func generateUniqueBinaries(r *rand.Rand, n, minLen, maxLen int) [][]byte {
 
 // generateRandomItem creates a random DynamoDB item with various attribute types.
 // When enableGSI or enableLSI is true, adds the required index attributes.
-func generateRandomItem(r *rand.Rand, id int, enableGSI, enableLSI bool) map[string]types.AttributeValue {
+// When itemSize > 0, adds padding to reach the target size in bytes.
+func generateRandomItem(r *rand.Rand, id int, enableGSI, enableLSI bool, itemSize int) map[string]types.AttributeValue {
 	numAttributes := randomNumber(r, 5, 15)
 	attributeNames := randomAttributeNames(r, numAttributes)
 
@@ -194,6 +196,17 @@ func generateRandomItem(r *rand.Rand, id int, enableGSI, enableLSI bool) map[str
 				listItems[i] = &types.AttributeValueMemberS{Value: randomString(r, randomNumber(r, 5, 20))}
 			}
 			item[name] = &types.AttributeValueMemberL{Value: listItems}
+		}
+	}
+
+	// Add padding to reach target item size if specified.
+	// Base item with random attributes is estimated at ~400 bytes.
+	if itemSize > 0 {
+		const baseSize = 400
+		const attrNameSize = 7 // "padding" attribute name overhead
+		paddingNeeded := itemSize - baseSize - attrNameSize
+		if paddingNeeded > 0 {
+			item["padding"] = &types.AttributeValueMemberS{Value: randomString(r, paddingNeeded)}
 		}
 	}
 
@@ -265,7 +278,7 @@ func runPutMode(ctx context.Context, client DataGenerator, cfg Config, r *rand.R
 	successCount := 0
 
 	for i := 0; i < cfg.NumItems; i++ {
-		item := generateRandomItem(r, i, cfg.EnableGSI, cfg.EnableLSI)
+		item := generateRandomItem(r, i, cfg.EnableGSI, cfg.EnableLSI, cfg.ItemSize)
 		_, err := client.PutItem(ctx, &dynamodb.PutItemInput{
 			TableName: aws.String(cfg.TableName),
 			Item:      item,
@@ -275,7 +288,7 @@ func runPutMode(ctx context.Context, client DataGenerator, cfg Config, r *rand.R
 			continue
 		}
 		successCount++
-		if (i+1)%10 == 0 {
+		if (i+1)%1000 == 0 {
 			fmt.Printf("Written %d items...\n", i+1)
 		}
 	}
@@ -290,7 +303,7 @@ func runLifecycleMode(ctx context.Context, client DataGenerator, cfg Config, r *
 	// Advance the random state to match where put mode left off
 	// This ensures lifecycle mode selects the same items regardless of when it's called
 	for i := 0; i < cfg.NumItems; i++ {
-		generateRandomItem(r, i, cfg.EnableGSI, cfg.EnableLSI)
+		generateRandomItem(r, i, cfg.EnableGSI, cfg.EnableLSI, cfg.ItemSize)
 	}
 
 	fmt.Printf("Lifecycle mode: updating %d items, deleting %d items\n", cfg.UpdateCount, cfg.DeleteCount)
@@ -360,6 +373,7 @@ func main() {
 	flag.Int64Var(&cfg.Seed, "seed", 0, "Random seed (0 = time-based)")
 	flag.BoolVar(&cfg.EnableGSI, "gsi", false, "Create table with GSI (ByCategory)")
 	flag.BoolVar(&cfg.EnableLSI, "lsi", false, "Create table with LSI (ByTimestamp)")
+	flag.IntVar(&cfg.ItemSize, "size", 0, "Target item size in bytes (adds padding if > 0)")
 	flag.Parse()
 
 	// Initialize random source

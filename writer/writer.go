@@ -23,20 +23,31 @@ type Writer interface {
 	Flush(ctx context.Context) error
 }
 
+// Callbacks allows the writer to report metrics without coupling to a specific metrics implementation.
+// All callbacks are optional - nil callbacks are safely ignored.
+type Callbacks struct {
+	OnThrottle func()                 // Called on throttle event
+	OnRetry    func()                 // Called on successful retry after transient failure
+	OnLost     func(count int)        // Called when items fail permanently after max retries
+	OnWrite    func(items, bytes int) // Called on successful write with item count and byte size
+}
+
 // DynamoDBWriter implements the Writer interface using AWS DynamoDB as specified in section 4.6.
 // It handles batching operations and retrying with exponential backoff.
 type DynamoDBWriter struct {
 	client    aws.DynamoDBClient
+	callbacks Callbacks
 	tableName string
 	batchSize int // Maximum number of operations per batch (≤25)
 }
 
-// NewDynamoDBWriter creates a new DynamoDBWriter instance with the specified batch size
-func NewDynamoDBWriter(client aws.DynamoDBClient, tableName string, batchSize int) *DynamoDBWriter {
+// NewDynamoDBWriter creates a new DynamoDBWriter instance with the specified batch size and callbacks
+func NewDynamoDBWriter(client aws.DynamoDBClient, tableName string, batchSize int, callbacks Callbacks) *DynamoDBWriter {
 	return &DynamoDBWriter{
 		client:    client,
 		tableName: tableName,
 		batchSize: batchSize,
+		callbacks: callbacks,
 	}
 }
 
@@ -55,6 +66,17 @@ func isThrottlingError(err error) bool {
 	var throughputErr *types.ProvisionedThroughputExceededException
 	var requestLimitErr *types.RequestLimitExceeded
 	return errors.As(err, &throughputErr) || errors.As(err, &requestLimitErr)
+}
+
+// estimateItemSize returns an approximate byte size for a DynamoDB item.
+// Uses a simple heuristic: 100 bytes base + 50 bytes per attribute.
+// This avoids expensive serialization while providing reasonable estimates.
+func estimateItemSize(item map[string]types.AttributeValue) int {
+	if item == nil {
+		return 0
+	}
+	// Base overhead + estimated bytes per attribute
+	return 100 + len(item)*50
 }
 
 // backoffWait sleeps for an exponentially increasing duration with jitter.
@@ -107,8 +129,9 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 		}
 		batch := ops[i:end]
 
-		// Convert operations to DynamoDB requests
+		// Convert operations to DynamoDB requests and estimate byte size
 		requests := make([]types.WriteRequest, 0, len(batch))
+		batchBytes := 0
 		for _, op := range batch {
 			switch op.Type {
 			case itemimage.OpPut:
@@ -117,12 +140,15 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 						Item: op.NewImage,
 					},
 				})
+				batchBytes += estimateItemSize(op.NewImage)
 			case itemimage.OpDelete:
 				requests = append(requests, types.WriteRequest{
 					DeleteRequest: &types.DeleteRequest{
 						Key: op.Keys,
 					},
 				})
+				// Deletes have minimal size (just keys)
+				batchBytes += estimateItemSize(op.Keys)
 			case itemimage.OpUpdate:
 				// For updates, we need to use UpdateItem
 				// This is handled separately since it can't be batched
@@ -143,20 +169,28 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 			},
 		}
 
+		// Track items in current batch for callbacks
+		itemsInBatch := len(requests)
+
 		// Retry with exponential backoff.
 		// Throttling errors retry indefinitely until context is cancelled.
 		// Other errors fail after maxRetries attempts.
 		const maxRetries = 5
 		attempt := 0
+		hadRetry := false
 		for {
 			output, err := w.client.BatchWriteItem(ctx, input)
 			if err != nil {
 				if isThrottlingError(err) {
 					// Throttling: wait and retry indefinitely
+					if w.callbacks.OnThrottle != nil {
+						w.callbacks.OnThrottle()
+					}
 					if !backoffWait(ctx, attempt) {
 						return ctx.Err()
 					}
 					attempt++
+					hadRetry = true
 					continue
 				}
 				// Non-throttling error: retry up to maxRetries
@@ -165,21 +199,38 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 						return ctx.Err()
 					}
 					attempt++
+					hadRetry = true
 					continue
+				}
+				// Permanent failure - record lost items
+				if w.callbacks.OnLost != nil {
+					w.callbacks.OnLost(itemsInBatch)
 				}
 				return fmt.Errorf("failed to write batch after %d retries: %w", maxRetries, err)
 			}
 
 			// Handle unprocessed items (indicates throttling)
 			if len(output.UnprocessedItems) > 0 {
+				if w.callbacks.OnThrottle != nil {
+					w.callbacks.OnThrottle()
+				}
 				input.RequestItems = output.UnprocessedItems
 				if !backoffWait(ctx, attempt) {
 					return ctx.Err()
 				}
 				attempt++
+				hadRetry = true
 				continue
 			}
 
+			// Success - record retry if we had one
+			if hadRetry && w.callbacks.OnRetry != nil {
+				w.callbacks.OnRetry()
+			}
+			// Record successful write
+			if w.callbacks.OnWrite != nil {
+				w.callbacks.OnWrite(itemsInBatch, batchBytes)
+			}
 			break
 		}
 	}
@@ -262,19 +313,27 @@ func (w *DynamoDBWriter) updateItem(ctx context.Context, op itemimage.Operation)
 		input.ExpressionAttributeValues = values
 	}
 
+	// Estimate byte size for the update
+	updateBytes := estimateItemSize(op.NewImage)
+
 	// Retry with exponential backoff.
 	// Throttling errors retry indefinitely until context is cancelled.
 	const maxRetries = 5
 	attempt := 0
+	hadRetry := false
 	for {
 		_, err := w.client.UpdateItem(ctx, input)
 		if err != nil {
 			if isThrottlingError(err) {
 				// Throttling: wait and retry indefinitely
+				if w.callbacks.OnThrottle != nil {
+					w.callbacks.OnThrottle()
+				}
 				if !backoffWait(ctx, attempt) {
 					return ctx.Err()
 				}
 				attempt++
+				hadRetry = true
 				continue
 			}
 			// Non-throttling error: retry up to maxRetries
@@ -283,9 +342,23 @@ func (w *DynamoDBWriter) updateItem(ctx context.Context, op itemimage.Operation)
 					return ctx.Err()
 				}
 				attempt++
+				hadRetry = true
 				continue
 			}
+			// Permanent failure - record lost item
+			if w.callbacks.OnLost != nil {
+				w.callbacks.OnLost(1)
+			}
 			return fmt.Errorf("failed to update item after %d retries: %w", maxRetries, err)
+		}
+
+		// Success - record retry if we had one
+		if hadRetry && w.callbacks.OnRetry != nil {
+			w.callbacks.OnRetry()
+		}
+		// Record successful write
+		if w.callbacks.OnWrite != nil {
+			w.callbacks.OnWrite(1, updateBytes)
 		}
 		break
 	}

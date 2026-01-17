@@ -28,10 +28,11 @@ S3_BUCKET="${PITR_TEST_BUCKET:?Error: PITR_TEST_BUCKET environment variable must
 REGION="${AWS_REGION:-us-east-1}"
 S3_PREFIX="verify/${SOURCE_TABLE}"
 
-# Test parameters
-ITEM_COUNT="${ITEM_COUNT:-100}"
-UPDATE_COUNT="${UPDATE_COUNT:-30}"
-DELETE_COUNT="${DELETE_COUNT:-20}"
+# Test parameters - defaults target 256MB of data (65536 items * 4KB each)
+ITEM_COUNT="${ITEM_COUNT:-65536}"
+UPDATE_COUNT="${UPDATE_COUNT:-19660}"
+DELETE_COUNT="${DELETE_COUNT:-13107}"
+ITEM_SIZE="${ITEM_SIZE:-4096}"
 SEED="${SEED:-42}"
 
 # Script directory for finding binaries
@@ -59,7 +60,7 @@ echo "Target table: ${TARGET_TABLE}"
 echo "S3 bucket: ${S3_BUCKET}"
 echo "S3 prefix: ${S3_PREFIX}"
 echo "Region: ${REGION}"
-echo "Items: ${ITEM_COUNT}, Updates: ${UPDATE_COUNT}, Deletes: ${DELETE_COUNT}"
+echo "Items: ${ITEM_COUNT}, Size: ${ITEM_SIZE}B, Updates: ${UPDATE_COUNT}, Deletes: ${DELETE_COUNT}"
 echo ""
 
 # Cleanup function - runs on exit
@@ -97,6 +98,7 @@ echo "Creating table with GSI/LSI and populating ${ITEM_COUNT} items..."
 
 "${BIN_DIR}/ddb-datagen" \
     -items "${ITEM_COUNT}" \
+    -size "${ITEM_SIZE}" \
     -gsi \
     -lsi \
     -mode put \
@@ -171,10 +173,16 @@ echo "=== Phase 4: Perform lifecycle operations (UPDATE/DELETE) ==="
 "${BIN_DIR}/ddb-datagen" \
     -table "${SOURCE_TABLE}" \
     -items "${ITEM_COUNT}" \
+    -size "${ITEM_SIZE}" \
     -mode lifecycle \
     -update-count "${UPDATE_COUNT}" \
     -delete-count "${DELETE_COUNT}" \
     -seed "${SEED}"
+
+# Wait for DynamoDB change capture to propagate all operations
+echo ""
+echo "Waiting 60s for change capture propagation..."
+sleep 60
 
 # Phase 5: Trigger INCREMENTAL export
 echo ""
@@ -304,20 +312,20 @@ echo "Applying incremental from: ${INC_MANIFEST_URI}"
 echo ""
 echo "=== Phase 9: Verify data completeness ==="
 
-# Count items in both tables
+# Count items in both tables (sum across all pages for large tables)
 SOURCE_COUNT=$(aws dynamodb scan \
     --table-name "${SOURCE_TABLE}" \
     --select COUNT \
     --region "${REGION}" \
     --query 'Count' \
-    --output text)
+    --output text | awk '{sum+=$1} END {print sum}')
 
 TARGET_COUNT=$(aws dynamodb scan \
     --table-name "${TARGET_TABLE}" \
     --select COUNT \
     --region "${REGION}" \
     --query 'Count' \
-    --output text)
+    --output text | awk '{sum+=$1} END {print sum}')
 
 EXPECTED_COUNT=$((ITEM_COUNT - DELETE_COUNT))
 
@@ -342,37 +350,81 @@ fi
 
 echo "Item counts match: ${SOURCE_COUNT}"
 
-# Full item comparison
+# Sample item comparison (full comparison impractical for large tables)
 echo ""
-echo "Performing full item comparison..."
+SAMPLE_SIZE=100
+echo "Performing sample item comparison (${SAMPLE_SIZE} items)..."
 
-aws dynamodb scan \
-    --table-name "${SOURCE_TABLE}" \
-    --region "${REGION}" \
-    --output json | jq -S '.Items | sort_by(.PK.S, .SK.S)' > /tmp/source_items.json
+# jq filter to normalize DynamoDB JSON for comparison.
+# DynamoDB sets (SS, NS, BS) are unordered, so we sort their values.
+# This ensures ["26","688"] and ["688","26"] compare as equal.
+JQ_NORMALIZE='
+def normalize:
+  if type == "object" then
+    if has("SS") then .SS |= sort
+    elif has("NS") then .NS |= sort
+    elif has("BS") then .BS |= sort
+    elif has("L") then .L |= map(normalize)
+    elif has("M") then .M |= map_values(normalize)
+    else map_values(normalize)
+    end
+  elif type == "array" then map(normalize)
+  else .
+  end;
+normalize
+'
 
-aws dynamodb scan \
-    --table-name "${TARGET_TABLE}" \
-    --region "${REGION}" \
-    --output json | jq -S '.Items | sort_by(.PK.S, .SK.S)' > /tmp/target_items.json
+# Compare a sample of items by fetching specific keys
+VERIFY_FAILED=0
+CHECKED=0
+for i in $(seq 0 $((SAMPLE_SIZE - 1))); do
+    # Sample items spread across the range
+    ITEM_ID=$((i * (ITEM_COUNT / SAMPLE_SIZE)))
+    CHECKED=$((CHECKED + 1))
+    if [[ $((CHECKED % 10)) -eq 0 ]]; then
+        printf "\rVerifying samples... %d/%d" ${CHECKED} ${SAMPLE_SIZE}
+    fi
+    PK="ITEM#${ITEM_ID}"
 
-if diff -q /tmp/source_items.json /tmp/target_items.json > /dev/null; then
+    SOURCE_ITEM=$(aws dynamodb get-item \
+        --table-name "${SOURCE_TABLE}" \
+        --key "{\"PK\": {\"S\": \"${PK}\"}, \"SK\": {\"S\": \"METADATA\"}}" \
+        --region "${REGION}" \
+        --output json 2>/dev/null | jq -S ".Item // empty | ${JQ_NORMALIZE}")
+
+    TARGET_ITEM=$(aws dynamodb get-item \
+        --table-name "${TARGET_TABLE}" \
+        --key "{\"PK\": {\"S\": \"${PK}\"}, \"SK\": {\"S\": \"METADATA\"}}" \
+        --region "${REGION}" \
+        --output json 2>/dev/null | jq -S ".Item // empty | ${JQ_NORMALIZE}")
+
+    if [[ "${SOURCE_ITEM}" != "${TARGET_ITEM}" ]]; then
+        echo "MISMATCH at ${PK}:"
+        # Show diff between source and target
+        diff <(echo "${SOURCE_ITEM}" | jq .) <(echo "${TARGET_ITEM}" | jq .) || true
+        VERIFY_FAILED=1
+        # Only show first mismatch for readability
+        break
+    fi
+done
+echo ""
+
+if [[ ${VERIFY_FAILED} -eq 0 ]]; then
     echo ""
     echo "=== VERIFICATION PASSED ==="
-    echo "All ${SOURCE_COUNT} items match between source and target tables"
+    echo "Item counts match and ${SAMPLE_SIZE} sampled items verified"
     echo ""
     echo "Summary:"
-    echo "  - Created ${ITEM_COUNT} items"
+    echo "  - Created ${ITEM_COUNT} items (${ITEM_SIZE} bytes each)"
     echo "  - Updated ${UPDATE_COUNT} items"
     echo "  - Deleted ${DELETE_COUNT} items"
     echo "  - Final count: ${EXPECTED_COUNT} items"
     echo "  - FULL export and restore: SUCCESS"
     echo "  - INCREMENTAL export and restore: SUCCESS"
-    echo "  - Data integrity: VERIFIED"
+    echo "  - Data integrity: VERIFIED (${SAMPLE_SIZE} samples)"
 else
     echo ""
     echo "=== VERIFICATION FAILED ==="
-    echo "Items differ between source and target tables:"
-    diff /tmp/source_items.json /tmp/target_items.json | head -100
+    echo "Sample items differ between source and target tables"
     exit 1
 fi

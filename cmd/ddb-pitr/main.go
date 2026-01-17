@@ -19,6 +19,7 @@ import (
 	"github.com/gurre/ddb-pitr/coordinator"
 	"github.com/gurre/ddb-pitr/itemimage"
 	"github.com/gurre/ddb-pitr/manifest"
+	"github.com/gurre/ddb-pitr/metrics"
 	"github.com/gurre/ddb-pitr/writer"
 	"github.com/gurre/s3streamer"
 )
@@ -92,11 +93,22 @@ func run() error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Create metrics for tracking progress
+	m := metrics.NewMetrics()
+
+	// Create writer callbacks that wire to metrics
+	writerCallbacks := writer.Callbacks{
+		OnThrottle: m.RecordThrottle,
+		OnRetry:    m.RecordRetry,
+		OnLost:     func(count int) { m.RecordLost(int64(count)) },
+		OnWrite:    func(items, bytes int) { m.RecordBytes(int64(bytes)) },
+	}
+
 	// Create and initialize required components for the coordinator
 	manifestLoader := manifest.NewS3Loader(s3Client)
 	streamer := s3streamer.NewS3Streamer(rawS3Client)
 	jsonDecoder := itemimage.NewJSONDecoder()
-	ddbWriter := writer.NewDynamoDBWriter(dynamoClient, cfg.TableName, cfg.BatchSize)
+	ddbWriter := writer.NewDynamoDBWriter(dynamoClient, cfg.TableName, cfg.BatchSize, writerCallbacks)
 
 	// Set up the checkpoint store based on ResumeKey
 	var checkpointStore checkpoint.Store
@@ -127,6 +139,7 @@ func run() error {
 		ddbWriter,
 		checkpointStore,
 		reportUploader,
+		m,
 	)
 
 	// Run the coordinator

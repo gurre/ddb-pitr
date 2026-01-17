@@ -31,7 +31,7 @@ func (m *mockDynamoDBClient) UpdateItem(ctx context.Context, params *dynamodb.Up
 func TestWriterHappyPath(t *testing.T) {
 	// Set up test data
 	mockClient := &mockDynamoDBClient{}
-	w := NewDynamoDBWriter(mockClient, "test-table", 3) // batch size of 3
+	w := NewDynamoDBWriter(mockClient, "test-table", 3, Callbacks{}) // batch size of 3
 
 	// Create test operations
 	ops := []itemimage.Operation{
@@ -159,7 +159,7 @@ func TestWriterHappyPath(t *testing.T) {
 // BenchmarkWriteBatch measures batch writing performance
 func BenchmarkWriteBatch(b *testing.B) {
 	mockClient := &mockDynamoDBClient{}
-	w := NewDynamoDBWriter(mockClient, "test-table", 25)
+	w := NewDynamoDBWriter(mockClient, "test-table", 25, Callbacks{})
 
 	ops := []itemimage.Operation{
 		{
@@ -182,7 +182,7 @@ func BenchmarkWriteBatch(b *testing.B) {
 // BenchmarkWriteBatchLarge measures performance with larger batches
 func BenchmarkWriteBatchLarge(b *testing.B) {
 	mockClient := &mockDynamoDBClient{}
-	w := NewDynamoDBWriter(mockClient, "test-table", 25)
+	w := NewDynamoDBWriter(mockClient, "test-table", 25, Callbacks{})
 
 	ops := make([]itemimage.Operation, 25)
 	for i := 0; i < 25; i++ {
@@ -206,7 +206,7 @@ func BenchmarkWriteBatchLarge(b *testing.B) {
 
 func TestWriterAllAttributeTypes(t *testing.T) {
 	mockClient := &mockDynamoDBClient{}
-	w := NewDynamoDBWriter(mockClient, "test-table", 1)
+	w := NewDynamoDBWriter(mockClient, "test-table", 1, Callbacks{})
 
 	// Create an operation with all DynamoDB attribute types
 	ops := []itemimage.Operation{
@@ -351,4 +351,200 @@ func TestWriterAllAttributeTypes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCallbacksOnWrite verifies OnWrite callback is invoked with item count and byte size
+// when batch write succeeds.
+func TestCallbacksOnWrite(t *testing.T) {
+	mockClient := &mockDynamoDBClient{}
+
+	var writeCalls []struct{ items, bytes int }
+	callbacks := Callbacks{
+		OnWrite: func(items, bytes int) {
+			writeCalls = append(writeCalls, struct{ items, bytes int }{items, bytes})
+		},
+	}
+
+	w := NewDynamoDBWriter(mockClient, "test-table", 25, callbacks)
+
+	ops := []itemimage.Operation{
+		{
+			Type: itemimage.OpPut,
+			NewImage: map[string]types.AttributeValue{
+				"PK": &types.AttributeValueMemberS{Value: "USER#1"},
+			},
+		},
+		{
+			Type: itemimage.OpPut,
+			NewImage: map[string]types.AttributeValue{
+				"PK": &types.AttributeValueMemberS{Value: "USER#2"},
+			},
+		},
+	}
+
+	if err := w.WriteBatch(context.Background(), ops); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	if len(writeCalls) != 1 {
+		t.Fatalf("expected 1 OnWrite call, got %d", len(writeCalls))
+	}
+	if writeCalls[0].items != 2 {
+		t.Errorf("expected 2 items in OnWrite, got %d", writeCalls[0].items)
+	}
+	if writeCalls[0].bytes <= 0 {
+		t.Errorf("expected positive byte count, got %d", writeCalls[0].bytes)
+	}
+}
+
+// TestCallbacksOnWriteForUpdate verifies OnWrite callback is invoked for UpdateItem operations.
+func TestCallbacksOnWriteForUpdate(t *testing.T) {
+	mockClient := &mockDynamoDBClient{}
+
+	var writeCalls int
+	callbacks := Callbacks{
+		OnWrite: func(items, bytes int) {
+			writeCalls++
+		},
+	}
+
+	w := NewDynamoDBWriter(mockClient, "test-table", 25, callbacks)
+
+	ops := []itemimage.Operation{
+		{
+			Type: itemimage.OpUpdate,
+			Keys: map[string]types.AttributeValue{
+				"PK": &types.AttributeValueMemberS{Value: "USER#1"},
+			},
+			OldImage: map[string]types.AttributeValue{
+				"PK": &types.AttributeValueMemberS{Value: "USER#1"},
+			},
+			NewImage: map[string]types.AttributeValue{
+				"PK":   &types.AttributeValueMemberS{Value: "USER#1"},
+				"name": &types.AttributeValueMemberS{Value: "Test"},
+			},
+		},
+	}
+
+	if err := w.WriteBatch(context.Background(), ops); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	if writeCalls != 1 {
+		t.Errorf("expected 1 OnWrite call for update, got %d", writeCalls)
+	}
+}
+
+// TestIsThrottlingError verifies throttling error detection for DynamoDB exceptions.
+func TestIsThrottlingError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "ProvisionedThroughputExceededException",
+			err:      &types.ProvisionedThroughputExceededException{Message: ptr("throttled")},
+			expected: true,
+		},
+		{
+			name:     "RequestLimitExceeded",
+			err:      &types.RequestLimitExceeded{Message: ptr("limit exceeded")},
+			expected: true,
+		},
+		{
+			name:     "other error",
+			err:      &types.ResourceNotFoundException{Message: ptr("not found")},
+			expected: false,
+		},
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isThrottlingError(tt.err); got != tt.expected {
+				t.Errorf("isThrottlingError() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+// TestEstimateItemSize verifies item size estimation for different attribute counts.
+func TestEstimateItemSize(t *testing.T) {
+	tests := []struct {
+		name string
+		item map[string]types.AttributeValue
+		want int
+	}{
+		{
+			name: "nil item",
+			item: nil,
+			want: 0,
+		},
+		{
+			name: "empty item",
+			item: map[string]types.AttributeValue{},
+			want: 100, // base overhead
+		},
+		{
+			name: "single attribute",
+			item: map[string]types.AttributeValue{
+				"PK": &types.AttributeValueMemberS{Value: "test"},
+			},
+			want: 150, // 100 base + 50 per attribute
+		},
+		{
+			name: "multiple attributes",
+			item: map[string]types.AttributeValue{
+				"PK":   &types.AttributeValueMemberS{Value: "test"},
+				"SK":   &types.AttributeValueMemberS{Value: "test"},
+				"name": &types.AttributeValueMemberS{Value: "test"},
+			},
+			want: 250, // 100 base + 3*50
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := estimateItemSize(tt.item); got != tt.want {
+				t.Errorf("estimateItemSize() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestFlush verifies Flush is a no-op that returns nil.
+func TestFlush(t *testing.T) {
+	mockClient := &mockDynamoDBClient{}
+	w := NewDynamoDBWriter(mockClient, "test-table", 25, Callbacks{})
+
+	if err := w.Flush(context.Background()); err != nil {
+		t.Errorf("Flush() returned error: %v", err)
+	}
+}
+
+// TestWriteBatchEmpty verifies empty batch returns immediately without errors.
+func TestWriteBatchEmpty(t *testing.T) {
+	mockClient := &mockDynamoDBClient{}
+	w := NewDynamoDBWriter(mockClient, "test-table", 25, Callbacks{})
+
+	if err := w.WriteBatch(context.Background(), nil); err != nil {
+		t.Errorf("WriteBatch(nil) returned error: %v", err)
+	}
+	if err := w.WriteBatch(context.Background(), []itemimage.Operation{}); err != nil {
+		t.Errorf("WriteBatch([]) returned error: %v", err)
+	}
+
+	if len(mockClient.batches) != 0 {
+		t.Errorf("expected no batches, got %d", len(mockClient.batches))
+	}
+}
+
+// ptr returns a pointer to the string value
+func ptr(s string) *string {
+	return &s
 }

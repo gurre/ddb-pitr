@@ -1,12 +1,426 @@
 package itemimage
 
 import (
+	"errors"
 	"testing"
 
 	stdjson "encoding/json"
 
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	goccyjson "github.com/goccy/go-json"
 )
+
+// TestOperationTypeDetection verifies correct operation type is assigned based on
+// presence of OldImage and NewImage fields in incremental exports.
+func TestOperationTypeDetection(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	tests := []struct {
+		name     string
+		input    string
+		wantType OperationType
+		wantErr  bool
+	}{
+		{
+			name:     "Update: both OldImage and NewImage present",
+			input:    `{"Keys":{"PK":{"S":"1"}},"OldImage":{"PK":{"S":"1"},"val":{"S":"old"}},"NewImage":{"PK":{"S":"1"},"val":{"S":"new"}}}`,
+			wantType: OpUpdate,
+		},
+		{
+			name:     "Put: only NewImage present (insert)",
+			input:    `{"Keys":{"PK":{"S":"1"}},"NewImage":{"PK":{"S":"1"},"val":{"S":"new"}}}`,
+			wantType: OpPut,
+		},
+		{
+			name:     "Delete: only OldImage present",
+			input:    `{"Keys":{"PK":{"S":"1"}},"OldImage":{"PK":{"S":"1"},"val":{"S":"old"}}}`,
+			wantType: OpDelete,
+		},
+		{
+			name:     "FULL export format: Item field",
+			input:    `{"Item":{"PK":{"S":"1"},"val":{"S":"test"}}}`,
+			wantType: OpPut,
+		},
+		{
+			name:    "Error: no image data",
+			input:   `{"Keys":{"PK":{"S":"1"}}}`,
+			wantErr: true,
+		},
+		{
+			name:    "Error: empty object",
+			input:   `{}`,
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op, err := decoder.Decode([]byte(tt.input))
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if op.Type != tt.wantType {
+				t.Errorf("got type %d, want %d", op.Type, tt.wantType)
+			}
+		})
+	}
+}
+
+// TestFullExportFormat verifies correct parsing of FULL export format {"Item": {...}}.
+func TestFullExportFormat(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	input := `{"Item":{"PK":{"S":"USER#123"},"SK":{"S":"PROFILE"},"name":{"S":"John"},"age":{"N":"30"}}}`
+
+	op, err := decoder.Decode([]byte(input))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if op.Type != OpPut {
+		t.Errorf("expected OpPut, got %d", op.Type)
+	}
+
+	// NewImage should contain the item
+	if op.NewImage == nil {
+		t.Fatal("NewImage is nil")
+	}
+
+	// Verify attributes
+	if pk, ok := op.NewImage["PK"].(*types.AttributeValueMemberS); !ok || pk.Value != "USER#123" {
+		t.Errorf("PK mismatch: got %v", op.NewImage["PK"])
+	}
+	if name, ok := op.NewImage["name"].(*types.AttributeValueMemberS); !ok || name.Value != "John" {
+		t.Errorf("name mismatch: got %v", op.NewImage["name"])
+	}
+	if age, ok := op.NewImage["age"].(*types.AttributeValueMemberN); !ok || age.Value != "30" {
+		t.Errorf("age mismatch: got %v", op.NewImage["age"])
+	}
+
+	// Keys should not be populated for FULL export
+	if op.Keys != nil {
+		t.Errorf("Keys should be nil for FULL export, got %v", op.Keys)
+	}
+}
+
+// TestIncrementalExportKeys verifies Keys field is correctly extracted from incremental exports.
+func TestIncrementalExportKeys(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	input := `{"Keys":{"PK":{"S":"ITEM#99"},"SK":{"S":"META"}},"NewImage":{"PK":{"S":"ITEM#99"},"SK":{"S":"META"},"data":{"S":"test"}}}`
+
+	op, err := decoder.Decode([]byte(input))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if op.Keys == nil {
+		t.Fatal("Keys is nil")
+	}
+
+	pk, ok := op.Keys["PK"].(*types.AttributeValueMemberS)
+	if !ok || pk.Value != "ITEM#99" {
+		t.Errorf("PK key mismatch: got %v", op.Keys["PK"])
+	}
+
+	sk, ok := op.Keys["SK"].(*types.AttributeValueMemberS)
+	if !ok || sk.Value != "META" {
+		t.Errorf("SK key mismatch: got %v", op.Keys["SK"])
+	}
+}
+
+// TestAllAttributeTypes verifies all DynamoDB attribute types are correctly parsed.
+func TestAllAttributeTypes(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	// Comprehensive test with all attribute types
+	input := `{
+		"Item": {
+			"pk": {"S": "test"},
+			"str": {"S": "hello"},
+			"num": {"N": "42"},
+			"bin": {"B": "SGVsbG8="},
+			"bool_true": {"BOOL": true},
+			"bool_false": {"BOOL": false},
+			"null_val": {"NULL": true},
+			"str_set": {"SS": ["a", "b", "c"]},
+			"num_set": {"NS": ["1", "2", "3"]},
+			"bin_set": {"BS": ["SGVsbG8=", "V29ybGQ="]},
+			"list": {"L": [{"S": "item1"}, {"N": "123"}]},
+			"map": {"M": {"nested": {"S": "value"}, "count": {"N": "5"}}}
+		}
+	}`
+
+	op, err := decoder.Decode([]byte(input))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	tests := []struct {
+		attr  string
+		check func(types.AttributeValue) bool
+	}{
+		{"str", func(v types.AttributeValue) bool {
+			s, ok := v.(*types.AttributeValueMemberS)
+			return ok && s.Value == "hello"
+		}},
+		{"num", func(v types.AttributeValue) bool {
+			n, ok := v.(*types.AttributeValueMemberN)
+			return ok && n.Value == "42"
+		}},
+		{"bin", func(v types.AttributeValue) bool {
+			b, ok := v.(*types.AttributeValueMemberB)
+			return ok && string(b.Value) == "Hello"
+		}},
+		{"bool_true", func(v types.AttributeValue) bool {
+			b, ok := v.(*types.AttributeValueMemberBOOL)
+			return ok && b.Value == true
+		}},
+		{"bool_false", func(v types.AttributeValue) bool {
+			b, ok := v.(*types.AttributeValueMemberBOOL)
+			return ok && b.Value == false
+		}},
+		{"null_val", func(v types.AttributeValue) bool {
+			n, ok := v.(*types.AttributeValueMemberNULL)
+			return ok && n.Value == true
+		}},
+		{"str_set", func(v types.AttributeValue) bool {
+			ss, ok := v.(*types.AttributeValueMemberSS)
+			return ok && len(ss.Value) == 3
+		}},
+		{"num_set", func(v types.AttributeValue) bool {
+			ns, ok := v.(*types.AttributeValueMemberNS)
+			return ok && len(ns.Value) == 3
+		}},
+		{"bin_set", func(v types.AttributeValue) bool {
+			bs, ok := v.(*types.AttributeValueMemberBS)
+			return ok && len(bs.Value) == 2
+		}},
+		{"list", func(v types.AttributeValue) bool {
+			l, ok := v.(*types.AttributeValueMemberL)
+			return ok && len(l.Value) == 2
+		}},
+		{"map", func(v types.AttributeValue) bool {
+			m, ok := v.(*types.AttributeValueMemberM)
+			if !ok || len(m.Value) != 2 {
+				return false
+			}
+			nested, ok := m.Value["nested"].(*types.AttributeValueMemberS)
+			return ok && nested.Value == "value"
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.attr, func(t *testing.T) {
+			v, exists := op.NewImage[tt.attr]
+			if !exists {
+				t.Fatalf("attribute %s not found", tt.attr)
+			}
+			if !tt.check(v) {
+				t.Errorf("attribute %s check failed: %T = %v", tt.attr, v, v)
+			}
+		})
+	}
+}
+
+// TestUpdateOperationImages verifies both OldImage and NewImage are captured for updates.
+func TestUpdateOperationImages(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	input := `{
+		"Keys": {"PK": {"S": "ITEM#1"}, "SK": {"S": "META"}},
+		"OldImage": {"PK": {"S": "ITEM#1"}, "SK": {"S": "META"}, "status": {"S": "pending"}, "count": {"N": "5"}},
+		"NewImage": {"PK": {"S": "ITEM#1"}, "SK": {"S": "META"}, "status": {"S": "complete"}, "count": {"N": "10"}, "timestamp": {"N": "12345"}}
+	}`
+
+	op, err := decoder.Decode([]byte(input))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if op.Type != OpUpdate {
+		t.Errorf("expected OpUpdate, got %d", op.Type)
+	}
+
+	// Verify OldImage
+	if op.OldImage == nil {
+		t.Fatal("OldImage is nil")
+	}
+	if status, ok := op.OldImage["status"].(*types.AttributeValueMemberS); !ok || status.Value != "pending" {
+		t.Errorf("OldImage status mismatch")
+	}
+
+	// Verify NewImage
+	if op.NewImage == nil {
+		t.Fatal("NewImage is nil")
+	}
+	if status, ok := op.NewImage["status"].(*types.AttributeValueMemberS); !ok || status.Value != "complete" {
+		t.Errorf("NewImage status mismatch")
+	}
+
+	// Verify new attribute in NewImage
+	if _, exists := op.NewImage["timestamp"]; !exists {
+		t.Error("timestamp should exist in NewImage")
+	}
+
+	// Verify removed attribute detection (count changed, not removed in this case)
+	oldCount := op.OldImage["count"].(*types.AttributeValueMemberN).Value
+	newCount := op.NewImage["count"].(*types.AttributeValueMemberN).Value
+	if oldCount == newCount {
+		t.Error("count should have changed")
+	}
+}
+
+// TestDeleteOperation verifies delete operations have OldImage but no NewImage.
+func TestDeleteOperation(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	input := `{
+		"Keys": {"PK": {"S": "ITEM#99"}, "SK": {"S": "META"}},
+		"OldImage": {"PK": {"S": "ITEM#99"}, "SK": {"S": "META"}, "data": {"S": "deleted"}}
+	}`
+
+	op, err := decoder.Decode([]byte(input))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if op.Type != OpDelete {
+		t.Errorf("expected OpDelete, got %d", op.Type)
+	}
+
+	if op.OldImage == nil {
+		t.Fatal("OldImage should not be nil for delete")
+	}
+
+	if op.NewImage != nil {
+		t.Error("NewImage should be nil for delete")
+	}
+
+	// Keys should match OldImage keys
+	if pk, ok := op.Keys["PK"].(*types.AttributeValueMemberS); !ok || pk.Value != "ITEM#99" {
+		t.Errorf("Keys PK mismatch")
+	}
+}
+
+// TestInsertOperation verifies insert operations have NewImage but no OldImage.
+func TestInsertOperation(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	input := `{
+		"Keys": {"PK": {"S": "ITEM#NEW"}, "SK": {"S": "META"}},
+		"NewImage": {"PK": {"S": "ITEM#NEW"}, "SK": {"S": "META"}, "data": {"S": "inserted"}}
+	}`
+
+	op, err := decoder.Decode([]byte(input))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	if op.Type != OpPut {
+		t.Errorf("expected OpPut for insert, got %d", op.Type)
+	}
+
+	if op.NewImage == nil {
+		t.Fatal("NewImage should not be nil for insert")
+	}
+
+	if op.OldImage != nil {
+		t.Error("OldImage should be nil for insert")
+	}
+}
+
+// TestCorruptDataHandling verifies error handling for malformed input.
+func TestCorruptDataHandling(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"invalid JSON", `{not valid json`},
+		{"empty string", ``},
+		{"null", `null`},
+		{"array instead of object", `[]`},
+		{"invalid Item format", `{"Item": "not an object"}`},
+		{"invalid Keys format", `{"Keys": "not an object", "NewImage": {}}`},
+		{"invalid NewImage format", `{"Keys": {}, "NewImage": "not an object"}`},
+		{"invalid OldImage format", `{"Keys": {}, "OldImage": "not an object"}`},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decoder.Decode([]byte(tt.input))
+			if err == nil {
+				t.Error("expected error for corrupt data")
+			}
+			if !errors.Is(err, ErrCorrupt) {
+				t.Errorf("expected ErrCorrupt, got %v", err)
+			}
+		})
+	}
+}
+
+// TestMetadataIgnored verifies that Metadata field is correctly ignored during parsing.
+func TestMetadataIgnored(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	input := `{
+		"Metadata": {"WriteTimestampMicros": {"N": "1746609560577628"}},
+		"Keys": {"PK": {"S": "1"}},
+		"NewImage": {"PK": {"S": "1"}, "data": {"S": "test"}}
+	}`
+
+	op, err := decoder.Decode([]byte(input))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	// Should parse successfully despite Metadata field
+	if op.Type != OpPut {
+		t.Errorf("expected OpPut, got %d", op.Type)
+	}
+}
+
+// TestAttributeRemovedInUpdate verifies detecting attributes removed during update.
+// This is critical for the writer to generate correct REMOVE expressions.
+func TestAttributeRemovedInUpdate(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	// OldImage has 'removed_attr', NewImage doesn't
+	input := `{
+		"Keys": {"PK": {"S": "1"}},
+		"OldImage": {"PK": {"S": "1"}, "kept": {"S": "stays"}, "removed_attr": {"S": "gone"}},
+		"NewImage": {"PK": {"S": "1"}, "kept": {"S": "stays"}, "added": {"S": "new"}}
+	}`
+
+	op, err := decoder.Decode([]byte(input))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+
+	// Verify removed_attr is in OldImage but not NewImage
+	if _, exists := op.OldImage["removed_attr"]; !exists {
+		t.Error("removed_attr should exist in OldImage")
+	}
+	if _, exists := op.NewImage["removed_attr"]; exists {
+		t.Error("removed_attr should NOT exist in NewImage")
+	}
+
+	// Verify added attr is only in NewImage
+	if _, exists := op.OldImage["added"]; exists {
+		t.Error("added should NOT exist in OldImage")
+	}
+	if _, exists := op.NewImage["added"]; !exists {
+		t.Error("added should exist in NewImage")
+	}
+}
 
 var testData = [][]byte{
 	[]byte("{\"Metadata\":{\"WriteTimestampMicros\":{\"N\":\"1746609560577628\"}},\"Keys\":{\"PK\":{\"S\":\"ITEM#99\"},\"SK\":{\"S\":\"METADATA\"}},\"OldImage\":{\"AttrIndex\":{\"N\":\"780\"},\"AttrLevel\":{\"BOOL\":true},\"AttrSize\":{\"BS\":[\"VWN5WVJncVplZQ==\"]},\"DataName\":{\"NULL\":true},\"DataScore\":{\"L\":[{\"S\":\"dYjXIBvLCgEkkzWixMGv\"},{\"S\":\"lOtkmjiAPSQR\"},{\"S\":\"GdqvFgCQSzvxVlqZ\"},{\"S\":\"HsIwGEt\"},{\"S\":\"ulxOLDKpbqDZ\"}]},\"DataStatus\":{\"L\":[{\"S\":\"KwStgafmLbvmKqCKdH\"}]},\"FieldSize\":{\"SS\":[\"DOvAQjN\"]},\"FieldStatus\":{\"BS\":[\"ZHBZUGc=\",\"dGFyQmN4\",\"enpBbks=\"]},\"InfoName\":{\"BS\":[\"QWFNYlloaQ==\",\"Tklld0FBU2c=\",\"YnpCZ256ZXZhTg==\"]},\"InfoType\":{\"M\":{\"OwOVW\":{\"S\":\"tKBpVavbBjEZGFZ\"},\"Ysfcp\":{\"S\":\"YMCAzpsztdX\"}}},\"PK\":{\"S\":\"ITEM#99\"},\"SK\":{\"S\":\"METADATA\"},\"SettingIndex\":{\"B\":\"VHlnRnR3Qk5OV0xl\"},\"SettingLevel\":{\"BOOL\":false},\"ValueCount\":{\"N\":\"965\"},\"ValueStatus\":{\"BS\":[\"a0pkanBIeVdBcA==\"]}},\"NewImage\":{\"AttrType\":{\"BOOL\":false},\"ConfigIndex\":{\"NS\":[\"590\"]},\"ConfigType\":{\"L\":[{\"S\":\"RciouzoMWuwzH\"}]},\"DataLevel\":{\"S\":\"FuJTEYobbkzPAWpPgXxkiLaPwkIYSHdYPFH\"},\"DataScore\":{\"BOOL\":false},\"DataStatus\":{\"BOOL\":true},\"InfoCount\":{\"B\":\"b2toWnQ=\"},\"InfoIndex\":{\"M\":{\"KJjUj\":{\"S\":\"MktTjmYlCqkSPXLT\"},\"MxqTd\":{\"S\":\"NitYMpqLoCkpLJ\"},\"bqwyu\":{\"S\":\"RAbqIBkAtLNTGGYFFQxZ\"},\"hYWig\":{\"S\":\"pZGWmkdFISbUvNTB\"},\"qHLXr\":{\"S\":\"sTrasrtAzKSLeEwCsE\"}}},\"InfoLevel\":{\"BS\":[\"RElJQU5IREc=\"]},\"MetaCount\":{\"S\":\"lhvZLNAyB\"},\"PK\":{\"S\":\"ITEM#99\"},\"SK\":{\"S\":\"METADATA\"},\"SettingLevel\":{\"NS\":[\"409\",\"783\"]}}}"),

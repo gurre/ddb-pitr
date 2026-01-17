@@ -13,6 +13,7 @@ import (
 	"github.com/gurre/ddb-pitr/integration/mock"
 	"github.com/gurre/ddb-pitr/itemimage"
 	"github.com/gurre/ddb-pitr/manifest"
+	"github.com/gurre/ddb-pitr/metrics"
 	"github.com/gurre/ddb-pitr/writer"
 	"github.com/gurre/s3streamer"
 )
@@ -133,7 +134,7 @@ func TestEndToEndWithCoordinator(t *testing.T) {
 	manifestLoader := manifest.NewS3Loader(mockS3)
 	streamer := s3streamer.NewS3Streamer(mockS3)
 	jsonDecoder := itemimage.NewJSONDecoder() // Use real decoder
-	ddbWriter := writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, cfg.BatchSize)
+	ddbWriter := writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, cfg.BatchSize, writer.Callbacks{})
 	checkpointStore := checkpoint.NewMemoryStore()
 
 	coord := coordinator.NewCoordinator(
@@ -144,6 +145,7 @@ func TestEndToEndWithCoordinator(t *testing.T) {
 		ddbWriter,
 		checkpointStore,
 		nil, // no report uploader in tests
+		metrics.NewMetrics(),
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -345,7 +347,7 @@ func TestDataCorrectnessAfterOperations(t *testing.T) {
 	manifestLoader := manifest.NewS3Loader(mockS3)
 	streamer := s3streamer.NewS3Streamer(mockS3)
 	decoder := itemimage.NewJSONDecoder()
-	ddbWriter := writer.NewDynamoDBWriter(mockDynamoDB, tableName, 25)
+	ddbWriter := writer.NewDynamoDBWriter(mockDynamoDB, tableName, 25, writer.Callbacks{})
 
 	ctx := context.Background()
 

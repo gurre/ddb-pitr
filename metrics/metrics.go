@@ -14,18 +14,23 @@ import (
 
 // Metrics collects counters and histograms as defined in section 6 of the spec.
 // It uses atomic operations for thread-safe counter updates.
+// Fields ordered largest to smallest for memory alignment.
 type Metrics struct {
 	mu sync.RWMutex
-
-	// Counters as specified in section 6
-	recordsProcessed int64 // Total number of records processed
-	batchesWritten   int64 // Number of batches written to DynamoDB
-	errors           int64 // Number of errors encountered
-	corruptCount     int64 // Number of corrupt records found
 
 	// Histograms for performance analysis
 	processingTime time.Duration // Total time spent processing records
 	startTime      time.Time     // When the restore operation started
+
+	// Counters as specified in section 6 (all use atomic operations)
+	recordsProcessed int64 // Total number of records processed
+	batchesWritten   int64 // Number of batches written to DynamoDB
+	errors           int64 // Number of errors encountered
+	corruptCount     int64 // Number of corrupt records found
+	throttles        int64 // Number of throttle events (ProvisionedThroughputExceeded)
+	retries          int64 // Number of successful retries after transient failures
+	lostItems        int64 // Number of items that failed permanently
+	bytesWritten     int64 // Total bytes written to DynamoDB
 }
 
 // NewMetrics creates a new Metrics instance with initialized counters
@@ -55,6 +60,51 @@ func (m *Metrics) RecordCorrupt() {
 	atomic.AddInt64(&m.corruptCount, 1)
 }
 
+// RecordThrottle increments the throttle events counter
+func (m *Metrics) RecordThrottle() {
+	atomic.AddInt64(&m.throttles, 1)
+}
+
+// RecordRetry increments the successful retries counter
+func (m *Metrics) RecordRetry() {
+	atomic.AddInt64(&m.retries, 1)
+}
+
+// RecordLost adds to the lost items counter
+func (m *Metrics) RecordLost(n int64) {
+	atomic.AddInt64(&m.lostItems, n)
+}
+
+// RecordBytes adds to the bytes written counter
+func (m *Metrics) RecordBytes(n int64) {
+	atomic.AddInt64(&m.bytesWritten, n)
+}
+
+// Throttles returns the current throttle count
+func (m *Metrics) Throttles() int64 {
+	return atomic.LoadInt64(&m.throttles)
+}
+
+// Retries returns the current retry count
+func (m *Metrics) Retries() int64 {
+	return atomic.LoadInt64(&m.retries)
+}
+
+// LostItems returns the current lost items count
+func (m *Metrics) LostItems() int64 {
+	return atomic.LoadInt64(&m.lostItems)
+}
+
+// BytesWritten returns the current bytes written count
+func (m *Metrics) BytesWritten() int64 {
+	return atomic.LoadInt64(&m.bytesWritten)
+}
+
+// Errors returns the current error count
+func (m *Metrics) Errors() int64 {
+	return atomic.LoadInt64(&m.errors)
+}
+
 // RecordProcessingTime records the processing time for a batch
 func (m *Metrics) RecordProcessingTime(d time.Duration) {
 	m.mu.Lock()
@@ -67,10 +117,15 @@ func (m *Metrics) RecordProcessingTime(d time.Duration) {
 type Report struct {
 	StartTime    time.Time     `json:"startTime"`    // When the restore operation started
 	EndTime      time.Time     `json:"endTime"`      // When the restore operation completed
+	Duration     time.Duration `json:"duration"`     // Total duration of the operation
 	TotalItems   int64         `json:"totalItems"`   // Total number of items processed
 	CorruptCount int64         `json:"corruptCount"` // Number of corrupt items found
-	Duration     time.Duration `json:"duration"`     // Total duration of the operation
+	Throttles    int64         `json:"throttles"`    // Number of throttle events
+	Retries      int64         `json:"retries"`      // Number of successful retries
+	LostItems    int64         `json:"lostItems"`    // Number of items that failed permanently
+	BytesWritten int64         `json:"bytesWritten"` // Total bytes written
 	Throughput   float64       `json:"throughput"`   // Items processed per second
+	ByteRate     float64       `json:"byteRate"`     // Bytes per second
 }
 
 // GenerateReport generates a final report as specified in section 6.
@@ -79,19 +134,28 @@ func (m *Metrics) GenerateReport() Report {
 	endTime := time.Now()
 	duration := endTime.Sub(m.startTime)
 
-	// Calculate throughput (items per second)
-	var throughput float64
+	totalItems := atomic.LoadInt64(&m.recordsProcessed)
+	bytesWritten := atomic.LoadInt64(&m.bytesWritten)
+
+	// Calculate throughput (items per second) and byte rate
+	var throughput, byteRate float64
 	if duration > 0 {
-		throughput = float64(atomic.LoadInt64(&m.recordsProcessed)) / duration.Seconds()
+		throughput = float64(totalItems) / duration.Seconds()
+		byteRate = float64(bytesWritten) / duration.Seconds()
 	}
 
 	return Report{
 		StartTime:    m.startTime,
 		EndTime:      endTime,
-		TotalItems:   atomic.LoadInt64(&m.recordsProcessed),
-		CorruptCount: atomic.LoadInt64(&m.corruptCount),
 		Duration:     duration,
+		TotalItems:   totalItems,
+		CorruptCount: atomic.LoadInt64(&m.corruptCount),
+		Throttles:    atomic.LoadInt64(&m.throttles),
+		Retries:      atomic.LoadInt64(&m.retries),
+		LostItems:    atomic.LoadInt64(&m.lostItems),
+		BytesWritten: bytesWritten,
 		Throughput:   throughput,
+		ByteRate:     byteRate,
 	}
 }
 
@@ -111,14 +175,24 @@ func (r Report) MarshalJSON() ([]byte, error) {
 // String returns a human-readable string representation of the report
 // as specified in section 6 for console output.
 func (r Report) String() string {
+	mbWritten := float64(r.BytesWritten) / (1024 * 1024)
+	mbPerSec := r.ByteRate / (1024 * 1024)
+
 	return fmt.Sprintf(
 		"Restore completed in %s\n"+
 			"Total items: %d\n"+
 			"Corrupt items: %d\n"+
-			"Throughput: %.2f items/sec",
+			"Throughput: %.2f items/sec (%.2f MB/s)\n"+
+			"Data written: %.2f MB\n"+
+			"Throttles: %d | Retries: %d | Lost: %d",
 		r.Duration,
 		r.TotalItems,
 		r.CorruptCount,
 		r.Throughput,
+		mbPerSec,
+		mbWritten,
+		r.Throttles,
+		r.Retries,
+		r.LostItems,
 	)
 }
