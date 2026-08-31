@@ -65,6 +65,11 @@ changelog:
   # Grouped by what a reader is looking for: whether anything they depend on changed.
   use: github
   sort: asc
+  # Commit and subject only. The default entry template falls back to the author's
+  # name and email address whenever it cannot resolve a GitHub username, which puts a
+  # private address on a public releases page. The SHA already links to the commit,
+  # where GitHub attributes it without exposing the address.
+  format: "{{ .SHA }}: {{ .Message }}"
   groups:
     - title: Features
       regexp: '(?i)^.*?feat(\(.+\))??!?:.+$'
