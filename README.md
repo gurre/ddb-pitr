@@ -163,9 +163,11 @@ go test -race ./...
 ```
 
 Test strength is measured with [mutest](https://github.com/gurre/mutest), which introduces one
-small defect at a time and reports the ones no test notices. The suite currently kills 93% of
-them. The survivors that remain are defects no test can observe: preallocation hints, retry
-pacing constants and equivalent boundary rewrites.
+small defect at a time and reports the ones no test notices. The tests reach 97% of the code
+and notice 89% of the defects introduced into what they reach. The survivors that remain are
+mostly defects no test can observe: preallocation hints, equivalent boundary rewrites, and
+buffering a channel nothing depends on the synchronisation of. The `cmd` packages are not
+covered: they wire the others together and nothing tests that wiring.
 
 ```bash
 mutest -packages writer            # one package
