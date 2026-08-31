@@ -65,6 +65,20 @@ func (m *S3Client) LoadTestFiles() error {
 		return fmt.Errorf("failed to load shared data directory: %w", err)
 	}
 
+	// The ETags the manifests recorded are applied once every file is in place. Loading
+	// a data file stamps a placeholder ETag on it, and exports share a data directory,
+	// so applying them any earlier lets a later load overwrite them.
+	for _, exportDir := range exportDirs {
+		manifestFilesPath := filepath.Join(m.TestDataDir, "AWSDynamoDB", exportDir, "manifest-files.json")
+		manifestFiles, err := os.ReadFile(manifestFilesPath)
+		if err != nil {
+			return fmt.Errorf("failed to read manifest files for %s: %w", exportDir, err)
+		}
+		if err := m.SetETags(manifestFiles); err != nil {
+			return fmt.Errorf("failed to set ETags for %s: %w", exportDir, err)
+		}
+	}
+
 	return nil
 }
 
@@ -87,11 +101,6 @@ func (m *S3Client) loadExportDir(exportDir string) error {
 	// Add manifests to mock S3
 	m.addFile("test-bucket", fmt.Sprintf("AWSDynamoDB/%s/manifest-summary.json", exportDir), manifestSummary)
 	m.addFile("test-bucket", fmt.Sprintf("AWSDynamoDB/%s/manifest-files.json", exportDir), manifestFiles)
-
-	// Set ETags from manifest
-	if err := m.SetETags(manifestFiles); err != nil {
-		fmt.Printf("Warning: Failed to set ETags from manifest %s: %v\n", exportDir, err)
-	}
 
 	// Load export-local data directory if it exists
 	localDataDir := filepath.Join(m.TestDataDir, "AWSDynamoDB", exportDir, "data")

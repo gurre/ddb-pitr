@@ -67,6 +67,15 @@ type FileMeta struct {
 	ItemCount int64  `json:"itemCount"`     // Number of items in this file
 }
 
+// Verification reports what checksum verification established. Files the manifest
+// recorded nothing comparable for are listed rather than counted as good, so a caller
+// can tell "checked and matched" from "nothing to check against".
+// Fields are ordered largest-to-smallest for memory alignment.
+type Verification struct {
+	Unverified []string // Keys of data files verification could not establish either way
+	Verified   int      // Data files whose S3 object matched what the manifest recorded
+}
+
 // Loader interface defines the contract for loading and verifying manifest files.
 // Example:
 //
@@ -75,10 +84,10 @@ type FileMeta struct {
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	err = loader.VerifyChecksums(ctx, summary)
+//	result, err := loader.VerifyChecksums(ctx, summary)
 type Loader interface {
 	Load(ctx context.Context, manifestS3URI string) (Summary, error)
-	VerifyChecksums(ctx context.Context, summary Summary) error
+	VerifyChecksums(ctx context.Context, summary Summary) (Verification, error)
 }
 
 // S3Loader implements the Loader interface using AWS S3.
@@ -173,6 +182,13 @@ func (l *S3Loader) Load(ctx context.Context, manifestS3URI string) (Summary, err
 }
 
 // VerifyChecksums implements the checksum verification requirements from section 4.3.
+// It reports an error only when a data file demonstrably differs from what the manifest
+// recorded; files it has nothing to compare against come back in Unverified.
+//
+// The manifest records both the ETag S3 reported at export time and the object's MD5.
+// The ETag is compared first because it is the only one that works for a file S3 stored
+// in parts, whose ETag is a digest of the parts' digests rather than of the object.
+//
 // Example:
 //
 //	loader := manifest.NewS3Loader(client)
@@ -180,15 +196,18 @@ func (l *S3Loader) Load(ctx context.Context, manifestS3URI string) (Summary, err
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	if err := loader.VerifyChecksums(ctx, summary); err != nil {
+//	result, err := loader.VerifyChecksums(ctx, summary)
+//	if err != nil {
 //	    log.Fatal("Checksum verification failed:", err)
 //	}
-func (l *S3Loader) VerifyChecksums(ctx context.Context, summary Summary) error {
+//	fmt.Printf("%d verified, %d unverifiable\n", result.Verified, len(result.Unverified))
+func (l *S3Loader) VerifyChecksums(ctx context.Context, summary Summary) (Verification, error) {
 	// We need the bucket for HeadObject operations
 	if summary.S3Bucket == "" {
-		return fmt.Errorf("no S3 bucket specified in summary")
+		return Verification{}, fmt.Errorf("no S3 bucket specified in summary")
 	}
 	bucket := summary.S3Bucket
+	result := Verification{Unverified: make([]string, 0)}
 
 	for _, file := range summary.DataFiles {
 		// Get the object metadata from S3 using HeadObject
@@ -198,36 +217,54 @@ func (l *S3Loader) VerifyChecksums(ctx context.Context, summary Summary) error {
 			Key:    &key,
 		})
 		if err != nil {
-			return fmt.Errorf("failed to get metadata for data file %s: %w", file.Key, err)
+			return Verification{}, fmt.Errorf("failed to get metadata for data file %s: %w", file.Key, err)
 		}
 
 		if resp.ETag == nil {
-			return fmt.Errorf("ETag is nil for data file %s", file.Key)
+			return Verification{}, fmt.Errorf("ETag is nil for data file %s", file.Key)
 		}
 
-		// Remove the quotes that may surround the ETag
-		etag := strings.Trim(*resp.ETag, "\"")
+		// Some S3 implementations quote the ETag and some do not.
+		etag := strings.Trim(*resp.ETag, `"`)
+
+		if recorded := strings.Trim(file.ETag, `"`); recorded != "" {
+			if etag != recorded {
+				return Verification{}, fmt.Errorf("ETag mismatch for data file %s: manifest recorded %s, S3 reports %s",
+					file.Key, recorded, etag)
+			}
+			result.Verified++
+			continue
+		}
+
+		// Without a recorded ETag the object's MD5 is all that is left, and it cannot
+		// speak for an object S3 assembled from parts.
+		if file.MD5Base64 == "" || isMultipartETag(etag) {
+			result.Unverified = append(result.Unverified, file.Key)
+			continue
+		}
 
 		// Convert expected MD5 from Base64 to Hex
 		md5Bytes, err := base64.StdEncoding.DecodeString(file.MD5Base64)
 		if err != nil {
-			return fmt.Errorf("failed to decode MD5 Base64 for data file %s: %w", file.Key, err)
+			return Verification{}, fmt.Errorf("failed to decode MD5 Base64 for data file %s: %w", file.Key, err)
 		}
 		expectedMD5Hex := fmt.Sprintf("%x", md5Bytes)
 
-		// Check if the ETag from S3 matches the expected MD5 checksum
-		// Note: this assumes no multipart uploads, as S3 calculates ETags differently for multipart uploads
 		if etag != expectedMD5Hex {
-			// Try with quotes too, as some S3 implementations return quoted ETags
-			quotedExpectedMD5 := fmt.Sprintf("\"%s\"", expectedMD5Hex)
-			if *resp.ETag != quotedExpectedMD5 {
-				return fmt.Errorf("checksum mismatch for data file %s: expected %s, got %s",
-					file.Key, expectedMD5Hex, etag)
-			}
+			return Verification{}, fmt.Errorf("checksum mismatch for data file %s: expected %s, got %s",
+				file.Key, expectedMD5Hex, etag)
 		}
+		result.Verified++
 	}
 
-	return nil
+	return result, nil
+}
+
+// isMultipartETag reports whether S3 built this ETag from a multipart upload, which
+// makes it an MD5 of the parts' MD5s followed by the part count. A single-part ETag is
+// plain hex, so the hyphen the part count is joined by is what tells them apart.
+func isMultipartETag(etag string) bool {
+	return strings.Contains(etag, "-")
 }
 
 // extractBucketFromS3URI extracts the bucket name from an S3 URI.

@@ -155,6 +155,122 @@ func TestReportMarshalJSON(t *testing.T) {
 	}
 }
 
+// TestProcessingTimeIsSafeUnderConcurrentWriters verifies the accumulated processing
+// time is guarded. Every worker records into it after each batch while the report reads
+// it, so unsynchronised access is a live data race that -race exposes here.
+func TestProcessingTimeIsSafeUnderConcurrentWriters(t *testing.T) {
+	m := NewMetrics()
+	const workers = 8
+	const batches = 50
+
+	var wg sync.WaitGroup
+	wg.Add(workers + 1)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for j := 0; j < batches; j++ {
+				m.RecordProcessingTime(time.Millisecond)
+			}
+		}()
+	}
+	go func() {
+		defer wg.Done()
+		for j := 0; j < batches; j++ {
+			m.GenerateReport()
+		}
+	}()
+	wg.Wait()
+
+	if got := m.GenerateReport().ProcessingTime; got != workers*batches*time.Millisecond {
+		t.Errorf("ProcessingTime = %v, want %v", got, workers*batches*time.Millisecond)
+	}
+}
+
+// TestReportCarriesTheWholeRun verifies every counter reaches the report. The report is
+// the only durable record once the process exits, so a field left at its zero value
+// would tell an operator a restore hit no throttling and lost nothing when it did.
+func TestReportCarriesTheWholeRun(t *testing.T) {
+	m := NewMetrics()
+	// Every value is distinct so a field taking another's value cannot look correct.
+	for i := 0; i < 7; i++ {
+		m.RecordProcessed()
+	}
+	for i := 0; i < 3; i++ {
+		m.RecordBatchWritten()
+	}
+	for i := 0; i < 5; i++ {
+		m.RecordCorrupt()
+	}
+	for i := 0; i < 2; i++ {
+		m.RecordThrottle()
+	}
+	for i := 0; i < 4; i++ {
+		m.RecordRetry()
+	}
+	m.RecordLost(6)
+	m.RecordBytes(8)
+	m.RecordProcessingTime(9 * time.Millisecond)
+
+	report := m.GenerateReport()
+
+	if report.StartTime.IsZero() {
+		t.Error("report carries no start time")
+	}
+	if !report.EndTime.After(report.StartTime) {
+		t.Errorf("report ends at %v, which is not after its start %v", report.EndTime, report.StartTime)
+	}
+	if report.Duration <= 0 {
+		t.Errorf("Duration = %v, want a positive span", report.Duration)
+	}
+	for _, tt := range []struct {
+		name string
+		got  int64
+		want int64
+	}{
+		{"TotalItems", report.TotalItems, 7},
+		{"BatchesWritten", report.BatchesWritten, 3},
+		{"CorruptCount", report.CorruptCount, 5},
+		{"Throttles", report.Throttles, 2},
+		{"Retries", report.Retries, 4},
+		{"LostItems", report.LostItems, 6},
+		{"BytesWritten", report.BytesWritten, 8},
+	} {
+		if tt.got != tt.want {
+			t.Errorf("report.%s = %d, want %d", tt.name, tt.got, tt.want)
+		}
+	}
+	if report.ProcessingTime != 9*time.Millisecond {
+		t.Errorf("report.ProcessingTime = %v, want 9ms", report.ProcessingTime)
+	}
+}
+
+// TestReportStringLabelsEveryCount verifies the console summary puts each number against
+// its own label. Throttles, retries and lost items call for different responses from an
+// operator, so reading one as another sends them the wrong way.
+func TestReportStringLabelsEveryCount(t *testing.T) {
+	// Distinct values, so a transposed pair cannot look correct.
+	report := Report{
+		Duration:       90 * time.Second,
+		TotalItems:     11,
+		BatchesWritten: 22,
+		CorruptCount:   33,
+		Throughput:     44,
+		Throttles:      55,
+		Retries:        66,
+		LostItems:      77,
+	}
+
+	const want = "Restore completed in 1m30s\n" +
+		"Total items: 11 in 22 batches\n" +
+		"Corrupt items: 33\n" +
+		"Throughput: 44.00 items/sec (0.00 MB/s)\n" +
+		"Data written: 0.00 MB\n" +
+		"Throttles: 55 | Retries: 66 | Lost: 77"
+	if got := report.String(); got != want {
+		t.Errorf("report string =\n%s\nwant\n%s", got, want)
+	}
+}
+
 // TestRecordProcessingTime verifies time spent writing accumulates into the report,
 // where it is what tells an operator whether the restore was limited by DynamoDB or
 // by reading the export.

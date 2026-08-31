@@ -18,7 +18,14 @@ import (
 	"github.com/gurre/ddb-pitr/aws"
 )
 
-// State represents the current state of the restore operation as defined in section 4.7.
+// State is the durable record of what a restore has finished, from which what remains
+// to do is computed.
+//
+// Progress is recorded per file rather than as a single high-water mark because a pool
+// of workers processes different files at the same time. A worker finishing the ninth
+// file says nothing about the third through eighth, which other workers may still be
+// part-way through; a single mark would let a resume skip them.
+//
 // Example:
 //
 //	store := checkpoint.NewS3Store(client, "s3://my-bucket/checkpoints/restore-123.json")
@@ -26,11 +33,11 @@ import (
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	fmt.Printf("Last processed file: %s\n", state.LastFile)
+//	fmt.Printf("%d files already done\n", len(state.Completed))
 type State struct {
-	ExportID       string `json:"exportId"`       // ID of the export being processed
-	LastFile       string `json:"lastFile"`       // Last file that was processed
-	LastByteOffset int64  `json:"lastByteOffset"` // Byte offset within the last file
+	Completed []string         `json:"completed"` // Keys of data files processed to the end
+	ExportID  string           `json:"exportId"`  // Identity of the export this progress belongs to
+	Offsets   map[string]int64 `json:"offsets"`   // Bytes already consumed, per file still in progress
 }
 
 // Store interface defines the contract for saving and loading checkpoint state.
@@ -41,7 +48,7 @@ type State struct {
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	state.LastFile = "new-file.json"
+//	state.Completed = append(state.Completed, "new-file.json")
 //	err = store.Save(ctx, state)
 type Store interface {
 	Load(ctx context.Context) (State, error)
@@ -92,7 +99,7 @@ func NewS3Store(client aws.S3Client, uri string) (*S3Store, error) {
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	fmt.Printf("Resuming from file %s at offset %d\n", state.LastFile, state.LastByteOffset)
+//	fmt.Printf("Resuming: %d files done, %d part-way\n", len(state.Completed), len(state.Offsets))
 func (s *S3Store) Load(ctx context.Context) (State, error) {
 	resp, err := s.client.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: &s.bucket,
@@ -127,9 +134,9 @@ func (s *S3Store) Load(ctx context.Context) (State, error) {
 //
 //	store := checkpoint.NewS3Store(client, "s3://my-bucket/checkpoints/restore-123.json")
 //	state := checkpoint.State{
-//	    ExportID: "export-123",
-//	    LastFile: "data-001.json",
-//	    LastByteOffset: 1024,
+//	    ExportID:  "arn:aws:dynamodb:eu-north-1:123456789012:table/orders/export/01768385930622-efd1a093",
+//	    Completed: []string{"data-001.json.gz"},
+//	    Offsets:   map[string]int64{"data-002.json.gz": 1024},
 //	}
 //	err := store.Save(ctx, state)
 //	if err != nil {
@@ -207,7 +214,7 @@ func NewFileStore(uri string) (*FileStore, error) {
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	fmt.Printf("Resuming from file %s at offset %d\n", state.LastFile, state.LastByteOffset)
+//	fmt.Printf("Resuming: %d files done, %d part-way\n", len(state.Completed), len(state.Offsets))
 func (f *FileStore) Load(ctx context.Context) (State, error) {
 	data, err := os.ReadFile(f.path)
 	if err != nil {
@@ -230,9 +237,9 @@ func (f *FileStore) Load(ctx context.Context) (State, error) {
 //
 //	store := checkpoint.NewFileStore("file:///tmp/checkpoints/restore-123.json")
 //	state := checkpoint.State{
-//	    ExportID: "export-123",
-//	    LastFile: "data-001.json",
-//	    LastByteOffset: 1024,
+//	    ExportID:  "arn:aws:dynamodb:eu-north-1:123456789012:table/orders/export/01768385930622-efd1a093",
+//	    Completed: []string{"data-001.json.gz"},
+//	    Offsets:   map[string]int64{"data-002.json.gz": 1024},
 //	}
 //	err := store.Save(ctx, state)
 //	if err != nil {

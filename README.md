@@ -8,9 +8,10 @@ AWS DynamoDB Point-in-Time Recovery can export table data to S3, but provides no
 
 - Stream multi-terabyte exports without loading into memory
 - Parallel workers with configurable concurrency
-- Checkpoint to S3 for safe resume after interruption
+- Checkpoint to S3 so an interrupted restore resumes where it stopped, at any worker count
+- Every data file checked against the manifest before the first write
 - Automatic throttling handling with exponential backoff
-- Dry-run mode for validation before restore
+- Dry-run mode that reads and measures the whole export without writing
 
 ## Supported Operations
 
@@ -25,7 +26,7 @@ For INCREMENTAL exports containing UPDATE operations, consider using FULL export
 ## Installation
 
 ```bash
-go install github.com/gurre/ddb-pitr@latest
+go install github.com/gurre/ddb-pitr/cmd/ddb-pitr@latest
 ```
 
 ## Usage
@@ -37,7 +38,7 @@ ddb-pitr restore \
   --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef/ \
   --region us-west-2
 
-# Validate export before restoring (no writes)
+# Read and measure the whole export without writing anything to the table
 ddb-pitr restore \
   --table my-table \
   --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef/ \
@@ -90,8 +91,30 @@ ddb-pitr restore \
 - `--workers`: Maximum number of concurrent workers (default: 10)
 - `--batch`: Batch size for DynamoDB writes (max 25, default: 25)
 - `--report`: S3 URI for the final report
-- `--dry-run`: Validate configuration without restoring
+- `--dry-run`: Read and measure the whole export without writing to the table
 - `--shutdown-timeout`: Graceful shutdown timeout (default: 5m)
+
+## Resuming an interrupted restore
+
+Pass `--resume` and a restore that is interrupted picks up where it stopped. The
+checkpoint records which data files finished and how far into the unfinished ones the
+restore got, so resuming re-reads only what was not completed, whatever `--workers` was
+set to. A checkpoint belongs to one export: pointing a different export at it is refused
+rather than resumed, since file names repeat across exports.
+
+Without `--resume` progress is kept in memory only, and an interrupted restore starts
+over. A `--dry-run` never writes a checkpoint, so a later restore cannot skip work that
+was only measured.
+
+## Verification
+
+Before the first write, every data file the manifest lists is checked against what S3
+reports for it. A file that no longer matches fails the restore while the target table
+is still untouched.
+
+Real exports store large data files in parts, and the manifest records the ETag S3
+produced for each, which is what the check compares. A file whose manifest entry carries
+nothing comparable is counted as unverified and reported rather than passed off as good.
 
 ## Architecture
 

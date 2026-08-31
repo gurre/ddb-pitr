@@ -39,6 +39,19 @@ type Backoffer interface {
 	Wait(ctx context.Context, attempt int) bool
 }
 
+// errBackoffStopped stands in when a wait was cut short but the context reports no
+// error. Returning the context's nil error there would hand a surrendered batch back as
+// a successful write, and the restore would count items it never sent.
+var errBackoffStopped = errors.New("writer: backoff stopped before the batch was written")
+
+// stopRetrying reports why the retry loop is giving up. It never returns nil.
+func stopRetrying(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return errBackoffStopped
+}
+
 // Option adjusts optional DynamoDBWriter behaviour.
 type Option func(*DynamoDBWriter)
 
@@ -64,13 +77,22 @@ type DynamoDBWriter struct {
 	batchSize int // Maximum number of operations per batch (≤25)
 }
 
+// maxBatchSize is DynamoDB's hard limit on the number of requests BatchWriteItem accepts.
+const maxBatchSize = 25
+
 // NewDynamoDBWriter creates a new DynamoDBWriter instance with the specified batch size and callbacks.
+// The batch size must be within DynamoDB's limits: a non-positive one leaves the split
+// loop unable to advance and a larger one builds a request DynamoDB rejects, so both are
+// wiring mistakes worth failing on here rather than mid-restore.
 // Example:
 //
 //	w := writer.NewDynamoDBWriter(client, "my-table", 25, writer.Callbacks{
 //	    OnThrottle: m.RecordThrottle,
 //	})
 func NewDynamoDBWriter(client aws.DynamoDBClient, tableName string, batchSize int, callbacks Callbacks, opts ...Option) *DynamoDBWriter {
+	if batchSize < 1 || batchSize > maxBatchSize {
+		panic(fmt.Sprintf("writer: batch size %d is outside 1..%d", batchSize, maxBatchSize))
+	}
 	w := &DynamoDBWriter{
 		client:    client,
 		tableName: tableName,
@@ -264,7 +286,7 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 						w.callbacks.OnThrottle()
 					}
 					if !w.backoff.Wait(ctx, attempt) {
-						return ctx.Err()
+						return stopRetrying(ctx)
 					}
 					attempt++
 					hadRetry = true
@@ -273,7 +295,7 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 				// Non-throttling error: retry up to maxRetries
 				if attempt < maxRetries {
 					if !w.backoff.Wait(ctx, attempt) {
-						return ctx.Err()
+						return stopRetrying(ctx)
 					}
 					attempt++
 					hadRetry = true
@@ -293,7 +315,7 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 				}
 				input.RequestItems = output.UnprocessedItems
 				if !w.backoff.Wait(ctx, attempt) {
-					return ctx.Err()
+					return stopRetrying(ctx)
 				}
 				attempt++
 				hadRetry = true
@@ -407,7 +429,7 @@ func (w *DynamoDBWriter) updateItem(ctx context.Context, op itemimage.Operation)
 					w.callbacks.OnThrottle()
 				}
 				if !w.backoff.Wait(ctx, attempt) {
-					return ctx.Err()
+					return stopRetrying(ctx)
 				}
 				attempt++
 				hadRetry = true
@@ -416,7 +438,7 @@ func (w *DynamoDBWriter) updateItem(ctx context.Context, op itemimage.Operation)
 			// Non-throttling error: retry up to maxRetries
 			if attempt < maxRetries {
 				if !w.backoff.Wait(ctx, attempt) {
-					return ctx.Err()
+					return stopRetrying(ctx)
 				}
 				attempt++
 				hadRetry = true

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -41,6 +42,10 @@ func TestMissingExportURI(t *testing.T) {
 	}
 }
 
+// TestInvalidS3URI verifies an export location that is not an S3 URI naming a bucket is
+// rejected at startup. Every later request is addressed from this value, so accepting a
+// bucketless or wrong-scheme URI turns one clear error into a confusing failure deep in
+// the restore.
 func TestInvalidS3URI(t *testing.T) {
 	testCases := []struct {
 		name string
@@ -50,6 +55,9 @@ func TestInvalidS3URI(t *testing.T) {
 		{"https scheme", "https://bucket/key"},
 		{"no scheme", "bucket/key"},
 		{"file scheme", "file:///path/to/file"},
+		{"no bucket at all", "s3://"},
+		{"empty bucket before the key", "s3:///some/prefix"},
+		{"unparseable", "s3://bucket/%zz"},
 	}
 
 	for _, tc := range testCases {
@@ -60,6 +68,81 @@ func TestInvalidS3URI(t *testing.T) {
 				t.Errorf("expected error for invalid S3 URI: %s", tc.uri)
 			}
 		})
+	}
+}
+
+// TestValidateReportsTheFirstProblem verifies each rule names what it rejected, so an
+// operator fixing a configuration is told which field is wrong rather than that
+// something is.
+func TestValidateReportsTheFirstProblem(t *testing.T) {
+	tests := []struct {
+		name    string
+		spoil   func(*Config)
+		mention string
+	}{
+		{"table name", func(c *Config) { c.TableName = "" }, "table name"},
+		{"export URI", func(c *Config) { c.ExportS3URI = "" }, "export S3 URI"},
+		{"export type", func(c *Config) { c.ExportType = "PARTIAL" }, "export type"},
+		{"view type", func(c *Config) { c.ViewType = "OLD" }, "view type"},
+		{"region", func(c *Config) { c.Region = "" }, "region"},
+		{"max workers", func(c *Config) { c.MaxWorkers = 0 }, "max workers"},
+		{"batch size", func(c *Config) { c.BatchSize = 26 }, "batch size"},
+		{"report URI", func(c *Config) { c.ReportS3URI = "http://bucket/report" }, "report S3 URI"},
+		{"shutdown timeout", func(c *Config) { c.ShutdownTimeout = 0 }, "shutdown timeout"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.spoil(cfg)
+
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected an error for an invalid %s", tt.name)
+			}
+			if !strings.Contains(err.Error(), tt.mention) {
+				t.Errorf("error %q does not name %q", err, tt.mention)
+			}
+		})
+	}
+}
+
+// TestExportURIIsCheckedInOrder verifies each export URI rule reports its own problem
+// rather than a later one's. An operator who omitted the flag entirely should be told it
+// is required, not that it must start with s3://.
+func TestExportURIIsCheckedInOrder(t *testing.T) {
+	tests := []struct {
+		name    string
+		uri     string
+		mention string
+	}{
+		{"omitted entirely", "", "required"},
+		{"wrong prefix", "https://bucket/key", "must start with s3://"},
+		{"no bucket", "s3://", "bucket"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			cfg.ExportS3URI = tt.uri
+
+			err := cfg.Validate()
+			if err == nil {
+				t.Fatalf("expected %q to be rejected", tt.uri)
+			}
+			if !strings.Contains(err.Error(), tt.mention) {
+				t.Errorf("error %q does not mention %q", err, tt.mention)
+			}
+		})
+	}
+}
+
+// TestGetExportBucketNameIsEmptyBeforeValidation verifies the parsed bucket only exists
+// once validation has run. Reading it earlier would silently address every request to an
+// empty bucket, so it must not look populated.
+func TestGetExportBucketNameIsEmptyBeforeValidation(t *testing.T) {
+	if got := validConfig().GetExportBucketName(); got != "" {
+		t.Errorf("expected no bucket before validation, got %q", got)
 	}
 }
 

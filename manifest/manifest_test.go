@@ -20,16 +20,32 @@ const (
 	testMD5Hex    = "5eb63bbbe01eeed093cb22bb8f5acdc3"
 )
 
-// mockS3Client implements the aws.S3Client interface for testing
+// mockS3Client implements the aws.S3Client interface for testing. It counts calls that
+// arrived without the marker a test put on its context, which is how a call made under a
+// substituted context is told from one made under the caller's.
 type mockS3Client struct {
-	data    map[string][]byte
-	etags   map[string]string // Custom ETags for specific keys
-	buckets []string          // Buckets the loader asked for, in order
+	data     map[string][]byte
+	etags    map[string]string // Custom ETags for specific keys
+	buckets  []string          // Buckets the loader asked for, in order
+	detached int
+}
+
+// callerContextKey marks the context a test passed in.
+type callerContextKey struct{}
+
+func (m *mockS3Client) noteContext(ctx context.Context) {
+	if ctx.Value(callerContextKey{}) == nil {
+		m.detached++
+	}
 }
 
 func (m *mockS3Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+	m.noteContext(ctx)
 	if params.Key == nil {
 		return nil, fmt.Errorf("key is nil")
+	}
+	if params.Bucket == nil || *params.Bucket == "" {
+		return nil, fmt.Errorf("no bucket in request")
 	}
 
 	m.buckets = append(m.buckets, *params.Bucket)
@@ -49,8 +65,12 @@ func (m *mockS3Client) PutObject(ctx context.Context, params *s3.PutObjectInput,
 }
 
 func (m *mockS3Client) HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	m.noteContext(ctx)
 	if params.Key == nil {
 		return nil, fmt.Errorf("key is nil")
+	}
+	if params.Bucket == nil || *params.Bucket == "" {
+		return nil, fmt.Errorf("no bucket in request")
 	}
 
 	// Check if we have a custom ETag for this key. An empty one stands for the S3
@@ -77,13 +97,19 @@ func (m *mockS3Client) HeadObject(ctx context.Context, params *s3.HeadObjectInpu
 	}, nil
 }
 
-// mockReadCloser implements io.ReadCloser for testing
+// mockReadCloser implements io.ReadCloser for testing. Reading a closed body fails, the
+// way a real S3 response body does, so a loader that closed one before finishing with it
+// is caught here rather than in production.
 type mockReadCloser struct {
 	data   []byte
 	offset int
+	closed bool
 }
 
 func (m *mockReadCloser) Read(p []byte) (n int, err error) {
+	if m.closed {
+		return 0, fmt.Errorf("read after the response body was closed")
+	}
 	if m.offset >= len(m.data) {
 		return 0, io.EOF
 	}
@@ -99,6 +125,7 @@ func (m *mockReadCloser) Read(p []byte) (n int, err error) {
 }
 
 func (m *mockReadCloser) Close() error {
+	m.closed = true
 	return nil
 }
 
@@ -219,8 +246,12 @@ func TestVerifyChecksumsAcceptsMatchingETag(t *testing.T) {
 		etags: map[string]string{"data-001.json.gz": testMD5Hex},
 	})
 
-	if err := loader.VerifyChecksums(context.Background(), summary); err != nil {
-		t.Errorf("expected a matching checksum to verify, got %v", err)
+	result, err := loader.VerifyChecksums(context.Background(), summary)
+	if err != nil {
+		t.Fatalf("expected a matching checksum to verify, got %v", err)
+	}
+	if result.Verified != 1 {
+		t.Errorf("expected 1 file counted as verified, got %d", result.Verified)
 	}
 }
 
@@ -232,8 +263,12 @@ func TestVerifyChecksumsAcceptsQuotedETag(t *testing.T) {
 		etags: map[string]string{"data-001.json.gz": `"` + testMD5Hex + `"`},
 	})
 
-	if err := loader.VerifyChecksums(context.Background(), summary); err != nil {
-		t.Errorf("expected a quoted matching checksum to verify, got %v", err)
+	result, err := loader.VerifyChecksums(context.Background(), summary)
+	if err != nil {
+		t.Fatalf("expected a quoted matching checksum to verify, got %v", err)
+	}
+	if result.Verified != 1 {
+		t.Errorf("expected 1 file counted as verified, got %d", result.Verified)
 	}
 }
 
@@ -246,12 +281,126 @@ func TestVerifyChecksumsRejectsMismatch(t *testing.T) {
 		etags: map[string]string{"data-001.json.gz": "00000000000000000000000000000000"},
 	})
 
-	err := loader.VerifyChecksums(context.Background(), summary)
+	_, err := loader.VerifyChecksums(context.Background(), summary)
 	if err == nil {
 		t.Fatal("expected a checksum mismatch to be reported")
 	}
 	if !strings.Contains(err.Error(), "data-001.json.gz") {
 		t.Errorf("expected the offending file named, got %v", err)
+	}
+}
+
+// TestVerifyChecksumsMatchesRecordedETag verifies a data file is accepted when the ETag
+// S3 reports is the one the manifest recorded at export time. Real exports store large
+// files in parts, whose ETag is a digest of the parts' digests and never equals the
+// object's MD5, so this is the only comparison that can pass for them.
+func TestVerifyChecksumsMatchesRecordedETag(t *testing.T) {
+	const multipartETag = "7deb4078f238dd87d6af0538152c04e9-1"
+	summary := Summary{
+		S3Bucket: "test-bucket",
+		// The MD5 is present and deliberately does not match the ETag, exactly as it
+		// does not in a real manifest for a file uploaded in parts.
+		DataFiles: []FileMeta{{Key: "data-001.json.gz", ETag: multipartETag, MD5Base64: testMD5Base64}},
+	}
+	loader := NewS3Loader(&mockS3Client{etags: map[string]string{"data-001.json.gz": multipartETag}})
+
+	result, err := loader.VerifyChecksums(context.Background(), summary)
+	if err != nil {
+		t.Fatalf("expected a file matching its recorded ETag to verify, got %v", err)
+	}
+	if result.Verified != 1 {
+		t.Errorf("expected 1 file counted as verified, got %d", result.Verified)
+	}
+}
+
+// TestVerifyChecksumsRejectsChangedETag verifies a data file that has been replaced
+// since the export was written is reported. This is the failure verification exists to
+// catch, and it must not be softened into "unverifiable" just because the ETag is
+// multipart.
+func TestVerifyChecksumsRejectsChangedETag(t *testing.T) {
+	summary := Summary{
+		S3Bucket:  "test-bucket",
+		DataFiles: []FileMeta{{Key: "data-001.json.gz", ETag: "7deb4078f238dd87d6af0538152c04e9-1"}},
+	}
+	loader := NewS3Loader(&mockS3Client{
+		etags: map[string]string{"data-001.json.gz": "b5443265c5e545b6c8d8275e0b6f8c15-1"},
+	})
+
+	if _, err := loader.VerifyChecksums(context.Background(), summary); err == nil {
+		t.Error("expected a data file that no longer matches the manifest to be reported")
+	}
+}
+
+// TestVerifyChecksumsReportsWhatItCannotCheck verifies a file with nothing comparable is
+// listed as unverified rather than counted as good. Reporting "verified" for a file
+// nothing was checked against would be the more dangerous of the two answers.
+func TestVerifyChecksumsReportsWhatItCannotCheck(t *testing.T) {
+	tests := []struct {
+		name string
+		file FileMeta
+		etag string
+	}{
+		{
+			name: "manifest recorded neither ETag nor checksum",
+			file: FileMeta{Key: "data-001.json.gz"},
+			etag: "5eb63bbbe01eeed093cb22bb8f5acdc3",
+		},
+		{
+			name: "only an MD5, against a multipart ETag it cannot describe",
+			file: FileMeta{Key: "data-001.json.gz", MD5Base64: testMD5Base64},
+			etag: "7deb4078f238dd87d6af0538152c04e9-1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			summary := Summary{S3Bucket: "test-bucket", DataFiles: []FileMeta{tt.file}}
+			loader := NewS3Loader(&mockS3Client{etags: map[string]string{tt.file.Key: tt.etag}})
+
+			result, err := loader.VerifyChecksums(context.Background(), summary)
+			if err != nil {
+				t.Fatalf("expected an unverifiable file to be reported, not to fail: %v", err)
+			}
+			if result.Verified != 0 {
+				t.Errorf("expected nothing counted as verified, got %d", result.Verified)
+			}
+			if len(result.Unverified) != 1 || result.Unverified[0] != tt.file.Key {
+				t.Errorf("expected the file listed as unverified, got %v", result.Unverified)
+			}
+		})
+	}
+}
+
+// TestVerifyChecksumsAcceptsRealExportManifest verifies the checked-in export manifest,
+// whose files all carry the multipart ETags a real DynamoDB export produces, passes
+// verification. The restore runs this before writing anything, so a real export failing
+// here would block every restore.
+func TestVerifyChecksumsAcceptsRealExportManifest(t *testing.T) {
+	const prefix = "AWSDynamoDB/01768385930622-efd1a093/"
+	summaryKey := prefix + "manifest-summary.json"
+	client := &mockS3Client{
+		data: map[string][]byte{
+			summaryKey:                     loadTestFile(t, "../s3exportdata/"+summaryKey),
+			prefix + "manifest-files.json": loadTestFile(t, "../s3exportdata/"+prefix+"manifest-files.json"),
+		},
+		etags: map[string]string{},
+	}
+
+	summary, err := NewS3Loader(client).Load(context.Background(), "s3://test-bucket/"+summaryKey)
+	if err != nil {
+		t.Fatalf("failed to load manifest: %v", err)
+	}
+	// S3 reports exactly what the manifest recorded, which is the healthy case.
+	for _, file := range summary.DataFiles {
+		client.etags[file.Key] = file.ETag
+	}
+
+	result, err := NewS3Loader(client).VerifyChecksums(context.Background(), summary)
+	if err != nil {
+		t.Fatalf("expected a real export manifest to verify, got %v", err)
+	}
+	if result.Verified != len(summary.DataFiles) {
+		t.Errorf("verified %d of %d data files, want all of them", result.Verified, len(summary.DataFiles))
 	}
 }
 
@@ -288,7 +437,7 @@ func TestVerifyChecksumsRejectsUnusableInputs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := NewS3Loader(tt.client).VerifyChecksums(context.Background(), tt.summary); err == nil {
+			if _, err := NewS3Loader(tt.client).VerifyChecksums(context.Background(), tt.summary); err == nil {
 				t.Error("expected verification to fail")
 			}
 		})
@@ -322,6 +471,57 @@ func TestExtractsBucketAndKeyFromURI(t *testing.T) {
 		if bucket != "test-bucket" {
 			t.Errorf("expected every request against test-bucket, got %q", bucket)
 		}
+	}
+}
+
+// TestLoaderSendsTheCallersContext verifies every S3 call the loader makes carries the
+// caller's context. Detaching from it would leave a shutting-down restore blocked on S3
+// with no deadline and no cancellation.
+func TestLoaderSendsTheCallersContext(t *testing.T) {
+	const summaryKey = "AWSDynamoDB/01768385930622-efd1a093/manifest-summary.json"
+	client := &mockS3Client{
+		data: map[string][]byte{
+			summaryKey:   []byte(`{"itemCount":1,"s3Bucket":"test-bucket","manifestFilesS3Key":"files.json"}`),
+			"files.json": []byte(`{"dataFileS3Key":"data-001.json.gz","etag":"abc-1"}`),
+		},
+		etags: map[string]string{"data-001.json.gz": "abc-1"},
+	}
+	loader := NewS3Loader(client)
+
+	ctx := context.WithValue(context.Background(), callerContextKey{}, true)
+	summary, err := loader.Load(ctx, "s3://test-bucket/"+summaryKey)
+	if err != nil {
+		t.Fatalf("failed to load manifest: %v", err)
+	}
+	if _, err := loader.VerifyChecksums(ctx, summary); err != nil {
+		t.Fatalf("failed to verify checksums: %v", err)
+	}
+
+	if client.detached > 0 {
+		t.Errorf("%d S3 calls were made outside the caller's context", client.detached)
+	}
+}
+
+// TestLoadReadsBothManifestsBeforeClosingThem verifies the loader consumes each response
+// body while it is still open. Closing one early costs the data files, which the restore
+// would then report as an empty export rather than as a failure.
+func TestLoadReadsBothManifestsBeforeClosingThem(t *testing.T) {
+	const summaryKey = "AWSDynamoDB/01768385930622-efd1a093/manifest-summary.json"
+	client := &mockS3Client{data: map[string][]byte{
+		summaryKey: []byte(`{"itemCount":3,"manifestFilesS3Key":"files.json"}`),
+		"files.json": []byte(`{"dataFileS3Key":"data-001.json.gz"}
+{"dataFileS3Key":"data-002.json.gz"}`),
+	}}
+
+	summary, err := NewS3Loader(client).Load(context.Background(), "s3://test-bucket/"+summaryKey)
+	if err != nil {
+		t.Fatalf("failed to load manifest: %v", err)
+	}
+	if summary.ItemCount != 3 {
+		t.Errorf("item count = %d, want 3", summary.ItemCount)
+	}
+	if len(summary.DataFiles) != 2 {
+		t.Errorf("expected both data files parsed, got %v", summary.DataFiles)
 	}
 }
 

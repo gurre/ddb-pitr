@@ -57,6 +57,11 @@ func (c *Config) Validate() error {
 	if u.Scheme != "s3" {
 		return fmt.Errorf("export S3 URI must use s3 scheme")
 	}
+	// "s3://" and "s3:///key" carry no bucket. Accepting them leaves every later
+	// request aimed at an empty bucket name, which fails far from its cause.
+	if u.Host == "" {
+		return fmt.Errorf("export S3 URI must name a bucket")
+	}
 	c.exportBucketName = u.Host
 
 	if c.ExportType != "FULL" && c.ExportType != "INCREMENTAL" {

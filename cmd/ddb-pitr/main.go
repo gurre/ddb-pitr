@@ -49,7 +49,7 @@ func run() error {
 	maxWorkers := fs.Int("workers", 10, "Maximum number of concurrent workers")
 	batchSize := fs.Int("batch", 25, "Batch size for DynamoDB writes (max 25)")
 	reportS3URI := fs.String("report", "", "S3 URI for the final report")
-	dryRun := fs.Bool("dry-run", false, "Validate configuration without restoring")
+	dryRun := fs.Bool("dry-run", false, "Read and measure the whole export without writing to the table")
 	shutdownTimeout := fs.Duration("shutdown-timeout", 5*time.Minute, "Graceful shutdown timeout")
 
 	// Parse flags as specified in section 7
@@ -108,11 +108,22 @@ func run() error {
 	manifestLoader := manifest.NewS3Loader(s3Client)
 	streamer := s3streamer.NewS3Streamer(rawS3Client)
 	jsonDecoder := itemimage.NewJSONDecoder()
-	ddbWriter := writer.NewDynamoDBWriter(dynamoClient, cfg.TableName, cfg.BatchSize, writerCallbacks)
 
-	// Set up the checkpoint store based on ResumeKey
+	// A dry run reads, decodes and measures the whole export but writes nothing. Which
+	// writer is wired in is the only thing that decides that, so there is no path by
+	// which a dry run reaches the table.
+	var ddbWriter writer.Writer
+	if cfg.DryRun {
+		ddbWriter = writer.NewDiscard(writerCallbacks)
+	} else {
+		ddbWriter = writer.NewDynamoDBWriter(dynamoClient, cfg.TableName, cfg.BatchSize, writerCallbacks)
+	}
+
+	// Set up the checkpoint store based on ResumeKey. A dry run keeps its progress in
+	// memory whatever was asked for: a later restore must not resume past work that
+	// was only ever measured.
 	var checkpointStore checkpoint.Store
-	if cfg.ResumeKey != "" {
+	if cfg.ResumeKey != "" && !cfg.DryRun {
 		// Use S3Store if a resume key is provided
 		s3Store, err := checkpoint.NewS3Store(s3Client, cfg.ResumeKey)
 		if err != nil {
@@ -146,11 +157,20 @@ func run() error {
 	)
 
 	// Run the coordinator
-	fmt.Printf("Starting restore of table %s from %s\n", cfg.TableName, cfg.ExportS3URI)
+	if cfg.DryRun {
+		fmt.Printf("Dry run: reading %s and measuring what a restore of table %s would write\n",
+			cfg.ExportS3URI, cfg.TableName)
+	} else {
+		fmt.Printf("Starting restore of table %s from %s\n", cfg.TableName, cfg.ExportS3URI)
+	}
 	if err := coord.Run(ctx); err != nil {
 		return fmt.Errorf("restore operation failed: %w", err)
 	}
 
-	fmt.Println("Restore operation completed successfully")
+	if cfg.DryRun {
+		fmt.Println("Dry run completed successfully; nothing was written")
+	} else {
+		fmt.Println("Restore operation completed successfully")
+	}
 	return nil
 }

@@ -103,6 +103,11 @@ func (u *S3ReportUploader) UploadReport(ctx context.Context, uri string, report 
 
 	bucket := parsed.Host
 	key := strings.TrimPrefix(parsed.Path, "/")
+	// The report is the only record of the restore once the process exits, so a URI
+	// that names nowhere to put it is reported rather than attempted.
+	if bucket == "" || key == "" {
+		return fmt.Errorf("report S3 URI must name a bucket and a key: %s", uri)
+	}
 
 	data, err := json.Marshal(report)
 	if err != nil {

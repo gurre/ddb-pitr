@@ -3,6 +3,7 @@ package writer
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +94,76 @@ func TestNewExponentialBackoffRejectsSpinningIntervals(t *testing.T) {
 			}()
 			NewExponentialBackoff(tt.base, tt.max)
 		})
+	}
+}
+
+// TestNewDynamoDBWriterRejectsUnusableBatchSizes verifies construction fails loudly on a
+// batch size DynamoDB cannot serve. A non-positive size leaves the split loop unable to
+// advance, which hangs the restore rather than failing it; a size above 25 builds a
+// request DynamoDB rejects on every batch.
+func TestNewDynamoDBWriterRejectsUnusableBatchSizes(t *testing.T) {
+	for _, size := range []int{0, -1, 26, 100} {
+		t.Run(fmt.Sprintf("size %d", size), func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("expected a panic for batch size %d", size)
+				}
+			}()
+			NewDynamoDBWriter(&scriptedClient{}, "test-table", size, Callbacks{})
+		})
+	}
+}
+
+// TestNewDynamoDBWriterAcceptsTheBatchSizeLimits verifies the ends of DynamoDB's range
+// are usable, so the fail-fast check does not reject a legitimate configuration.
+func TestNewDynamoDBWriterAcceptsTheBatchSizeLimits(t *testing.T) {
+	for _, size := range []int{1, 25} {
+		t.Run(fmt.Sprintf("size %d", size), func(t *testing.T) {
+			client := &scriptedClient{}
+			w := NewDynamoDBWriter(client, "test-table", size, Callbacks{}, WithBackoff(&instantBackoff{}))
+			if err := w.WriteBatch(context.Background(), putOps(size)); err != nil {
+				t.Fatalf("WriteBatch failed: %v", err)
+			}
+			if len(client.batchRequests) != 1 {
+				t.Errorf("expected 1 BatchWriteItem call, got %d", len(client.batchRequests))
+			}
+		})
+	}
+}
+
+// TestWriteBatchSendsTheCallersContext verifies every DynamoDB call is made under the
+// context the caller passed. Detaching from it would leave a shutting-down restore
+// writing to the table with no deadline and no way to stop it.
+func TestWriteBatchSendsTheCallersContext(t *testing.T) {
+	client := &scriptedClient{}
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
+
+	ctx := context.WithValue(context.Background(), callerContextKey{}, true)
+	ops := append(putOps(1), updateOp())
+	if err := w.WriteBatch(ctx, ops); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	if client.detached > 0 {
+		t.Errorf("%d DynamoDB calls were made outside the caller's context", client.detached)
+	}
+}
+
+// TestBackoffWaitSendsTheCallersContext verifies the retry wait watches the caller's
+// context. A wait detached from it would ignore shutdown and hold the restore open for
+// the full backoff, which grows to tens of seconds under throttling.
+func TestBackoffWaitSendsTheCallersContext(t *testing.T) {
+	client := &scriptedClient{batchErrs: []error{throttle(), nil}}
+	backoff := &contextRecordingBackoff{}
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(backoff))
+
+	ctx := context.WithValue(context.Background(), callerContextKey{}, true)
+	if err := w.WriteBatch(ctx, putOps(1)); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	if backoff.detached > 0 {
+		t.Errorf("%d waits were made outside the caller's context", backoff.detached)
 	}
 }
 
@@ -223,6 +294,45 @@ func TestBatchWriteStopsRetryingWhenContextEnds(t *testing.T) {
 
 	if err := w.WriteBatch(ctx, putOps(1)); !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled, got %v", err)
+	}
+}
+
+// TestWriteSurrendersBatchWhenBackoffStops verifies a write whose retry wait is cut
+// short reports a failure rather than nothing.
+//
+// The wait is only cut short when the restore is stopping, and the batch has not been
+// written. Returning no error would let the coordinator count those items as written and
+// checkpoint past them, so an interrupted restore would resume having silently skipped a
+// batch. Both retry loops carry the same hazard, so both are covered.
+func TestWriteSurrendersBatchWhenBackoffStops(t *testing.T) {
+	tests := []struct {
+		name   string
+		client *scriptedClient
+		ops    []itemimage.Operation
+	}{
+		{
+			name:   "batched put",
+			client: &scriptedClient{batchErrs: []error{throttle()}},
+			ops:    putOps(1),
+		},
+		{
+			name:   "individual update",
+			client: &scriptedClient{updateErrs: []error{throttle()}},
+			ops:    []itemimage.Operation{updateOp()},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := NewDynamoDBWriter(tt.client, "test-table", 25, Callbacks{},
+				WithBackoff(&stoppedBackoff{}))
+
+			// The context is live, so a caller reading the context's own error would
+			// find nothing wrong and report the batch as written.
+			if err := w.WriteBatch(context.Background(), tt.ops); err == nil {
+				t.Error("expected a surrendered batch to be reported as an error")
+			}
+		})
 	}
 }
 
@@ -612,6 +722,27 @@ func (b *instantBackoff) Wait(ctx context.Context, attempt int) bool {
 	return ctx.Err() == nil
 }
 
+// stoppedBackoff stands for a wait cut short before the delay elapsed.
+type stoppedBackoff struct{}
+
+func (b *stoppedBackoff) Wait(ctx context.Context, attempt int) bool { return false }
+
+// callerContextKey marks the context a test passed in, so a double can tell the caller's
+// context from one the code under test substituted for it.
+type callerContextKey struct{}
+
+// contextRecordingBackoff counts waits that arrived without the caller's context.
+type contextRecordingBackoff struct {
+	detached int
+}
+
+func (b *contextRecordingBackoff) Wait(ctx context.Context, attempt int) bool {
+	if ctx.Value(callerContextKey{}) == nil {
+		b.detached++
+	}
+	return ctx.Err() == nil
+}
+
 // scriptedClient replays a fixed sequence of DynamoDB outcomes so the retry loops can
 // be driven deterministically. Once a script is exhausted its last entry repeats,
 // which expresses a persistent failure as a single entry.
@@ -621,9 +752,17 @@ type scriptedClient struct {
 	updateErrs    []error
 	batchRequests []map[string][]types.WriteRequest
 	updateCalls   []*dynamodb.UpdateItemInput
+	detached      int // Calls that arrived without the caller's context
+}
+
+func (c *scriptedClient) noteContext(ctx context.Context) {
+	if ctx.Value(callerContextKey{}) == nil {
+		c.detached++
+	}
 }
 
 func (c *scriptedClient) BatchWriteItem(ctx context.Context, params *dynamodb.BatchWriteItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.BatchWriteItemOutput, error) {
+	c.noteContext(ctx)
 	// The writer mutates RequestItems in place when retrying, so snapshot the call.
 	snapshot := make(map[string][]types.WriteRequest, len(params.RequestItems))
 	for table, requests := range params.RequestItems {
@@ -642,6 +781,7 @@ func (c *scriptedClient) BatchWriteItem(ctx context.Context, params *dynamodb.Ba
 }
 
 func (c *scriptedClient) UpdateItem(ctx context.Context, params *dynamodb.UpdateItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
+	c.noteContext(ctx)
 	call := len(c.updateCalls)
 	c.updateCalls = append(c.updateCalls, params)
 

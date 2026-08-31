@@ -2,6 +2,7 @@ package itemimage
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	stdjson "encoding/json"
@@ -364,6 +365,98 @@ func TestCorruptDataHandling(t *testing.T) {
 				t.Errorf("expected ErrCorrupt, got %v", err)
 			}
 		})
+	}
+}
+
+// TestUnreadableImageIsNotDowngradedToAnotherOperation verifies a line whose image
+// cannot be parsed is rejected outright.
+//
+// The operation type is inferred from which images are present, so an image that failed
+// to parse looks exactly like one that was absent. An update whose new image is
+// unreadable would then be applied as a delete, and one whose old image is unreadable as
+// a blind put that leaves stale attributes behind. Both silently corrupt the restore,
+// which is worse than refusing the line.
+func TestUnreadableImageIsNotDowngradedToAnotherOperation(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{
+			name:  "unreadable NewImage must not become a delete",
+			input: `{"Keys":{"PK":{"S":"1"}},"OldImage":{"PK":{"S":"1"}},"NewImage":"not an object"}`,
+		},
+		{
+			name:  "unreadable OldImage must not become a put",
+			input: `{"Keys":{"PK":{"S":"1"}},"NewImage":{"PK":{"S":"1"}},"OldImage":"not an object"}`,
+		},
+		{
+			name:  "unreadable Keys must not be dropped",
+			input: `{"Keys":"not an object","NewImage":{"PK":{"S":"1"}},"OldImage":{"PK":{"S":"1"}}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op, err := decoder.Decode([]byte(tt.input))
+			if err == nil {
+				t.Fatalf("expected the line rejected, got operation type %d", op.Type)
+			}
+			if !errors.Is(err, ErrCorrupt) {
+				t.Errorf("expected ErrCorrupt, got %v", err)
+			}
+		})
+	}
+}
+
+// TestCorruptLineNamesWhatFailed verifies a rejected line says which part could not be
+// read. Every corrupt line is counted and skipped, so the message is all an operator has
+// to tell a malformed export from one carrying an attribute the decoder mishandles.
+func TestCorruptLineNamesWhatFailed(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	tests := []struct {
+		name    string
+		input   string
+		mention string
+	}{
+		{"unparseable line", `{not valid json`, "invalid"},
+		{"unreadable Item", `{"Item":"not an object"}`, "Item"},
+		{"unreadable Keys", `{"Keys":"not an object","NewImage":{}}`, "Keys"},
+		{"unreadable NewImage", `{"Keys":{},"NewImage":"not an object"}`, "NewImage"},
+		{"unreadable OldImage", `{"Keys":{},"OldImage":"not an object"}`, "OldImage"},
+		{"nothing to apply", `{"Keys":{"PK":{"S":"1"}}}`, "no image data"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := decoder.Decode([]byte(tt.input))
+			if err == nil {
+				t.Fatal("expected the line rejected")
+			}
+			if !strings.Contains(err.Error(), tt.mention) {
+				t.Errorf("error %q does not mention %q", err, tt.mention)
+			}
+		})
+	}
+}
+
+// TestPutWithoutKeysIsAccepted verifies an incremental line carrying only a new image
+// decodes as a put. The item's keys are inside the image, so a separate Keys field is not
+// required, and rejecting the line would drop an item the export meant to restore.
+func TestPutWithoutKeysIsAccepted(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	op, err := decoder.Decode([]byte(`{"NewImage":{"PK":{"S":"ITEM#1"},"data":{"S":"x"}}}`))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if op.Type != OpPut {
+		t.Errorf("expected OpPut, got %d", op.Type)
+	}
+	if pk, ok := op.NewImage["PK"].(*types.AttributeValueMemberS); !ok || pk.Value != "ITEM#1" {
+		t.Errorf("PK mismatch: got %v", op.NewImage["PK"])
 	}
 }
 
