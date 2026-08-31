@@ -399,7 +399,7 @@ func main() {
 	if cfg.TableName == "" {
 		cfg.TableName = tableNamePrefix + randomString(r, 8)
 
-		if err := createTableWithIndexes(ctx, client, cfg.TableName, cfg.EnableGSI, cfg.EnableLSI); err != nil {
+		if err = createTableWithIndexes(ctx, client, cfg.TableName, cfg.EnableGSI, cfg.EnableLSI); err != nil {
 			log.Fatalf("Failed to create table: %v", err)
 		}
 		fmt.Printf("Created table: %s\n", cfg.TableName)
@@ -407,7 +407,7 @@ func main() {
 		// Wait for table to become active
 		fmt.Println("Waiting for table to become active...")
 		waiter := dynamodb.NewTableExistsWaiter(client)
-		if err := waiter.Wait(ctx, &dynamodb.DescribeTableInput{
+		if err = waiter.Wait(ctx, &dynamodb.DescribeTableInput{
 			TableName: aws.String(cfg.TableName),
 		}, 300*time.Second); err != nil {
 			log.Fatalf("Failed to wait for table: %v", err)

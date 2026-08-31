@@ -1,5 +1,8 @@
 version: "2"
 
+run:
+  timeout: 5m
+
 linters:
   enable:
     - errcheck
@@ -11,33 +14,43 @@ linters:
     - staticcheck
     - unconvert
     - unused
+  settings:
+    govet:
+      enable:
+        - shadow
+    gocyclo:
+      # golangci-lint's own default. The stricter 15 this file used to ask for was
+      # never actually applied, and six functions sit above it today; see the note in
+      # README's Linting section before tightening it.
+      min-complexity: 30
+    goconst:
+      min-len: 3
+      min-occurrences: 3
+  exclusions:
+    rules:
+      # Tests name their fixtures freely and assert on errors the linter would
+      # rather see handled, neither of which says anything about the implementation.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gocyclo
+          - goconst
+      # Tests rebind err inside guards constantly, which is the idiom rather than a
+      # mistake. Production code keeps the check.
+      - path: _test\.go
+        text: "^shadow:"
+        linters:
+          - govet
+      - path: mock/
+        linters:
+          - errcheck
+          - gocyclo
 
 formatters:
   enable:
     - gofmt
     - goimports
 
-linters-settings:
-  govet:
-    shadow: true
-  gocyclo:
-    min-complexity: 15
-  goconst:
-    min-len: 3
-    min-occurrences: 3
-
-run:
-  timeout: 5m
-
 issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gocyclo
-        - goconst
-    - path: mock/
-      linters:
-        - errcheck
   max-issues-per-linter: 0
   max-same-issues: 0

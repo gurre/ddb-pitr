@@ -146,7 +146,7 @@ func (l *S3Loader) Load(ctx context.Context, manifestS3URI string) (Summary, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if err := json.NewDecoder(resp.Body).Decode(&summary); err != nil {
+	if err = json.NewDecoder(resp.Body).Decode(&summary); err != nil {
 		return Summary{}, fmt.Errorf("failed to decode manifest summary: %w", err)
 	}
 

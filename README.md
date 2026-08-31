@@ -177,5 +177,14 @@ mutest -results mutants.json       # every package
 ### Linting
 
 ```bash
-golangci-lint run ./...
+golangci-lint run --config ./.golangci.yml ./...
+golangci-lint config verify
 ```
+
+`config verify` is what CI runs first, and it is stricter than `run`: it rejects
+configuration keys `run` quietly ignores.
+
+`gocyclo` is set to its default threshold of 30. The stricter 15 the config used to name
+was never in effect, and six functions sit above it — `Coordinator.Run`,
+`Coordinator.worker`, `DynamoDBWriter.WriteBatch`, `DynamoDBWriter.updateItem`,
+`Config.Validate` and `generateRandomItem`. Tightening it means splitting those first.
