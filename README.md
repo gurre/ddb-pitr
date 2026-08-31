@@ -126,7 +126,17 @@ go build
 ### Testing
 
 ```bash
-go test ./...
+go test -race ./...
+```
+
+Test strength is measured with [mutest](https://github.com/gurre/mutest), which introduces one
+small defect at a time and reports the ones no test notices. The suite currently kills 93% of
+them. The survivors that remain are defects no test can observe: preallocation hints, retry
+pacing constants and equivalent boundary rewrites.
+
+```bash
+mutest -packages writer            # one package
+mutest -results mutants.json       # every package
 ```
 
 ### Linting

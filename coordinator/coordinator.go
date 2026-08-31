@@ -144,13 +144,11 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 
 	// Send tasks
-	remainingFiles := 0
 	for _, file := range summary.DataFiles {
 		// Skip files we've already processed
 		if file.Key < state.LastFile {
 			continue
 		}
-		remainingFiles++
 
 		select {
 		case tasks <- file:
@@ -239,6 +237,80 @@ func (c *Coordinator) updateWorkerStatus(id int, fn func(*WorkerStatus)) {
 	}
 }
 
+// workerIdleTimeout is how long a worker may go without activity before the progress
+// line stops counting it among the active workers.
+const workerIdleTimeout = 10 * time.Second
+
+// bytesPerMB converts the byte counters into the megabytes the progress line reports.
+const bytesPerMB = 1024 * 1024
+
+// progressSnapshot is the point-in-time view of the restore that the progress line renders.
+// Fields are ordered largest-to-smallest for memory alignment.
+type progressSnapshot struct {
+	ItemsPerSec   float64 // Items written per second since the previous snapshot
+	MBPerSec      float64 // Megabytes written per second since the previous snapshot
+	Percent       float64 // Share of the manifest's item count written so far, capped at 100
+	TotalBatches  int64   // Batches written since the restore started
+	Throttles     int64
+	Retries       int64
+	LostItems     int64
+	Errors        int64
+	ActiveWorkers int // Workers that reported activity within workerIdleTimeout
+}
+
+// snapshot folds worker status and metrics into the numbers the progress line shows,
+// then advances the rolling window to now.
+//
+// Rates are measured over the interval since the previous snapshot rather than since
+// the start, so a restore that slows down says so immediately instead of being hidden
+// behind a long average. Taking now as an argument keeps the rate over a known interval.
+func (c *Coordinator) snapshot(now time.Time) progressSnapshot {
+	c.statusMu.RLock()
+	var totalItems, totalBatches int64
+	activeWorkers := 0
+	for _, status := range c.workerStatus {
+		if now.Sub(status.LastActive) < workerIdleTimeout {
+			activeWorkers++
+		}
+		totalItems += status.ItemsWritten
+		totalBatches += status.BatchesCount
+	}
+	c.statusMu.RUnlock()
+
+	bytesWritten := c.metrics.BytesWritten()
+
+	snap := progressSnapshot{
+		TotalBatches:  totalBatches,
+		Throttles:     c.metrics.Throttles(),
+		Retries:       c.metrics.Retries(),
+		LostItems:     c.metrics.LostItems(),
+		Errors:        c.metrics.Errors(),
+		ActiveWorkers: activeWorkers,
+	}
+
+	if elapsed := now.Sub(c.lastReportTime).Seconds(); elapsed > 0 {
+		itemsDelta := totalItems - c.lastReportItems
+		bytesDelta := bytesWritten - c.lastReportBytes
+		snap.ItemsPerSec = float64(itemsDelta) / elapsed
+		snap.MBPerSec = float64(bytesDelta) / bytesPerMB / elapsed
+	}
+
+	if c.totalExpectedItems > 0 {
+		snap.Percent = float64(totalItems) / float64(c.totalExpectedItems) * 100
+		// The manifest's item count is an estimate for incremental exports, so a
+		// restore can legitimately write more items than it predicted.
+		if snap.Percent > 100 {
+			snap.Percent = 100
+		}
+	}
+
+	c.lastReportTime = now
+	c.lastReportItems = totalItems
+	c.lastReportBytes = bytesWritten
+
+	return snap
+}
+
 // reportProgress implements the progress reporting requirements from section 5.
 // It periodically reports progress to stdout, overwriting the same line.
 func (c *Coordinator) reportProgress(ctx context.Context) {
@@ -248,54 +320,12 @@ func (c *Coordinator) reportProgress(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			// Gather worker status
-			c.statusMu.RLock()
-			var totalItems, totalBatches int64
-			activeWorkers := 0
-			for _, status := range c.workerStatus {
-				if time.Since(status.LastActive) < 10*time.Second {
-					activeWorkers++
-				}
-				totalItems += status.ItemsWritten
-				totalBatches += status.BatchesCount
-			}
-			c.statusMu.RUnlock()
-
-			// Get metrics
-			now := time.Now()
-			bytesWritten := c.metrics.BytesWritten()
-			throttles := c.metrics.Throttles()
-			retries := c.metrics.Retries()
-			lostItems := c.metrics.LostItems()
-			errors := c.metrics.Errors()
-
-			// Calculate rolling throughput since last report
-			elapsed := now.Sub(c.lastReportTime).Seconds()
-			var itemsPerSec, mbPerSec float64
-			if elapsed > 0 {
-				itemsDelta := totalItems - c.lastReportItems
-				bytesDelta := bytesWritten - c.lastReportBytes
-				itemsPerSec = float64(itemsDelta) / elapsed
-				mbPerSec = float64(bytesDelta) / (1024 * 1024) / elapsed
-			}
-
-			// Calculate percentage
-			var percent float64
-			if c.totalExpectedItems > 0 {
-				percent = float64(totalItems) / float64(c.totalExpectedItems) * 100
-				if percent > 100 {
-					percent = 100
-				}
-			}
-
-			// Update last report values
-			c.lastReportTime = now
-			c.lastReportItems = totalItems
-			c.lastReportBytes = bytesWritten
+			snap := c.snapshot(time.Now())
 
 			// Print progress overwriting the same line
 			fmt.Printf("\rProgress: %.1f%% (%.0f/s, %.1f MB/s) | %d batches | %d workers | %d throttles | %d retries | %d lost | %d errors",
-				percent, itemsPerSec, mbPerSec, totalBatches, activeWorkers, throttles, retries, lostItems, errors)
+				snap.Percent, snap.ItemsPerSec, snap.MBPerSec, snap.TotalBatches, snap.ActiveWorkers,
+				snap.Throttles, snap.Retries, snap.LostItems, snap.Errors)
 
 		case <-ctx.Done():
 			// Print newline before exit so final output appears on new line

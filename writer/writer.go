@@ -32,23 +32,56 @@ type Callbacks struct {
 	OnWrite    func(items, bytes int) // Called on successful write with item count and byte size
 }
 
+// Backoffer paces the wait between retry attempts.
+// Wait reports false when the wait was cut short because the context ended,
+// which callers must treat as "stop retrying".
+type Backoffer interface {
+	Wait(ctx context.Context, attempt int) bool
+}
+
+// Option adjusts optional DynamoDBWriter behaviour.
+type Option func(*DynamoDBWriter)
+
+// WithBackoff replaces the retry pacing. The default doubles from 100ms up to 30s.
+// Example:
+//
+//	w := writer.NewDynamoDBWriter(client, "my-table", 25, cb,
+//	    writer.WithBackoff(writer.NewExponentialBackoff(time.Second, time.Minute)))
+func WithBackoff(b Backoffer) Option {
+	return func(w *DynamoDBWriter) {
+		w.backoff = b
+	}
+}
+
 // DynamoDBWriter implements the Writer interface using AWS DynamoDB as specified in section 4.6.
 // It handles batching operations and retrying with exponential backoff.
+// Fields are ordered largest-to-smallest for memory alignment.
 type DynamoDBWriter struct {
-	client    aws.DynamoDBClient
 	callbacks Callbacks
+	client    aws.DynamoDBClient
+	backoff   Backoffer
 	tableName string
 	batchSize int // Maximum number of operations per batch (≤25)
 }
 
-// NewDynamoDBWriter creates a new DynamoDBWriter instance with the specified batch size and callbacks
-func NewDynamoDBWriter(client aws.DynamoDBClient, tableName string, batchSize int, callbacks Callbacks) *DynamoDBWriter {
-	return &DynamoDBWriter{
+// NewDynamoDBWriter creates a new DynamoDBWriter instance with the specified batch size and callbacks.
+// Example:
+//
+//	w := writer.NewDynamoDBWriter(client, "my-table", 25, writer.Callbacks{
+//	    OnThrottle: m.RecordThrottle,
+//	})
+func NewDynamoDBWriter(client aws.DynamoDBClient, tableName string, batchSize int, callbacks Callbacks, opts ...Option) *DynamoDBWriter {
+	w := &DynamoDBWriter{
 		client:    client,
 		tableName: tableName,
 		batchSize: batchSize,
 		callbacks: callbacks,
+		backoff:   NewExponentialBackoff(100*time.Millisecond, 30*time.Second),
 	}
+	for _, opt := range opts {
+		opt(w)
+	}
+	return w
 }
 
 // isThrottlingError returns true if the error is a DynamoDB throughput throttling error.
@@ -79,28 +112,72 @@ func estimateItemSize(item map[string]types.AttributeValue) int {
 	return 100 + len(item)*50
 }
 
-// backoffWait sleeps for an exponentially increasing duration with jitter.
-// Returns false if the context is cancelled during the wait.
-func backoffWait(ctx context.Context, attempt int) bool {
-	// Base delay 100ms, max delay 30s
-	base := 100 * time.Millisecond
-	maxDelay := 30 * time.Second
+// ExponentialBackoff doubles the wait after every attempt up to Max, then adds
+// jitter of up to one further interval so concurrent workers do not retry in lockstep.
+// Fields are exported for inspection; use NewExponentialBackoff to build one.
+type ExponentialBackoff struct {
+	Base time.Duration // Wait before the first retry
+	Max  time.Duration // Ceiling for the doubled wait, before jitter
+}
 
-	delay := base * time.Duration(1<<uint(attempt))
-	if delay > maxDelay {
-		delay = maxDelay
+// NewExponentialBackoff returns a backoff that starts at base and doubles up to max.
+// Both durations must be positive: a non-positive interval would spin, so it is a
+// wiring mistake and panics here rather than degrading a restore into a busy loop.
+// Example:
+//
+//	b := writer.NewExponentialBackoff(100*time.Millisecond, 30*time.Second)
+func NewExponentialBackoff(base, max time.Duration) *ExponentialBackoff {
+	if base <= 0 || max < base {
+		panic(fmt.Sprintf("writer: invalid backoff base=%s max=%s", base, max))
+	}
+	return &ExponentialBackoff{Base: base, Max: max}
+}
+
+// Delay returns the wait before the given attempt, jitter included.
+//
+// The shift is clamped before it is applied. Throttling is retried for as long as
+// the context lives, so attempt is unbounded: an unclamped shift overflows the
+// duration during a long throttling storm and yields a negative delay, which the
+// Max ceiling does not catch and the jitter draw cannot accept.
+func (b *ExponentialBackoff) Delay(attempt int) time.Duration {
+	shift := attempt
+	if shift < 0 {
+		shift = 0
+	}
+	// Beyond this the doubled value already exceeds any Max we would honour.
+	if limit := shiftLimit(b.Base, b.Max); shift > limit {
+		shift = limit
 	}
 
-	// Add jitter: random value between 0 and delay
-	jitter := time.Duration(rand.Int64N(int64(delay)))
-	delay = delay + jitter
+	delay := b.Base << uint(shift)
+	if delay > b.Max {
+		delay = b.Max
+	}
+
+	return delay + time.Duration(rand.Int64N(int64(delay)))
+}
+
+// Wait sleeps for Delay(attempt), reporting false if the context ends first.
+func (b *ExponentialBackoff) Wait(ctx context.Context, attempt int) bool {
+	timer := time.NewTimer(b.Delay(attempt))
+	defer timer.Stop()
 
 	select {
-	case <-time.After(delay):
+	case <-timer.C:
 		return true
 	case <-ctx.Done():
 		return false
 	}
+}
+
+// shiftLimit returns the smallest shift for which base doubled reaches max.
+// Doubling stops there, which keeps the shift far below the width of a Duration.
+func shiftLimit(base, max time.Duration) int {
+	limit := 0
+	for d := base; d < max; d <<= 1 {
+		limit++
+	}
+	return limit
 }
 
 // WriteBatch implements the batch writing requirements from section 4.6.
@@ -186,7 +263,7 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 					if w.callbacks.OnThrottle != nil {
 						w.callbacks.OnThrottle()
 					}
-					if !backoffWait(ctx, attempt) {
+					if !w.backoff.Wait(ctx, attempt) {
 						return ctx.Err()
 					}
 					attempt++
@@ -195,7 +272,7 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 				}
 				// Non-throttling error: retry up to maxRetries
 				if attempt < maxRetries {
-					if !backoffWait(ctx, attempt) {
+					if !w.backoff.Wait(ctx, attempt) {
 						return ctx.Err()
 					}
 					attempt++
@@ -215,7 +292,7 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 					w.callbacks.OnThrottle()
 				}
 				input.RequestItems = output.UnprocessedItems
-				if !backoffWait(ctx, attempt) {
+				if !w.backoff.Wait(ctx, attempt) {
 					return ctx.Err()
 				}
 				attempt++
@@ -329,7 +406,7 @@ func (w *DynamoDBWriter) updateItem(ctx context.Context, op itemimage.Operation)
 				if w.callbacks.OnThrottle != nil {
 					w.callbacks.OnThrottle()
 				}
-				if !backoffWait(ctx, attempt) {
+				if !w.backoff.Wait(ctx, attempt) {
 					return ctx.Err()
 				}
 				attempt++
@@ -338,7 +415,7 @@ func (w *DynamoDBWriter) updateItem(ctx context.Context, op itemimage.Operation)
 			}
 			// Non-throttling error: retry up to maxRetries
 			if attempt < maxRetries {
-				if !backoffWait(ctx, attempt) {
+				if !w.backoff.Wait(ctx, attempt) {
 					return ctx.Err()
 				}
 				attempt++

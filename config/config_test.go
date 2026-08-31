@@ -134,6 +134,34 @@ func TestInvalidMaxWorkers(t *testing.T) {
 	}
 }
 
+// TestValidMaxWorkers verifies a single worker is accepted. It is the smallest pool that
+// can make progress, and rejecting it would force concurrency the operator did not ask for.
+func TestValidMaxWorkers(t *testing.T) {
+	for _, workers := range []int{1, 10, 100} {
+		t.Run("workers", func(t *testing.T) {
+			cfg := validConfig()
+			cfg.MaxWorkers = workers
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("expected valid max workers %d to pass, got: %v", workers, err)
+			}
+		})
+	}
+}
+
+// TestValidShutdownTimeout verifies one second, the shortest allowed grace period, is
+// accepted so an operator can ask for a fast shutdown.
+func TestValidShutdownTimeout(t *testing.T) {
+	for _, timeout := range []time.Duration{time.Second, time.Minute} {
+		t.Run(timeout.String(), func(t *testing.T) {
+			cfg := validConfig()
+			cfg.ShutdownTimeout = timeout
+			if err := cfg.Validate(); err != nil {
+				t.Errorf("expected valid shutdown timeout %s to pass, got: %v", timeout, err)
+			}
+		})
+	}
+}
+
 func TestInvalidBatchSize(t *testing.T) {
 	testCases := []int{0, -1, 26, 100}
 	for _, size := range testCases {

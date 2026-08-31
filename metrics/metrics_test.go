@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -133,6 +134,12 @@ func TestReportMarshalJSON(t *testing.T) {
 		t.Error("duration should not be empty")
 	}
 
+	// Both durations are rendered the same way, so a reader never has to guess whether a
+	// field is nanoseconds or a formatted span.
+	if _, ok := parsed["processingTime"].(string); !ok {
+		t.Errorf("processingTime should be string, got %T", parsed["processingTime"])
+	}
+
 	// Verify numeric fields exist
 	if _, ok := parsed["throttles"]; !ok {
 		t.Error("missing throttles field")
@@ -148,18 +155,76 @@ func TestReportMarshalJSON(t *testing.T) {
 	}
 }
 
-// TestRecordProcessingTime verifies processing time accumulates correctly.
+// TestRecordProcessingTime verifies time spent writing accumulates into the report,
+// where it is what tells an operator whether the restore was limited by DynamoDB or
+// by reading the export.
 func TestRecordProcessingTime(t *testing.T) {
 	m := NewMetrics()
 
 	m.RecordProcessingTime(100 * time.Millisecond)
 	m.RecordProcessingTime(200 * time.Millisecond)
 
-	// Access internal field through report timing behavior
-	// Processing time affects throughput calculation indirectly
+	if got := m.GenerateReport().ProcessingTime; got != 300*time.Millisecond {
+		t.Errorf("ProcessingTime = %v, want 300ms", got)
+	}
+}
+
+// TestReportCountsBatches verifies batch writes reach the report, which is the durable
+// record of how many DynamoDB calls the restore cost.
+func TestReportCountsBatches(t *testing.T) {
+	m := NewMetrics()
+
+	m.RecordBatchWritten()
+	m.RecordBatchWritten()
+	m.RecordBatchWritten()
+
+	if got := m.GenerateReport().BatchesWritten; got != 3 {
+		t.Errorf("BatchesWritten = %d, want 3", got)
+	}
+}
+
+// TestReportDividesWorkByElapsedTime verifies throughput and byte rate are the recorded
+// totals divided by the elapsed time. Both feed the summary an operator uses to size the
+// next restore, so a rate that multiplies instead of divides would badly mislead.
+func TestReportDividesWorkByElapsedTime(t *testing.T) {
+	m := NewMetrics()
+	// Backdate the start so the elapsed time is a known interval rather than microseconds.
+	m.startTime = time.Now().Add(-2 * time.Second)
+
+	for i := 0; i < 100; i++ {
+		m.RecordProcessed()
+	}
+	m.RecordBytes(2048)
+
 	report := m.GenerateReport()
-	if report.Duration <= 0 {
-		t.Error("expected positive duration")
+
+	// Elapsed is just over two seconds, so the rates sit just under half the totals.
+	if report.Throughput > 50 || report.Throughput < 49 {
+		t.Errorf("Throughput = %f, want about 50 items/sec", report.Throughput)
+	}
+	if report.ByteRate > 1024 || report.ByteRate < 1000 {
+		t.Errorf("ByteRate = %f, want about 1024 bytes/sec", report.ByteRate)
+	}
+}
+
+// TestReportStringConvertsBytesToMegabytes verifies the console summary reports megabytes,
+// since the byte counters are meaningless to read at restore scale.
+func TestReportStringConvertsBytesToMegabytes(t *testing.T) {
+	report := Report{
+		BytesWritten: 1000 * 1024 * 1024,
+		ByteRate:     500 * 1024 * 1024,
+		TotalItems:   7,
+	}
+
+	str := report.String()
+
+	// The full field is matched, since a substring would also be found inside a much
+	// larger wrong number.
+	if !strings.Contains(str, "Data written: 1000.00 MB\n") {
+		t.Errorf("expected 1000.00 MB written in:\n%s", str)
+	}
+	if !strings.Contains(str, "(500.00 MB/s)") {
+		t.Errorf("expected 500.00 MB/s in:\n%s", str)
 	}
 }
 

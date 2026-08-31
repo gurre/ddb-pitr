@@ -115,17 +115,21 @@ func (m *Metrics) RecordProcessingTime(d time.Duration) {
 // Report contains the final metrics report as defined in section 6 of the spec.
 // It includes all required fields for the JSON report output.
 type Report struct {
-	StartTime    time.Time     `json:"startTime"`    // When the restore operation started
-	EndTime      time.Time     `json:"endTime"`      // When the restore operation completed
-	Duration     time.Duration `json:"duration"`     // Total duration of the operation
-	TotalItems   int64         `json:"totalItems"`   // Total number of items processed
-	CorruptCount int64         `json:"corruptCount"` // Number of corrupt items found
-	Throttles    int64         `json:"throttles"`    // Number of throttle events
-	Retries      int64         `json:"retries"`      // Number of successful retries
-	LostItems    int64         `json:"lostItems"`    // Number of items that failed permanently
-	BytesWritten int64         `json:"bytesWritten"` // Total bytes written
-	Throughput   float64       `json:"throughput"`   // Items processed per second
-	ByteRate     float64       `json:"byteRate"`     // Bytes per second
+	StartTime time.Time     `json:"startTime"` // When the restore operation started
+	EndTime   time.Time     `json:"endTime"`   // When the restore operation completed
+	Duration  time.Duration `json:"duration"`  // Wall clock time the operation took
+	// ProcessingTime is the time workers spent writing, summed across the pool. Held
+	// against Duration it separates a restore limited by DynamoDB from one limited by S3.
+	ProcessingTime time.Duration `json:"processingTime"`
+	TotalItems     int64         `json:"totalItems"`     // Total number of items processed
+	BatchesWritten int64         `json:"batchesWritten"` // Number of batches written to DynamoDB
+	CorruptCount   int64         `json:"corruptCount"`   // Number of corrupt items found
+	Throttles      int64         `json:"throttles"`      // Number of throttle events
+	Retries        int64         `json:"retries"`        // Number of successful retries
+	LostItems      int64         `json:"lostItems"`      // Number of items that failed permanently
+	BytesWritten   int64         `json:"bytesWritten"`   // Total bytes written
+	Throughput     float64       `json:"throughput"`     // Items processed per second
+	ByteRate       float64       `json:"byteRate"`       // Bytes per second
 }
 
 // GenerateReport generates a final report as specified in section 6.
@@ -137,6 +141,10 @@ func (m *Metrics) GenerateReport() Report {
 	totalItems := atomic.LoadInt64(&m.recordsProcessed)
 	bytesWritten := atomic.LoadInt64(&m.bytesWritten)
 
+	m.mu.RLock()
+	processingTime := m.processingTime
+	m.mu.RUnlock()
+
 	// Calculate throughput (items per second) and byte rate
 	var throughput, byteRate float64
 	if duration > 0 {
@@ -145,17 +153,19 @@ func (m *Metrics) GenerateReport() Report {
 	}
 
 	return Report{
-		StartTime:    m.startTime,
-		EndTime:      endTime,
-		Duration:     duration,
-		TotalItems:   totalItems,
-		CorruptCount: atomic.LoadInt64(&m.corruptCount),
-		Throttles:    atomic.LoadInt64(&m.throttles),
-		Retries:      atomic.LoadInt64(&m.retries),
-		LostItems:    atomic.LoadInt64(&m.lostItems),
-		BytesWritten: bytesWritten,
-		Throughput:   throughput,
-		ByteRate:     byteRate,
+		StartTime:      m.startTime,
+		EndTime:        endTime,
+		Duration:       duration,
+		ProcessingTime: processingTime,
+		TotalItems:     totalItems,
+		BatchesWritten: atomic.LoadInt64(&m.batchesWritten),
+		CorruptCount:   atomic.LoadInt64(&m.corruptCount),
+		Throttles:      atomic.LoadInt64(&m.throttles),
+		Retries:        atomic.LoadInt64(&m.retries),
+		LostItems:      atomic.LoadInt64(&m.lostItems),
+		BytesWritten:   bytesWritten,
+		Throughput:     throughput,
+		ByteRate:       byteRate,
 	}
 }
 
@@ -165,10 +175,12 @@ func (r Report) MarshalJSON() ([]byte, error) {
 	type Alias Report
 	return json.Marshal(&struct {
 		Alias
-		Duration string `json:"duration"`
+		Duration       string `json:"duration"`
+		ProcessingTime string `json:"processingTime"`
 	}{
-		Alias:    Alias(r),
-		Duration: r.Duration.String(),
+		Alias:          Alias(r),
+		Duration:       r.Duration.String(),
+		ProcessingTime: r.ProcessingTime.String(),
 	})
 }
 
@@ -180,13 +192,14 @@ func (r Report) String() string {
 
 	return fmt.Sprintf(
 		"Restore completed in %s\n"+
-			"Total items: %d\n"+
+			"Total items: %d in %d batches\n"+
 			"Corrupt items: %d\n"+
 			"Throughput: %.2f items/sec (%.2f MB/s)\n"+
 			"Data written: %.2f MB\n"+
 			"Throttles: %d | Retries: %d | Lost: %d",
 		r.Duration,
 		r.TotalItems,
+		r.BatchesWritten,
 		r.CorruptCount,
 		r.Throughput,
 		mbPerSec,

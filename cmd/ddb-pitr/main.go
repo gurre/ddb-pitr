@@ -124,8 +124,11 @@ func run() error {
 		checkpointStore = checkpoint.NewMemoryStore()
 	}
 
-	// Create report uploader if report URI is provided
-	var reportUploader *aws.S3ReportUploader
+	// Create report uploader if report URI is provided. The variable is declared as the
+	// interface the coordinator expects: a nil *S3ReportUploader would otherwise arrive
+	// there as a non-nil interface holding a nil pointer, and the coordinator's nil check
+	// would not catch it.
+	var reportUploader coordinator.ReportUploader
 	if cfg.ReportS3URI != "" {
 		reportUploader = aws.NewS3ReportUploader(s3Client)
 	}
