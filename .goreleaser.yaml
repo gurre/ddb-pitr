@@ -1,0 +1,98 @@
+version: 2
+
+project_name: ddb-pitr
+
+before:
+  hooks:
+    # Dependencies are vendored, so the build needs no network. This checks the
+    # vendored tree still matches go.mod rather than fetching anything.
+    - go mod verify
+
+builds:
+  # Only the restore tool is released. cmd/ddb-datagen creates and mutates DynamoDB
+  # tables to exercise a restore end to end; it belongs to this repository's own
+  # verification, not in an operator's hands.
+  - id: ddb-pitr
+    main: ./cmd/ddb-pitr
+    binary: ddb-pitr
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+      - -X main.commit={{ .FullCommit }}
+      - -X main.date={{ .CommitDate }}
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      # Windows on ARM is rare enough that shipping it would cost more in support
+      # than it earns; amd64 covers the Windows machines this tool is run from.
+      - goos: windows
+        goarch: arm64
+    # Reproducible builds: the binary depends on the tag, not on when it was built.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: ddb-pitr
+    ids:
+      - ddb-pitr
+    # macOS is named Darwin by Go and nothing else, so it is spelled out here.
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_
+      {{- if eq .Os "darwin" }}macos{{ else }}{{ .Os }}{{ end }}_
+      {{- .Arch }}
+    formats:
+      - tar.gz
+    format_overrides:
+      - goos: windows
+        formats:
+          - zip
+    files:
+      - README.md
+      - LICENSE.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  # Grouped by what a reader is looking for: whether anything they depend on changed.
+  use: github
+  sort: asc
+  groups:
+    - title: Features
+      regexp: '(?i)^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '(?i)^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Other
+      order: 99
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^tests:"
+      - "^chore:"
+      - Merge pull request
+      - Merge branch
+
+release:
+  draft: false
+  # A tag carrying a pre-release suffix is published as one, so `latest` keeps
+  # pointing at the last stable build.
+  prerelease: auto
+  footer: |
+    ## Install
+
+    Download the archive for your platform, verify it against `checksums.txt`, and put
+    `ddb-pitr` on your PATH. Run `ddb-pitr --version` to confirm which build you have.
+
+    On macOS, Gatekeeper quarantines downloaded binaries; clear it with
+    `xattr -d com.apple.quarantine ddb-pitr`.

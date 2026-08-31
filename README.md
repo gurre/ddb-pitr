@@ -25,6 +25,16 @@ For INCREMENTAL exports containing UPDATE operations, consider using FULL export
 
 ## Installation
 
+Download a build for your platform from the [releases page](https://github.com/gurre/ddb-pitr/releases),
+verify it against the release's `checksums.txt`, and put `ddb-pitr` on your PATH.
+Builds are published for Linux, macOS and Windows on x86-64, and for Linux and macOS on
+ARM64. `ddb-pitr --version` reports which build you are running.
+
+On macOS, Gatekeeper quarantines downloaded binaries; clear it with
+`xattr -d com.apple.quarantine ddb-pitr`.
+
+Or build from source:
+
 ```bash
 go install github.com/gurre/ddb-pitr/cmd/ddb-pitr@latest
 ```

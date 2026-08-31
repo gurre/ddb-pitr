@@ -24,6 +24,15 @@ import (
 	"github.com/gurre/s3streamer"
 )
 
+// Build identity, stamped in at link time by the release build. The defaults are what a
+// binary built straight from a working tree reports, so an operator can always tell a
+// released build from a local one.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -51,10 +60,18 @@ func run() error {
 	reportS3URI := fs.String("report", "", "S3 URI for the final report")
 	dryRun := fs.Bool("dry-run", false, "Read and measure the whole export without writing to the table")
 	shutdownTimeout := fs.Duration("shutdown-timeout", 5*time.Minute, "Graceful shutdown timeout")
+	showVersion := fs.Bool("version", false, "Print the build identity and exit")
 
 	// Parse flags as specified in section 7
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return fmt.Errorf("failed to parse flags: %w", err)
+	}
+
+	// Asked before anything is validated, so the version is readable without a
+	// complete configuration.
+	if *showVersion {
+		fmt.Printf("ddb-pitr %s (commit %s, built %s)\n", version, commit, date)
+		return nil
 	}
 
 	// Create and validate configuration as specified in section 4.1

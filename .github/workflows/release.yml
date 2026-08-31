@@ -1,0 +1,59 @@
+name: Release
+
+# Releases are cut from tags, so what ships is always something that was named
+# deliberately rather than whatever last landed on main.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  # Gate the release on the suite. A tag that does not pass is worth failing loudly
+  # before artifacts exist, not after someone has downloaded them.
+  verify:
+    name: Test and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -race ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+          args: --config ./.golangci.yml ./...
+
+  release:
+    name: Build and publish
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to create the release and upload its archives.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # GoReleaser builds the changelog from the commits since the previous tag,
+          # which a shallow clone does not contain.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Release
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
