@@ -37,7 +37,7 @@ import (
 type State struct {
 	Completed []string         `json:"completed"` // Keys of data files processed to the end
 	ExportID  string           `json:"exportId"`  // Identity of the export this progress belongs to
-	Offsets   map[string]int64 `json:"offsets"`   // Bytes already consumed, per file still in progress
+	Offsets   map[string]int64 `json:"offsets"`   // Offset of the last line written, per file still in progress
 }
 
 // Store interface defines the contract for saving and loading checkpoint state.

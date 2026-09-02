@@ -8,7 +8,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -16,7 +19,9 @@ import (
 	json "github.com/goccy/go-json"
 )
 
-// S3Client is a mock implementation of aws.S3Client interface for testing
+// S3Client is a mock implementation of aws.S3Client interface for testing. Objects are
+// addressed by exact bucket and key, as S3 addresses them; every export the fixtures
+// hold is loaded under the bucket named by ExportBucket.
 type S3Client struct {
 	// Maps bucket/key to file content
 	Files map[string][]byte
@@ -26,7 +31,13 @@ type S3Client struct {
 	ETags map[string]*string
 	// Base directory for test files
 	TestDataDir string
+	// Every Range header GetObject was asked for, in order
+	ranges []string
+	mu     sync.Mutex
 }
+
+// ExportBucket is the bucket the fixtures are loaded under.
+const ExportBucket = "test-bucket"
 
 // NewS3Client creates a new mock S3 client
 func NewS3Client(testDataDir string) *S3Client {
@@ -99,8 +110,8 @@ func (m *S3Client) loadExportDir(exportDir string) error {
 	}
 
 	// Add manifests to mock S3
-	m.addFile("test-bucket", fmt.Sprintf("AWSDynamoDB/%s/manifest-summary.json", exportDir), manifestSummary)
-	m.addFile("test-bucket", fmt.Sprintf("AWSDynamoDB/%s/manifest-files.json", exportDir), manifestFiles)
+	m.addFile(ExportBucket, fmt.Sprintf("AWSDynamoDB/%s/manifest-summary.json", exportDir), manifestSummary)
+	m.addFile(ExportBucket, fmt.Sprintf("AWSDynamoDB/%s/manifest-files.json", exportDir), manifestFiles)
 
 	// Load export-local data directory if it exists
 	localDataDir := filepath.Join(m.TestDataDir, "AWSDynamoDB", exportDir, "data")
@@ -140,7 +151,7 @@ func (m *S3Client) loadDataDir(dataDir string) error {
 				return err
 			}
 
-			m.addFile("test-bucket", rel, data)
+			m.addFile(ExportBucket, rel, data)
 		}
 		return nil
 	})
@@ -185,40 +196,33 @@ func (m *S3Client) SetETags(manifestFiles []byte) error {
 		}
 
 		if file.DataFileS3Key != "" && file.ETag != "" {
-			bucketKey := fmt.Sprintf("test-bucket/%s", file.DataFileS3Key)
+			bucketKey := fmt.Sprintf("%s/%s", ExportBucket, file.DataFileS3Key)
 			// Store the ETag with quotes
 			m.ETags[bucketKey] = aws.String(fmt.Sprintf("\"%s\"", file.ETag))
-			fmt.Printf("Set ETag for %s: %s\n", bucketKey, *m.ETags[bucketKey])
 		}
 	}
 
 	return scanner.Err()
 }
 
-// GetObject implements the S3Client interface for reading objects
-func (m *S3Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
-	bucketKey := fmt.Sprintf("%s/%s", *params.Bucket, *params.Key)
+// rangePattern is the one Range form the streamer emits: a closed byte range.
+var rangePattern = regexp.MustCompile(`^bytes=(\d+)-(\d+)$`)
 
+// GetObject implements the S3Client interface for reading objects. A Range header is
+// honoured the way S3 honours it: the body is the requested slice, ContentLength is the
+// slice's length and ContentRange names it. A range starting past the end is refused,
+// as S3 refuses it with 416. Without this the mock is more forgiving than S3: a ranged
+// read would receive the whole object, and a streamer reading in chunks would silently
+// duplicate every byte after the first chunk.
+func (m *S3Client) GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	bucketKey := fmt.Sprintf("%s/%s", *params.Bucket, *params.Key)
 	content, ok := m.Files[bucketKey]
 	if !ok {
-		// Try finding by suffix match if exact match fails
-		for k, v := range m.Files {
-			if strings.HasSuffix(k, *params.Key) {
-				content = v
-				bucketKey = k
-				ok = true
-				break
-			}
-		}
-
-		if !ok {
-			// For debugging
-			fmt.Printf("Mock S3: Key not found: %s\n", bucketKey)
-			fmt.Printf("Available keys: %v\n", m.listKeys())
-
-			return nil, &types.NoSuchKey{
-				Message: aws.String(fmt.Sprintf("The specified key does not exist: %s", *params.Key)),
-			}
+		return nil, &types.NoSuchKey{
+			Message: aws.String(fmt.Sprintf("The specified key does not exist: %s", bucketKey)),
 		}
 	}
 
@@ -227,14 +231,48 @@ func (m *S3Client) GetObject(ctx context.Context, params *s3.GetObjectInput, opt
 		metadata = make(map[string]string)
 	}
 
-	contentLength := int64(len(content))
+	start, end := int64(0), int64(len(content))-1
+	var contentRange *string
+	if params.Range != nil {
+		m.ranges = append(m.ranges, *params.Range)
+		match := rangePattern.FindStringSubmatch(*params.Range)
+		if match == nil {
+			return nil, fmt.Errorf("mock S3: unsupported Range %q", *params.Range)
+		}
+		start, _ = strconv.ParseInt(match[1], 10, 64)
+		end, _ = strconv.ParseInt(match[2], 10, 64)
+		if start >= int64(len(content)) || start > end {
+			return nil, &types.InvalidObjectState{
+				Message: aws.String(fmt.Sprintf("InvalidRange: %s is outside %d bytes", *params.Range, len(content))),
+			}
+		}
+		if end >= int64(len(content)) {
+			end = int64(len(content)) - 1
+		}
+		contentRange = aws.String(fmt.Sprintf("bytes %d-%d/%d", start, end, len(content)))
+	}
+
+	body := content
+	if len(content) > 0 {
+		body = content[start : end+1]
+	}
+	contentLength := int64(len(body))
 
 	return &s3.GetObjectOutput{
-		Body:          io.NopCloser(bytes.NewReader(content)),
+		Body:          io.NopCloser(bytes.NewReader(body)),
 		Metadata:      metadata,
 		ETag:          m.ETags[bucketKey],
 		ContentLength: &contentLength,
+		ContentRange:  contentRange,
 	}, nil
+}
+
+// Ranges returns every Range header GetObject was asked for, in order, so a test can
+// prove a ranged read covered an object exactly once.
+func (m *S3Client) Ranges() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.ranges...)
 }
 
 // PutObject implements the S3Client interface for writing objects
@@ -247,6 +285,8 @@ func (m *S3Client) PutObject(ctx context.Context, params *s3.PutObjectInput, opt
 		return nil, err
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.Files[bucketKey] = data
 
 	// Set up metadata
@@ -265,62 +305,29 @@ func (m *S3Client) PutObject(ctx context.Context, params *s3.PutObjectInput, opt
 	}, nil
 }
 
-// HeadObject implements the S3Client interface for retrieving object metadata
+// HeadObject implements the S3Client interface for retrieving object metadata. Only the
+// exact bucket and key are consulted: an object is either there or it is not, so a test
+// that names the wrong bucket learns so instead of being served a same-named object
+// from another.
 func (m *S3Client) HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
-	bucketKey := ""
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	// If a bucket is provided, create the bucket/key format
-	if params.Bucket != nil {
-		bucketKey = fmt.Sprintf("%s/%s", *params.Bucket, *params.Key)
-	}
-
-	// Check if we have the file with this exact key
+	bucketKey := fmt.Sprintf("%s/%s", *params.Bucket, *params.Key)
 	content, ok := m.Files[bucketKey]
-
-	// If not found by exact match, try to find by suffix
 	if !ok {
-		for k, v := range m.Files {
-			if strings.HasSuffix(k, *params.Key) {
-				content = v
-				bucketKey = k
-				ok = true
-				break
-			}
-		}
-	}
-
-	// If still not found, look for the key in our available files
-	if !ok {
-		fmt.Printf("Mock S3 HeadObject: Key not found: %s\n", bucketKey)
-		fmt.Printf("Available keys: %v\n", m.listKeys())
-		return nil, &types.NoSuchKey{
-			Message: aws.String(fmt.Sprintf("The specified key does not exist: %s", *params.Key)),
+		return nil, &types.NotFound{
+			Message: aws.String(fmt.Sprintf("The specified key does not exist: %s", bucketKey)),
 		}
 	}
 
 	contentLength := int64(len(content))
-
-	// Ensure we have an ETag for this object
-	if _, ok := m.ETags[bucketKey]; !ok {
-		// Generate an ETag based on content length (simplified for testing)
-		etag := fmt.Sprintf("\"%x\"", len(content))
-		m.ETags[bucketKey] = aws.String(etag)
-	}
 
 	return &s3.HeadObjectOutput{
 		ETag:          m.ETags[bucketKey],
 		Metadata:      m.Metadata[bucketKey],
 		ContentLength: &contentLength,
 	}, nil
-}
-
-// listKeys returns a list of all keys in the mock S3 bucket (for debugging)
-func (m *S3Client) listKeys() []string {
-	var keys []string
-	for k := range m.Files {
-		keys = append(keys, k)
-	}
-	return keys
 }
 
 // CreateMultipartUpload is a stub implementation for the s3streamer.S3Client interface

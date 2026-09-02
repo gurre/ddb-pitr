@@ -111,12 +111,14 @@ func TestCoordinatorSkipsCompletedFile(t *testing.T) {
 }
 
 // TestCoordinatorCheckpointsAtInterval verifies progress is written every
-// checkpointInterval batches at the offset reached, then again for the trailing partial
-// batch, and finally as a completion. Checkpointing too rarely loses work on an
-// interrupted restore; too often turns S3 into the bottleneck.
+// checkpointInterval batches at the offset of the last line written, then again for the
+// trailing partial batch, and finally as a completion. Checkpointing too rarely loses
+// work on an interrupted restore; too often turns S3 into the bottleneck. Recording the
+// last written line, rather than the next unwritten one, is what lets a resume skip up
+// to and including it without knowing how the streamer counts line terminators.
 func TestCoordinatorCheckpointsAtInterval(t *testing.T) {
-	// Two lines per batch, so batch N completes at line offset 2N-1. With 401 lines the
-	// 100th and 200th batches land on offsets 199 and 399, and line 400 trails behind.
+	// Two lines per batch, so batch N ends on line 2N-1. With 401 lines the 100th and
+	// 200th batches end on lines 199 and 399, and line 400 trails behind.
 	lines := make([][]byte, 401)
 	for i := range lines {
 		lines[i] = []byte(`{"id":"1"}`)
@@ -135,7 +137,8 @@ func TestCoordinatorCheckpointsAtInterval(t *testing.T) {
 		t.Fatalf("coordinator failed: %v", err)
 	}
 
-	want := []int64{199, 399, 400}
+	offsets := lineOffsets(lines)
+	want := []int64{offsets[199], offsets[399], offsets[400]}
 	got := store.savedOffsets(testFileKey)
 	if len(got) != len(want) {
 		t.Fatalf("checkpoint offsets = %v, want %v then a completion", got, want)
@@ -246,47 +249,76 @@ func TestCoordinatorTracksWorkerTotals(t *testing.T) {
 	}
 }
 
-// TestCoordinatorResumesFromRecordedOffset verifies an interrupted file is resumed at
-// the byte offset the checkpoint recorded, so items already written are not written twice.
-func TestCoordinatorResumesFromRecordedOffset(t *testing.T) {
-	streamer := &mockStreamer{lines: [][]byte{[]byte(`{"id":"1"}`)}}
+// resumeLines are three distinguishable lines for the resume tests.
+var resumeLines = [][]byte{[]byte(`{"id":"1"}`), []byte(`{"id":"2"}`), []byte(`{"id":"3"}`)}
+
+// TestCoordinatorSkipsLinesUpToTheRecordedOffset verifies a file resumed from a
+// checkpoint writes only the lines after the one recorded: the recorded line was
+// written, so it is skipped too, and the one after it is the first to be written. A
+// boundary off by one either writes an item twice or loses one.
+func TestCoordinatorSkipsLinesUpToTheRecordedOffset(t *testing.T) {
+	writer := &mockWriter{}
 	coord, _ := newTestCoordinator(t, testDeps{
-		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
-		streamer: streamer,
-		store:    &mockStore{state: checkpoint.State{Offsets: map[string]int64{testFileKey: 4096}}},
+		files:  []manifest.FileMeta{{Key: testFileKey, ItemCount: 3}},
+		lines:  resumeLines,
+		writer: writer,
+		store: &mockStore{state: checkpoint.State{
+			Offsets: map[string]int64{testFileKey: lineOffsets(resumeLines)[1]},
+		}},
 	})
 
 	if err := runCoordinator(t, coord); err != nil {
 		t.Fatalf("coordinator failed: %v", err)
 	}
 
-	if len(streamer.requests) != 1 {
-		t.Fatalf("expected 1 stream request, got %d", len(streamer.requests))
-	}
-	if streamer.requests[0].offset != 4096 {
-		t.Errorf("expected the stream to resume at offset 4096, got %d", streamer.requests[0].offset)
+	if got := writer.writtenLines(); len(got) != 1 || got[0] != string(resumeLines[2]) {
+		t.Errorf("expected only the line after the recorded one written, got %v", got)
 	}
 }
 
-// TestCoordinatorStartsUnrelatedFileAtZero verifies the recorded offset is only applied
-// to the file it belongs to. Applying it to another file would silently skip its head.
-func TestCoordinatorStartsUnrelatedFileAtZero(t *testing.T) {
-	streamer := &mockStreamer{lines: [][]byte{[]byte(`{"id":"1"}`)}}
+// TestCoordinatorAlwaysStreamsFromTheStartOfTheFile verifies the streamer is never
+// handed a checkpointed offset. The streamer's offset is a position in the stored
+// object and the checkpoint holds positions in the decompressed stream; on a gzipped
+// export the former would land inside a compressed block and the file would come back
+// as garbage or not at all.
+func TestCoordinatorAlwaysStreamsFromTheStartOfTheFile(t *testing.T) {
+	streamer := &mockStreamer{lines: resumeLines}
 	coord, _ := newTestCoordinator(t, testDeps{
-		files:    []manifest.FileMeta{{Key: testFileKey2, ItemCount: 1}},
+		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 3}},
 		streamer: streamer,
-		store:    &mockStore{state: checkpoint.State{Offsets: map[string]int64{testFileKey: 4096}}},
+		store: &mockStore{state: checkpoint.State{
+			Offsets: map[string]int64{testFileKey: lineOffsets(resumeLines)[1]},
+		}},
 	})
 
 	if err := runCoordinator(t, coord); err != nil {
 		t.Fatalf("coordinator failed: %v", err)
 	}
 
-	if len(streamer.requests) != 1 {
-		t.Fatalf("expected 1 stream request, got %d", len(streamer.requests))
+	if len(streamer.requests) != 1 || streamer.requests[0].offset != 0 {
+		t.Errorf("expected one stream request from offset 0, got %+v", streamer.requests)
 	}
-	if streamer.requests[0].offset != 0 {
-		t.Errorf("expected an unrelated file to start at offset 0, got %d", streamer.requests[0].offset)
+}
+
+// TestCoordinatorSkipsNothingInAnUnrelatedFile verifies a recorded offset applies only
+// to the file it belongs to. Applying it to another file would silently skip its head.
+func TestCoordinatorSkipsNothingInAnUnrelatedFile(t *testing.T) {
+	writer := &mockWriter{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:  []manifest.FileMeta{{Key: testFileKey2, ItemCount: 3}},
+		lines:  resumeLines,
+		writer: writer,
+		store: &mockStore{state: checkpoint.State{
+			Offsets: map[string]int64{testFileKey: lineOffsets(resumeLines)[1]},
+		}},
+	})
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+
+	if got := writer.writtenLines(); len(got) != len(resumeLines) {
+		t.Errorf("expected every line of an unrelated file written, got %v", got)
 	}
 }
 
@@ -834,24 +866,22 @@ func TestCoordinatorReportsWriteFailureRatherThanHanging(t *testing.T) {
 	}
 }
 
-// TestCoordinatorDiscardsBufferedItemsOnStreamRetry verifies a file whose stream fails
-// part-way is retried from the checkpointed offset with nothing carried over from the
-// failed attempt. Items already buffered would otherwise be re-read on the retry and
-// written twice, inflating the item count and duplicating work.
-func TestCoordinatorDiscardsBufferedItemsOnStreamRetry(t *testing.T) {
-	// Four lines, and the first attempt dies after the third. The batch size is larger
-	// than the file, so everything sits in the buffer when the failure lands.
-	streamer := &mockStreamer{
-		lines:     [][]byte{[]byte(`{"id":"1"}`), []byte(`{"id":"2"}`), []byte(`{"id":"3"}`), []byte(`{"id":"4"}`)},
-		failAfter: 3,
-	}
+// TestCoordinatorRetryWritesEachLineOnce verifies a file whose stream fails part-way is
+// retried from the furthest line already written, with nothing carried over from the
+// failed attempt. Restarting from where the file began would write every earlier batch
+// a second time; carrying the buffered lines over would write those twice instead.
+func TestCoordinatorRetryWritesEachLineOnce(t *testing.T) {
+	// Four lines in batches of two, and the first attempt dies after the third: the
+	// first batch is written, the third line is buffered when the failure lands.
+	lines := [][]byte{[]byte(`{"id":"1"}`), []byte(`{"id":"2"}`), []byte(`{"id":"3"}`), []byte(`{"id":"4"}`)}
+	streamer := &mockStreamer{lines: lines, failAfter: 3}
 	writer := &mockWriter{}
 	coord, _ := newTestCoordinator(t, testDeps{
 		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 4}},
 		streamer: streamer,
 		writer:   writer,
 		configure: func(cfg *config.Config) {
-			cfg.BatchSize = 10
+			cfg.BatchSize = 2
 		},
 	})
 
@@ -862,12 +892,14 @@ func TestCoordinatorDiscardsBufferedItemsOnStreamRetry(t *testing.T) {
 	if len(streamer.requests) != 2 {
 		t.Fatalf("expected the stream to be retried once, got %d requests", len(streamer.requests))
 	}
-	var written int
-	for _, batch := range writer.batches {
-		written += len(batch)
+	got := writer.writtenLines()
+	if len(got) != len(lines) {
+		t.Fatalf("expected each of the %d lines written once, got %v", len(lines), got)
 	}
-	if written != 4 {
-		t.Errorf("expected the file's 4 items written once, got %d", written)
+	for i, line := range lines {
+		if got[i] != string(line) {
+			t.Fatalf("expected each of the %d lines written once in order, got %v", len(lines), got)
+		}
 	}
 }
 
@@ -995,9 +1027,9 @@ func TestProgressResumeReportsWhereToRestart(t *testing.T) {
 		wantOffset int64
 		wantDone   bool
 	}{
-		{key: "file1", wantOffset: 0, wantDone: true},
+		{key: "file1", wantOffset: noOffset, wantDone: true},
 		{key: testFileKey2, wantOffset: 4096, wantDone: false},
-		{key: "file3", wantOffset: 0, wantDone: false},
+		{key: "file3", wantOffset: noOffset, wantDone: false},
 	}
 
 	for _, tt := range tests {
@@ -1008,6 +1040,20 @@ func TestProgressResumeReportsWhereToRestart(t *testing.T) {
 					tt.key, offset, done, tt.wantOffset, tt.wantDone)
 			}
 		})
+	}
+}
+
+// TestProgressNeverMovesAnOffsetBackwards verifies recording a lower offset for a file
+// leaves the higher one in place. A retried stream re-delivers lines that were already
+// written; if their offsets overwrote the record, a checkpoint taken during the retry
+// would send a later resume back over work that was done twice already.
+func TestProgressNeverMovesAnOffsetBackwards(t *testing.T) {
+	p := newProgress(testExportARN, checkpoint.State{})
+	p.record(testFileKey, 4096)
+	p.record(testFileKey, 512)
+
+	if offset, _ := p.resume(testFileKey); offset != 4096 {
+		t.Errorf("resume after a lower record = %d, want 4096", offset)
 	}
 }
 
@@ -1319,7 +1365,7 @@ func (m *mockLoader) Load(ctx context.Context, manifestS3URI string) (manifest.S
 	return m.summary, nil
 }
 
-func (m *mockLoader) VerifyChecksums(ctx context.Context, summary manifest.Summary) (manifest.Verification, error) {
+func (m *mockLoader) VerifyChecksums(ctx context.Context, bucket string, summary manifest.Summary) (manifest.Verification, error) {
 	if m.verifyErr != nil {
 		return manifest.Verification{}, m.verifyErr
 	}
@@ -1391,8 +1437,9 @@ func (m *mockStreamer) Stream(ctx context.Context, bucket, key string, offset in
 	if m.failAfter > 0 && attempt == 0 {
 		limit = m.failAfter
 	}
+	offsets := lineOffsets(m.lines)
 	for i := 0; i < limit; i++ {
-		if err := fn(m.lines[i], int64(i)); err != nil {
+		if err := fn(m.lines[i], offsets[i]); err != nil {
 			return err
 		}
 	}
@@ -1402,8 +1449,22 @@ func (m *mockStreamer) Stream(ctx context.Context, bucket, key string, offset in
 	return nil
 }
 
-// mockDecoder turns every line into the same put operation, except lines it is told to
-// treat as corrupt.
+// lineOffsets reports the offset the streamer hands the callback for each line: its
+// position in the decompressed stream, counting one terminator per line. The double
+// and the assertions share it so a test states which line it means, not a number.
+func lineOffsets(lines [][]byte) []int64 {
+	offsets := make([]int64, len(lines))
+	var offset int64
+	for i, line := range lines {
+		offsets[i] = offset
+		offset += int64(len(line)) + 1
+	}
+	return offsets
+}
+
+// mockDecoder turns every line into a put operation carrying the line itself, so a
+// test can tell from what reached the writer which lines were written. Lines it is
+// told to treat as corrupt fail with the corrupt sentinel.
 type mockDecoder struct {
 	corruptLines map[string]bool
 }
@@ -1419,9 +1480,22 @@ func (m *mockDecoder) Decode(line []byte) (itemimage.Operation, error) {
 		},
 		NewImage: map[string]types.AttributeValue{
 			"id":   &types.AttributeValueMemberS{Value: "123"},
-			"name": &types.AttributeValueMemberS{Value: "test"},
+			"line": &types.AttributeValueMemberS{Value: string(line)},
 		},
 	}, nil
+}
+
+// writtenLines reports, in order, the lines behind every operation the writer received.
+func (m *mockWriter) writtenLines() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var lines []string
+	for _, batch := range m.batches {
+		for _, op := range batch {
+			lines = append(lines, op.NewImage["line"].(*types.AttributeValueMemberS).Value)
+		}
+	}
+	return lines
 }
 
 type mockWriter struct {

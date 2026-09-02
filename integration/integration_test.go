@@ -2,6 +2,7 @@ package integration
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -67,7 +68,7 @@ func TestFullIntegrationFlow(t *testing.T) {
 		t.Logf("Processing file %d: %s", i+1, file.Key)
 
 		itemCount := 0
-		err = streamer.Stream(ctx, manifestSummary.S3Bucket, file.Key, 0, func(line []byte, byteOffset int64) error {
+		err = streamer.Stream(ctx, mock.ExportBucket, file.Key, 0, func(line []byte, byteOffset int64) error {
 			op, err := decoder.Decode(line)
 			if err != nil {
 				t.Errorf("Failed to decode line: %v", err)
@@ -228,7 +229,7 @@ func TestIncrementalExportWithCoordinator(t *testing.T) {
 	var putCount, updateCount, deleteCount int
 
 	for _, file := range manifestSummary.DataFiles {
-		err = streamer.Stream(ctx, manifestSummary.S3Bucket, file.Key, 0, func(line []byte, byteOffset int64) error {
+		err = streamer.Stream(ctx, mock.ExportBucket, file.Key, 0, func(line []byte, byteOffset int64) error {
 			op, err := decoder.Decode(line)
 			if err != nil {
 				// Some files may not exist in test data
@@ -368,7 +369,7 @@ func TestDataCorrectnessAfterOperations(t *testing.T) {
 
 		for _, file := range summary.DataFiles {
 			var ops []itemimage.Operation
-			err := streamer.Stream(ctx, summary.S3Bucket, file.Key, 0, func(line []byte, _ int64) error {
+			err := streamer.Stream(ctx, mock.ExportBucket, file.Key, 0, func(line []byte, _ int64) error {
 				op, err := decoder.Decode(line)
 				if err != nil {
 					return nil
@@ -515,4 +516,141 @@ func TestDataCorrectnessAfterOperations(t *testing.T) {
 			}
 		}
 	})
+}
+
+// fullExportDataFile is the one data file of the FULL export fixture that holds items:
+// three lines, gzipped, which is enough for a resume to land inside it.
+const fullExportDataFile = "AWSDynamoDB/01768385930622-efd1a093/data/5mrfg3b44e3vhnfickkozoym6a.json.gz"
+
+// fullExportURI is the manifest of the FULL export fixture.
+const fullExportURI = "s3://test-bucket/AWSDynamoDB/01768385930622-efd1a093/manifest-summary.json"
+
+// loadFixtures returns a mock S3 holding every export under s3exportdata.
+func loadFixtures(t *testing.T) *mock.S3Client {
+	t.Helper()
+	testDataDir, err := filepath.Abs("../s3exportdata")
+	if err != nil {
+		t.Fatalf("Failed to get absolute path to s3exportdata: %v", err)
+	}
+	mockS3 := mock.NewS3Client(testDataDir)
+	if err := mockS3.LoadTestFiles(); err != nil {
+		t.Fatalf("Failed to load test files: %v", err)
+	}
+	return mockS3
+}
+
+// restoreConfig is a validated configuration for restoring the given export with one
+// worker, so the order items reach the table is the order of the file.
+func restoreConfig(t *testing.T, exportURI string) *config.Config {
+	t.Helper()
+	cfg := &config.Config{
+		TableName:       "test-table",
+		ExportS3URI:     exportURI,
+		ExportType:      "FULL",
+		ViewType:        "NEW",
+		Region:          "us-west-2",
+		MaxWorkers:      1,
+		BatchSize:       1,
+		ShutdownTimeout: time.Second,
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Invalid config: %v", err)
+	}
+	return cfg
+}
+
+// TestResumeSkipsLinesAlreadyWrittenAgainstTheRealStreamer verifies a checkpoint
+// holding an offset the real streamer reported for a gzipped file resumes exactly after
+// that line. The streamer's own offset argument is a position in the compressed object,
+// so a checkpoint offset handed straight back to it would range into the middle of the
+// gzip stream; only a test against the real streamer and a real gzipped file can tell
+// a resume that works from one that merely looks right against a line-counting double.
+func TestResumeSkipsLinesAlreadyWrittenAgainstTheRealStreamer(t *testing.T) {
+	mockS3 := loadFixtures(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// The offsets a checkpoint can hold are the ones the streamer reports.
+	streamer := s3streamer.NewS3Streamer(mockS3)
+	var offsets []int64
+	err := streamer.Stream(ctx, mock.ExportBucket, fullExportDataFile, 0, func(_ []byte, offset int64) error {
+		offsets = append(offsets, offset)
+		return nil
+	})
+	if err != nil || len(offsets) != 3 {
+		t.Fatalf("expected the fixture to stream 3 lines, got %d lines, err %v", len(offsets), err)
+	}
+
+	cfg := restoreConfig(t, fullExportURI)
+	summary, err := manifest.NewS3Loader(mockS3).Load(ctx, cfg.ExportS3URI)
+	if err != nil {
+		t.Fatalf("Failed to load manifest: %v", err)
+	}
+	store := checkpoint.NewMemoryStore()
+	if err := store.Save(ctx, checkpoint.State{
+		ExportID: summary.ExportARN,
+		Offsets:  map[string]int64{fullExportDataFile: offsets[1]},
+	}); err != nil {
+		t.Fatalf("Failed to seed checkpoint: %v", err)
+	}
+	mockDynamoDB := mock.NewDynamoDBClient()
+	coord := coordinator.NewCoordinator(cfg, manifest.NewS3Loader(mockS3), streamer,
+		itemimage.NewJSONDecoder(),
+		writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, cfg.BatchSize, writer.Callbacks{}),
+		store, nil, metrics.NewMetrics())
+
+	if err := coord.Run(ctx); err != nil {
+		t.Fatalf("Coordinator run failed: %v", err)
+	}
+
+	// The fixture holds pk=1 with sk=1, sk=2, sk=3 in that order; only the third
+	// follows the second line.
+	contents := mockDynamoDB.GetTableContents(cfg.TableName)
+	if len(contents) != 1 {
+		t.Fatalf("expected only the line after the recorded one written, got %d items", len(contents))
+	}
+	third := map[string]types.AttributeValue{
+		"pk": &types.AttributeValueMemberS{Value: "1"},
+		"sk": &types.AttributeValueMemberS{Value: "3"},
+	}
+	if !mockDynamoDB.ItemExists(cfg.TableName, third) {
+		t.Errorf("expected pk=1,sk=3 to be the item written, got %v", contents)
+	}
+}
+
+// TestStreamerReadsEachByteOfTheObjectOnce verifies the ranged reads the streamer
+// issues, after its compression probe, tile the object exactly once. The mock only
+// started honouring Range so that a resume could be tested; this is what keeps that
+// honest, since a mock returning the whole object for every range would make any
+// chunked read silently duplicate data and any resume test pass for the wrong reason.
+func TestStreamerReadsEachByteOfTheObjectOnce(t *testing.T) {
+	mockS3 := loadFixtures(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	err := s3streamer.NewS3Streamer(mockS3).Stream(ctx, mock.ExportBucket, fullExportDataFile, 0,
+		func([]byte, int64) error { return nil })
+	if err != nil {
+		t.Fatalf("stream failed: %v", err)
+	}
+
+	size := len(mockS3.Files[mock.ExportBucket+"/"+fullExportDataFile])
+	ranges := mockS3.Ranges()
+	if len(ranges) < 2 {
+		t.Fatalf("expected a probe followed by at least one chunk, got %v", ranges)
+	}
+	next := 0
+	for _, r := range ranges[1:] {
+		var start, end int
+		if _, err := fmt.Sscanf(r, "bytes=%d-%d", &start, &end); err != nil {
+			t.Fatalf("unexpected range %q: %v", r, err)
+		}
+		if start != next {
+			t.Fatalf("ranges %v do not tile the object from byte 0 without gaps or overlap", ranges[1:])
+		}
+		next = end + 1
+	}
+	if next < size {
+		t.Errorf("ranges %v stop at byte %d of %d", ranges[1:], next, size)
+	}
 }

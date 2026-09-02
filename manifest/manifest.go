@@ -87,7 +87,7 @@ type Verification struct {
 //	result, err := loader.VerifyChecksums(ctx, summary)
 type Loader interface {
 	Load(ctx context.Context, manifestS3URI string) (Summary, error)
-	VerifyChecksums(ctx context.Context, summary Summary) (Verification, error)
+	VerifyChecksums(ctx context.Context, bucket string, summary Summary) (Verification, error)
 }
 
 // S3Loader implements the Loader interface using AWS S3.
@@ -181,9 +181,12 @@ func (l *S3Loader) Load(ctx context.Context, manifestS3URI string) (Summary, err
 	return summary, nil
 }
 
-// VerifyChecksums implements the checksum verification requirements from section 4.3.
-// It reports an error only when a data file demonstrably differs from what the manifest
-// recorded; files it has nothing to compare against come back in Unverified.
+// VerifyChecksums checks every data file the manifest lists against the object in the
+// given bucket, which must be the bucket the restore is going to read from. The bucket
+// the manifest itself names is where the export was written, and an export that has
+// since been copied elsewhere would otherwise be verified against objects the restore
+// never reads. It reports an error only when a data file demonstrably differs from what
+// the manifest recorded; files it has nothing to compare against come back in Unverified.
 //
 // The manifest records both the ETag S3 reported at export time and the object's MD5.
 // The ETag is compared first because it is the only one that works for a file S3 stored
@@ -196,17 +199,15 @@ func (l *S3Loader) Load(ctx context.Context, manifestS3URI string) (Summary, err
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	result, err := loader.VerifyChecksums(ctx, summary)
+//	result, err := loader.VerifyChecksums(ctx, "my-bucket", summary)
 //	if err != nil {
 //	    log.Fatal("Checksum verification failed:", err)
 //	}
 //	fmt.Printf("%d verified, %d unverifiable\n", result.Verified, len(result.Unverified))
-func (l *S3Loader) VerifyChecksums(ctx context.Context, summary Summary) (Verification, error) {
-	// We need the bucket for HeadObject operations
-	if summary.S3Bucket == "" {
-		return Verification{}, fmt.Errorf("no S3 bucket specified in summary")
+func (l *S3Loader) VerifyChecksums(ctx context.Context, bucket string, summary Summary) (Verification, error) {
+	if bucket == "" {
+		return Verification{}, fmt.Errorf("no bucket to verify the export against")
 	}
-	bucket := summary.S3Bucket
 	result := Verification{Unverified: make([]string, 0)}
 
 	for _, file := range summary.DataFiles {

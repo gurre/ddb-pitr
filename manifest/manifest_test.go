@@ -20,6 +20,9 @@ const (
 	testMD5Hex    = "5eb63bbbe01eeed093cb22bb8f5acdc3"
 )
 
+// testBucket is the bucket the tests ask verification to check.
+const testBucket = "test-bucket"
+
 // mockS3Client implements the aws.S3Client interface for testing. It counts calls that
 // arrived without the marker a test put on its context, which is how a call made under a
 // substituted context is told from one made under the caller's.
@@ -72,6 +75,8 @@ func (m *mockS3Client) HeadObject(ctx context.Context, params *s3.HeadObjectInpu
 	if params.Bucket == nil || *params.Bucket == "" {
 		return nil, fmt.Errorf("no bucket in request")
 	}
+
+	m.buckets = append(m.buckets, *params.Bucket)
 
 	// Check if we have a custom ETag for this key. An empty one stands for the S3
 	// implementations that omit the header entirely.
@@ -246,7 +251,7 @@ func TestVerifyChecksumsAcceptsMatchingETag(t *testing.T) {
 		etags: map[string]string{"data-001.json.gz": testMD5Hex},
 	})
 
-	result, err := loader.VerifyChecksums(context.Background(), summary)
+	result, err := loader.VerifyChecksums(context.Background(), testBucket, summary)
 	if err != nil {
 		t.Fatalf("expected a matching checksum to verify, got %v", err)
 	}
@@ -263,7 +268,7 @@ func TestVerifyChecksumsAcceptsQuotedETag(t *testing.T) {
 		etags: map[string]string{"data-001.json.gz": `"` + testMD5Hex + `"`},
 	})
 
-	result, err := loader.VerifyChecksums(context.Background(), summary)
+	result, err := loader.VerifyChecksums(context.Background(), testBucket, summary)
 	if err != nil {
 		t.Fatalf("expected a quoted matching checksum to verify, got %v", err)
 	}
@@ -281,7 +286,7 @@ func TestVerifyChecksumsRejectsMismatch(t *testing.T) {
 		etags: map[string]string{"data-001.json.gz": "00000000000000000000000000000000"},
 	})
 
-	_, err := loader.VerifyChecksums(context.Background(), summary)
+	_, err := loader.VerifyChecksums(context.Background(), testBucket, summary)
 	if err == nil {
 		t.Fatal("expected a checksum mismatch to be reported")
 	}
@@ -304,7 +309,7 @@ func TestVerifyChecksumsMatchesRecordedETag(t *testing.T) {
 	}
 	loader := NewS3Loader(&mockS3Client{etags: map[string]string{"data-001.json.gz": multipartETag}})
 
-	result, err := loader.VerifyChecksums(context.Background(), summary)
+	result, err := loader.VerifyChecksums(context.Background(), testBucket, summary)
 	if err != nil {
 		t.Fatalf("expected a file matching its recorded ETag to verify, got %v", err)
 	}
@@ -326,7 +331,7 @@ func TestVerifyChecksumsRejectsChangedETag(t *testing.T) {
 		etags: map[string]string{"data-001.json.gz": "b5443265c5e545b6c8d8275e0b6f8c15-1"},
 	})
 
-	if _, err := loader.VerifyChecksums(context.Background(), summary); err == nil {
+	if _, err := loader.VerifyChecksums(context.Background(), testBucket, summary); err == nil {
 		t.Error("expected a data file that no longer matches the manifest to be reported")
 	}
 }
@@ -357,7 +362,7 @@ func TestVerifyChecksumsReportsWhatItCannotCheck(t *testing.T) {
 			summary := Summary{S3Bucket: "test-bucket", DataFiles: []FileMeta{tt.file}}
 			loader := NewS3Loader(&mockS3Client{etags: map[string]string{tt.file.Key: tt.etag}})
 
-			result, err := loader.VerifyChecksums(context.Background(), summary)
+			result, err := loader.VerifyChecksums(context.Background(), testBucket, summary)
 			if err != nil {
 				t.Fatalf("expected an unverifiable file to be reported, not to fail: %v", err)
 			}
@@ -395,12 +400,30 @@ func TestVerifyChecksumsAcceptsRealExportManifest(t *testing.T) {
 		client.etags[file.Key] = file.ETag
 	}
 
-	result, err := NewS3Loader(client).VerifyChecksums(context.Background(), summary)
+	result, err := NewS3Loader(client).VerifyChecksums(context.Background(), testBucket, summary)
 	if err != nil {
 		t.Fatalf("expected a real export manifest to verify, got %v", err)
 	}
 	if result.Verified != len(summary.DataFiles) {
 		t.Errorf("verified %d of %d data files, want all of them", result.Verified, len(summary.DataFiles))
+	}
+}
+
+// TestVerifyChecksumsHeadsTheBucketItWasGiven verifies the data files are looked up in
+// the bucket the caller names, not the one the manifest recorded. The manifest names
+// where the export was written; a restore reading a copy of it elsewhere would otherwise
+// verify objects it never reads, and report the copy as checked.
+func TestVerifyChecksumsHeadsTheBucketItWasGiven(t *testing.T) {
+	client := &mockS3Client{etags: map[string]string{"data-001.json.gz": testMD5Hex}}
+	summary := summaryWithChecksum("data-001.json.gz", testMD5Base64)
+	summary.S3Bucket = "where-the-export-was-written"
+
+	if _, err := NewS3Loader(client).VerifyChecksums(context.Background(), "the-copy", summary); err != nil {
+		t.Fatalf("expected verification to pass, got %v", err)
+	}
+
+	if len(client.buckets) != 1 || client.buckets[0] != "the-copy" {
+		t.Errorf("expected the data file headed in the-copy, got %v", client.buckets)
 	}
 }
 
@@ -410,26 +433,30 @@ func TestVerifyChecksumsAcceptsRealExportManifest(t *testing.T) {
 func TestVerifyChecksumsRejectsUnusableInputs(t *testing.T) {
 	tests := []struct {
 		name    string
+		bucket  string
 		summary Summary
 		client  *mockS3Client
 	}{
 		{
-			name:    "no bucket in the summary",
+			name:    "no bucket to verify against",
 			summary: Summary{DataFiles: []FileMeta{{Key: "data-001.json.gz"}}},
 			client:  &mockS3Client{},
 		},
 		{
 			name:    "S3 reports no ETag",
+			bucket:  testBucket,
 			summary: summaryWithChecksum("data-001.json.gz", testMD5Base64),
 			client:  &mockS3Client{etags: map[string]string{"data-001.json.gz": ""}},
 		},
 		{
 			name:    "the data file cannot be read",
+			bucket:  testBucket,
 			summary: summaryWithChecksum("data-001.json.gz", testMD5Base64),
 			client:  &mockS3Client{data: map[string][]byte{}},
 		},
 		{
 			name:    "checksum is not Base64",
+			bucket:  testBucket,
 			summary: summaryWithChecksum("data-001.json.gz", "not base64!"),
 			client:  &mockS3Client{etags: map[string]string{"data-001.json.gz": "abc"}},
 		},
@@ -437,7 +464,7 @@ func TestVerifyChecksumsRejectsUnusableInputs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := NewS3Loader(tt.client).VerifyChecksums(context.Background(), tt.summary); err == nil {
+			if _, err := NewS3Loader(tt.client).VerifyChecksums(context.Background(), tt.bucket, tt.summary); err == nil {
 				t.Error("expected verification to fail")
 			}
 		})
@@ -493,7 +520,7 @@ func TestLoaderSendsTheCallersContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to load manifest: %v", err)
 	}
-	if _, err := loader.VerifyChecksums(ctx, summary); err != nil {
+	if _, err := loader.VerifyChecksums(ctx, testBucket, summary); err != nil {
 		t.Fatalf("failed to verify checksums: %v", err)
 	}
 

@@ -21,8 +21,26 @@ import (
 	"github.com/gurre/ddb-pitr/manifest"
 	"github.com/gurre/ddb-pitr/metrics"
 	"github.com/gurre/ddb-pitr/writer"
-	"github.com/gurre/s3streamer"
 )
+
+// Streamer delivers the lines of one data file in order. The offset handed to fn is
+// the line's position in the decompressed stream, counted from the start of the file,
+// which is the only position the coordinator ever records or compares. The offset
+// argument to Stream is a position in the stored object as S3 holds it; the
+// coordinator always passes streamFromStart, because a decompressed position has no
+// meaning there. See worker for why.
+type Streamer interface {
+	Stream(ctx context.Context, bucket, key string, offset int64, fn func(line []byte, offset int64) error) error
+}
+
+// streamFromStart is the only stored-object offset a worker asks for. Checkpoint
+// offsets are decompressed positions; handing one to the streamer would range into the
+// middle of a gzip member.
+const streamFromStart int64 = 0
+
+// noOffset is what progress reports for a file nothing has been written from yet.
+// Zero cannot mean that, since the first line of every file sits at offset zero.
+const noOffset int64 = -1
 
 // WorkerStatus represents the status of a worker as required by section 5.
 // It tracks progress and errors for monitoring and reporting.
@@ -84,7 +102,7 @@ func WithStreamBackoff(b Backoffer) Option {
 type Coordinator struct {
 	cfg            *config.Config
 	manifest       manifest.Loader
-	streamer       s3streamer.Streamer
+	streamer       Streamer
 	parser         itemimage.Decoder
 	writer         writer.Writer
 	store          checkpoint.Store
@@ -117,7 +135,7 @@ type Coordinator struct {
 type progress struct {
 	exportID  string              // Export this progress belongs to
 	completed map[string]struct{} // Files processed to the end
-	offsets   map[string]int64    // Bytes consumed, for files still in progress
+	offsets   map[string]int64    // Offset of the last line written, per file still in progress
 	mu        sync.Mutex
 }
 
@@ -137,20 +155,29 @@ func newProgress(exportID string, state checkpoint.State) *progress {
 	return p
 }
 
-// resume reports where to start a file, and whether it is finished already.
+// resume reports the offset of the last line written from a file, noOffset when none
+// has been, and whether the file is finished already.
 func (p *progress) resume(key string) (offset int64, done bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if _, ok := p.completed[key]; ok {
-		return 0, true
+		return noOffset, true
 	}
-	return p.offsets[key], false
+	if offset, ok := p.offsets[key]; ok {
+		return offset, false
+	}
+	return noOffset, false
 }
 
-// record notes how far into a file the restore has written.
+// record notes the offset of the last line written from a file. It never moves
+// backwards: a retried stream re-delivers lines that were already written, and letting
+// it lower the offset would make a later resume write them a third time.
 func (p *progress) record(key string, offset int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if recorded, ok := p.offsets[key]; ok && recorded >= offset {
+		return
+	}
 	p.offsets[key] = offset
 }
 
@@ -187,7 +214,7 @@ func (p *progress) snapshot() checkpoint.State {
 func NewCoordinator(
 	cfg *config.Config,
 	manifest manifest.Loader,
-	streamer s3streamer.Streamer,
+	streamer Streamer,
 	parser itemimage.Decoder,
 	w writer.Writer,
 	store checkpoint.Store,
@@ -241,7 +268,9 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	// Verify the export against what its manifest recorded before writing anything.
 	// A file that no longer matches means the restore would write data the export
 	// never contained, which is worth failing on while the table is still untouched.
-	verification, err := c.manifest.VerifyChecksums(ctx, summary)
+	// The bucket checked is the one the workers read from, not the one the manifest
+	// names: they differ for an export that was copied since it was taken.
+	verification, err := c.manifest.VerifyChecksums(ctx, c.cfg.GetExportBucketName(), summary)
 	if err != nil {
 		return fmt.Errorf("export failed verification: %w", err)
 	}
@@ -521,12 +550,11 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 			s.CurrentFile = file.Key
 		})
 
-		offset, done := c.progress.resume(file.Key)
-		if done {
+		if _, done := c.progress.resume(file.Key); done {
 			continue
 		}
 
-		// Track current byte offset and batch count for checkpointing
+		// Offset of the last line handed to the writer, and batches since the last save.
 		var currentOffset int64
 		var batchesSinceCheckpoint int
 
@@ -541,16 +569,28 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 				return fmt.Errorf("stopped retrying file %s: %w", file.Key, stopRetrying(ctx))
 			}
 
-			// Each attempt restarts the file at the checkpointed offset, so whatever the
-			// failed attempt left buffered has to go with it. Carrying it over would
-			// write those items a second time and count them twice.
+			// Every attempt reads the file from its start and skips what is already
+			// written, taken fresh from progress so a retry continues from the furthest
+			// point the failed attempt reached. Whatever the failed attempt left
+			// buffered goes with it: those lines are re-read and re-skipped or
+			// re-written by the next attempt, never carried over and written twice.
+			//
+			// The file is read from the start because the streamer's offset is a
+			// position in the stored object, while the offsets the callback reports and
+			// progress records are positions in the decompressed stream. The two only
+			// agree for an uncompressed file, and exports are gzipped.
+			startOffset, _ := c.progress.resume(file.Key)
 			batch = batch[:0]
 			batchesSinceCheckpoint = 0
-			currentOffset = offset
+			currentOffset = startOffset
 
 			// HOT PATH: Inner loop - callback invoked for every JSON line from S3
-			streamErr = c.streamer.Stream(ctx, bucket, file.Key, offset, func(line []byte, byteOffset int64) error {
-				// Track the current position for checkpoint saves
+			streamErr = c.streamer.Stream(ctx, bucket, file.Key, streamFromStart, func(line []byte, byteOffset int64) error {
+				// Lines up to and including the recorded one are already written. The
+				// check precedes decoding, which is where the CPU and memory go.
+				if byteOffset <= startOffset {
+					return nil
+				}
 				currentOffset = byteOffset
 
 				// Decode is the main CPU/memory bottleneck (~27% CPU, ~99% memory)
@@ -631,9 +671,9 @@ func (c *Coordinator) writeBatch(ctx context.Context, id int, batch []itemimage.
 		s.BatchesCount++
 	})
 
-	// The offset is recorded on every batch so any checkpoint, whichever worker takes
-	// it, carries the furthest point every file has reached. Writing it out is what
-	// costs an S3 call, so that still happens only at intervals.
+	// The offset of the batch's last line is recorded on every batch so any checkpoint,
+	// whichever worker takes it, carries the furthest point every file has reached.
+	// Writing it out is what costs an S3 call, so that still happens only at intervals.
 	c.progress.record(file.Key, offset)
 	if shouldCheckpoint {
 		if err := c.saveProgress(ctx); err != nil {
