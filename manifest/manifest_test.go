@@ -6,7 +6,9 @@ import (
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -31,12 +33,34 @@ type mockS3Client struct {
 	etags    map[string]string // Custom ETags for specific keys
 	buckets  []string          // Buckets the loader asked for, in order
 	detached int
+	inFlight int32 // Calls currently in progress
+	peak     int32 // Most calls ever in progress at once
+	mu       sync.Mutex
+}
+
+// enter notes a call starting and reports the marker for leave; together they measure
+// how many calls overlap, which is how a test sees verification running in parallel.
+func (m *mockS3Client) enter() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inFlight++
+	if m.inFlight > m.peak {
+		m.peak = m.inFlight
+	}
+}
+
+func (m *mockS3Client) leave() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inFlight--
 }
 
 // callerContextKey marks the context a test passed in.
 type callerContextKey struct{}
 
 func (m *mockS3Client) noteContext(ctx context.Context) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if ctx.Value(callerContextKey{}) == nil {
 		m.detached++
 	}
@@ -51,9 +75,10 @@ func (m *mockS3Client) GetObject(ctx context.Context, params *s3.GetObjectInput,
 		return nil, fmt.Errorf("no bucket in request")
 	}
 
+	m.mu.Lock()
 	m.buckets = append(m.buckets, *params.Bucket)
-
 	data, ok := m.data[*params.Key]
+	m.mu.Unlock()
 	if !ok {
 		return nil, &types.NoSuchKey{}
 	}
@@ -68,6 +93,10 @@ func (m *mockS3Client) PutObject(ctx context.Context, params *s3.PutObjectInput,
 }
 
 func (m *mockS3Client) HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	m.enter()
+	defer m.leave()
+	// Overlapping calls have to be given the chance to overlap.
+	time.Sleep(time.Millisecond)
 	m.noteContext(ctx)
 	if params.Key == nil {
 		return nil, fmt.Errorf("key is nil")
@@ -76,6 +105,8 @@ func (m *mockS3Client) HeadObject(ctx context.Context, params *s3.HeadObjectInpu
 		return nil, fmt.Errorf("no bucket in request")
 	}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.buckets = append(m.buckets, *params.Bucket)
 
 	// Check if we have a custom ETag for this key. An empty one stands for the S3
@@ -340,39 +371,106 @@ func TestVerifyChecksumsRejectsChangedETag(t *testing.T) {
 // listed as unverified rather than counted as good. Reporting "verified" for a file
 // nothing was checked against would be the more dangerous of the two answers.
 func TestVerifyChecksumsReportsWhatItCannotCheck(t *testing.T) {
+	summary := Summary{DataFiles: []FileMeta{{Key: "data-001.json.gz"}}}
+	loader := NewS3Loader(&mockS3Client{etags: map[string]string{"data-001.json.gz": testMD5Hex}})
+
+	result, err := loader.VerifyChecksums(context.Background(), testBucket, summary)
+	if err != nil {
+		t.Fatalf("expected an unverifiable file to be reported, not to fail: %v", err)
+	}
+	if result.Verified != 0 {
+		t.Errorf("expected nothing counted as verified, got %d", result.Verified)
+	}
+	if len(result.Unverified) != 1 || result.Unverified[0] != "data-001.json.gz" {
+		t.Errorf("expected the file listed as unverified, got %v", result.Unverified)
+	}
+}
+
+// TestVerifyChecksumsAcceptsACopiedObjectByItsMD5 verifies a data file whose ETag no
+// longer matches the multipart one the export recorded, but whose single-part ETag is
+// the MD5 the manifest carries, is verified. Copying an export re-uploads its objects
+// and the ETag changes; the MD5 is what still identifies the content, and without it
+// no copied export could ever pass.
+func TestVerifyChecksumsAcceptsACopiedObjectByItsMD5(t *testing.T) {
+	summary := Summary{DataFiles: []FileMeta{
+		{Key: "data-001.json.gz", ETag: "7deb4078f238dd87d6af0538152c04e9-1", MD5Base64: testMD5Base64},
+	}}
+	loader := NewS3Loader(&mockS3Client{etags: map[string]string{"data-001.json.gz": testMD5Hex}})
+
+	result, err := loader.VerifyChecksums(context.Background(), testBucket, summary)
+	if err != nil {
+		t.Fatalf("expected a copied object with a matching MD5 to verify, got %v", err)
+	}
+	if result.Verified != 1 {
+		t.Errorf("expected 1 file counted as verified, got %d", result.Verified)
+	}
+}
+
+// TestVerifyChecksumsReadsACopiedMultipartObject verifies a data file whose ETag is a
+// multipart digest that matches nothing the manifest recorded is read and its content
+// compared to the recorded MD5, passing when the content matches and failing when it
+// does not. A large copied file lands here; refusing to decide would leave the operator
+// choosing between trusting it blind and not restoring at all.
+func TestVerifyChecksumsReadsACopiedMultipartObject(t *testing.T) {
 	tests := []struct {
-		name string
-		file FileMeta
-		etag string
+		name    string
+		content string
+		wantErr bool
 	}{
-		{
-			name: "manifest recorded neither ETag nor checksum",
-			file: FileMeta{Key: "data-001.json.gz"},
-			etag: "5eb63bbbe01eeed093cb22bb8f5acdc3",
-		},
-		{
-			name: "only an MD5, against a multipart ETag it cannot describe",
-			file: FileMeta{Key: "data-001.json.gz", MD5Base64: testMD5Base64},
-			etag: "7deb4078f238dd87d6af0538152c04e9-1",
-		},
+		{name: "content matches the recorded MD5", content: "hello world"},
+		{name: "content differs from the recorded MD5", content: "hello there", wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			summary := Summary{S3Bucket: "test-bucket", DataFiles: []FileMeta{tt.file}}
-			loader := NewS3Loader(&mockS3Client{etags: map[string]string{tt.file.Key: tt.etag}})
+			summary := Summary{DataFiles: []FileMeta{
+				{Key: "data-001.json.gz", ETag: "7deb4078f238dd87d6af0538152c04e9-1", MD5Base64: testMD5Base64},
+			}}
+			loader := NewS3Loader(&mockS3Client{
+				etags: map[string]string{"data-001.json.gz": "b5443265c5e545b6c8d8275e0b6f8c15-2"},
+				data:  map[string][]byte{"data-001.json.gz": []byte(tt.content)},
+			})
 
 			result, err := loader.VerifyChecksums(context.Background(), testBucket, summary)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected content that differs from the manifest to fail")
+				}
+				return
+			}
 			if err != nil {
-				t.Fatalf("expected an unverifiable file to be reported, not to fail: %v", err)
+				t.Fatalf("expected the object verified by its content, got %v", err)
 			}
-			if result.Verified != 0 {
-				t.Errorf("expected nothing counted as verified, got %d", result.Verified)
-			}
-			if len(result.Unverified) != 1 || result.Unverified[0] != tt.file.Key {
-				t.Errorf("expected the file listed as unverified, got %v", result.Unverified)
+			if result.Verified != 1 {
+				t.Errorf("expected 1 file counted as verified, got %d", result.Verified)
 			}
 		})
+	}
+}
+
+// TestVerifyChecksumsChecksFilesInParallel verifies the data files are examined
+// several at a time. An export lists a file per partition, tens of thousands for a
+// large table, and one round trip each in sequence is a preflight measured in tens of
+// minutes with nothing to show for it.
+func TestVerifyChecksumsChecksFilesInParallel(t *testing.T) {
+	const files = 64
+	summary := Summary{}
+	client := &mockS3Client{etags: map[string]string{}}
+	for i := 0; i < files; i++ {
+		key := fmt.Sprintf("data-%03d.json.gz", i)
+		summary.DataFiles = append(summary.DataFiles, FileMeta{Key: key, ETag: "abc-1"})
+		client.etags[key] = "abc-1"
+	}
+
+	result, err := NewS3Loader(client).VerifyChecksums(context.Background(), testBucket, summary)
+	if err != nil {
+		t.Fatalf("expected every file to verify, got %v", err)
+	}
+	if result.Verified != files {
+		t.Errorf("expected %d files verified, got %d", files, result.Verified)
+	}
+	if client.peak < 2 {
+		t.Errorf("expected files checked concurrently, but at most %d call was in flight", client.peak)
 	}
 }
 

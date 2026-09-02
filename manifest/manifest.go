@@ -1,15 +1,17 @@
-// Package manifest implements the manifest loading and verification as specified in section 4.3
-// of the design specification. It handles loading and validating the DynamoDB PITR export
-// manifest files from S3.
+// Package manifest loads a DynamoDB export's manifests from S3 and verifies the data
+// files they list before a restore reads them.
 package manifest
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/base64"
 	"fmt"
 	"io"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	json "github.com/goccy/go-json"
@@ -84,7 +86,7 @@ type Verification struct {
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	result, err := loader.VerifyChecksums(ctx, summary)
+//	result, err := loader.VerifyChecksums(ctx, "my-bucket", summary)
 type Loader interface {
 	Load(ctx context.Context, manifestS3URI string) (Summary, error)
 	VerifyChecksums(ctx context.Context, bucket string, summary Summary) (Verification, error)
@@ -181,16 +183,24 @@ func (l *S3Loader) Load(ctx context.Context, manifestS3URI string) (Summary, err
 	return summary, nil
 }
 
+// verifyParallelism bounds how many data files are checked at once. Verification is
+// one HeadObject per file, and an export can list tens of thousands of files.
+const verifyParallelism = 16
+
 // VerifyChecksums checks every data file the manifest lists against the object in the
 // given bucket, which must be the bucket the restore is going to read from. The bucket
 // the manifest itself names is where the export was written, and an export that has
 // since been copied elsewhere would otherwise be verified against objects the restore
-// never reads. It reports an error only when a data file demonstrably differs from what
-// the manifest recorded; files it has nothing to compare against come back in Unverified.
+// never reads.
 //
-// The manifest records both the ETag S3 reported at export time and the object's MD5.
-// The ETag is compared first because it is the only one that works for a file S3 stored
-// in parts, whose ETag is a digest of the parts' digests rather than of the object.
+// Each file is decided by the first of these that applies: the ETag S3 reports equals
+// the one the manifest recorded; the manifest recorded an MD5 and S3's ETag is a
+// single-part one, so the two are compared directly; the manifest recorded an MD5 but
+// S3's ETag is a multipart digest that cannot be compared, so the object is read and
+// its MD5 computed. A copied object loses the ETag the export recorded, and the MD5
+// is what still identifies it. An error is returned only when a file demonstrably
+// differs from what the manifest recorded. A file the manifest recorded nothing
+// comparable for, which a real export never produces, comes back in Unverified.
 //
 // Example:
 //
@@ -208,57 +218,125 @@ func (l *S3Loader) VerifyChecksums(ctx context.Context, bucket string, summary S
 	if bucket == "" {
 		return Verification{}, fmt.Errorf("no bucket to verify the export against")
 	}
-	result := Verification{Unverified: make([]string, 0)}
 
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		result   = Verification{Unverified: make([]string, 0)}
+		mu       sync.Mutex
+		firstErr error
+		wg       sync.WaitGroup
+		slots    = make(chan struct{}, verifyParallelism)
+	)
 	for _, file := range summary.DataFiles {
-		// Get the object metadata from S3 using HeadObject
-		key := file.Key
-		resp, err := l.client.HeadObject(ctx, &s3.HeadObjectInput{
-			Bucket: &bucket,
-			Key:    &key,
-		})
-		if err != nil {
-			return Verification{}, fmt.Errorf("failed to get metadata for data file %s: %w", file.Key, err)
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
 		}
-
-		if resp.ETag == nil {
-			return Verification{}, fmt.Errorf("ETag is nil for data file %s", file.Key)
+		if ctx.Err() != nil {
+			break
 		}
-
-		// Some S3 implementations quote the ETag and some do not.
-		etag := strings.Trim(*resp.ETag, `"`)
-
-		if recorded := strings.Trim(file.ETag, `"`); recorded != "" {
-			if etag != recorded {
-				return Verification{}, fmt.Errorf("ETag mismatch for data file %s: manifest recorded %s, S3 reports %s",
-					file.Key, recorded, etag)
+		wg.Add(1)
+		go func(file FileMeta) {
+			defer wg.Done()
+			defer func() { <-slots }()
+			verified, err := l.verifyFile(ctx, bucket, file)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err != nil:
+				if firstErr == nil {
+					firstErr = err
+				}
+				cancel()
+			case verified:
+				result.Verified++
+			default:
+				result.Unverified = append(result.Unverified, file.Key)
 			}
-			result.Verified++
-			continue
-		}
+		}(file)
+	}
+	wg.Wait()
 
-		// Without a recorded ETag the object's MD5 is all that is left, and it cannot
-		// speak for an object S3 assembled from parts.
-		if file.MD5Base64 == "" || isMultipartETag(etag) {
-			result.Unverified = append(result.Unverified, file.Key)
-			continue
-		}
+	if firstErr != nil {
+		return Verification{}, firstErr
+	}
+	sort.Strings(result.Unverified)
+	return result, nil
+}
 
-		// Convert expected MD5 from Base64 to Hex
-		md5Bytes, err := base64.StdEncoding.DecodeString(file.MD5Base64)
-		if err != nil {
-			return Verification{}, fmt.Errorf("failed to decode MD5 Base64 for data file %s: %w", file.Key, err)
-		}
-		expectedMD5Hex := fmt.Sprintf("%x", md5Bytes)
-
-		if etag != expectedMD5Hex {
-			return Verification{}, fmt.Errorf("checksum mismatch for data file %s: expected %s, got %s",
-				file.Key, expectedMD5Hex, etag)
-		}
-		result.Verified++
+// verifyFile decides one data file. It reports true when the object matches what the
+// manifest recorded, false when the manifest recorded nothing comparable, and an
+// error when the object demonstrably differs or could not be examined.
+func (l *S3Loader) verifyFile(ctx context.Context, bucket string, file FileMeta) (bool, error) {
+	key := file.Key
+	resp, err := l.client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to get metadata for data file %s: %w", file.Key, err)
+	}
+	if resp.ETag == nil {
+		return false, fmt.Errorf("ETag is nil for data file %s", file.Key)
 	}
 
-	return result, nil
+	// Some S3 implementations quote the ETag and some do not.
+	etag := strings.Trim(*resp.ETag, `"`)
+	recorded := strings.Trim(file.ETag, `"`)
+	if recorded != "" && etag == recorded {
+		return true, nil
+	}
+
+	if file.MD5Base64 == "" {
+		if recorded == "" {
+			return false, nil
+		}
+		return false, fmt.Errorf("ETag mismatch for data file %s: manifest recorded %s, S3 reports %s",
+			file.Key, recorded, etag)
+	}
+	md5Bytes, err := base64.StdEncoding.DecodeString(file.MD5Base64)
+	if err != nil {
+		return false, fmt.Errorf("failed to decode MD5 Base64 for data file %s: %w", file.Key, err)
+	}
+	expectedMD5Hex := fmt.Sprintf("%x", md5Bytes)
+
+	// A single-part ETag is the object's MD5; a multipart one is a digest of the parts'
+	// digests, so only reading the object can tell whether its content matches.
+	actualMD5Hex := etag
+	if isMultipartETag(etag) {
+		actualMD5Hex, err = l.contentMD5(ctx, bucket, key)
+		if err != nil {
+			return false, fmt.Errorf("failed to read data file %s to verify it: %w", file.Key, err)
+		}
+	}
+	if actualMD5Hex != expectedMD5Hex {
+		return false, fmt.Errorf("checksum mismatch for data file %s: expected %s, got %s",
+			file.Key, expectedMD5Hex, actualMD5Hex)
+	}
+	return true, nil
+}
+
+// contentMD5 reads an object and returns the hex MD5 of its bytes.
+func (l *S3Loader) contentMD5(ctx context.Context, bucket, key string) (string, error) {
+	resp, err := l.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	})
+	if err != nil {
+		return "", err
+	}
+	if resp.Body == nil {
+		return "", fmt.Errorf("response body is nil")
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	digest := md5.New()
+	if _, err := io.Copy(digest, resp.Body); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", digest.Sum(nil)), nil
 }
 
 // isMultipartETag reports whether S3 built this ETag from a multipart upload, which

@@ -270,6 +270,7 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	// never contained, which is worth failing on while the table is still untouched.
 	// The bucket checked is the one the workers read from, not the one the manifest
 	// names: they differ for an export that was copied since it was taken.
+	fmt.Printf("Verifying %d data files against the manifest\n", len(summary.DataFiles))
 	verification, err := c.manifest.VerifyChecksums(ctx, c.cfg.GetExportBucketName(), summary)
 	if err != nil {
 		return fmt.Errorf("export failed verification: %w", err)
