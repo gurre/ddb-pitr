@@ -1,6 +1,5 @@
-// Package main implements the command-line interface as specified in section 7
-// of the design specification. It handles parsing flags and initializing the
-// restore operation.
+// Package main is the ddb-pitr command: it parses the flags, wires the AWS clients to
+// the restore and maps the outcome to an exit status.
 package main
 
 import (
@@ -8,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -54,46 +54,52 @@ func main() {
 	}
 }
 
-// run implements the main restore command as specified in section 7.
-// It parses flags, validates configuration, and initializes the restore operation.
-func run() error {
-	// Create a new flag set for the restore command as specified in section 7
-	fs := flag.NewFlagSet("restore", flag.ExitOnError)
+// errVersionShown is returned by parseArgs when --version was asked for and answered;
+// there is nothing left to do.
+var errVersionShown = errors.New("version shown")
 
-	// Required flags as specified in section 4.1
+// parseArgs turns the command line into a validated configuration. The command takes
+// flags only: an operator who types a word before them, such as the subcommand an
+// older README showed, gets told which word rather than a complaint about a flag the
+// word stopped from being read.
+func parseArgs(args []string, out io.Writer) (*config.Config, error) {
+	fs := flag.NewFlagSet("ddb-pitr", flag.ContinueOnError)
+	fs.SetOutput(out)
+	fs.Usage = func() {
+		fmt.Fprintln(out, "Usage: ddb-pitr --table TABLE --export s3://BUCKET/PREFIX/AWSDynamoDB/EXPORT-ID/ [flags]")
+		fmt.Fprintln(out)
+		fs.PrintDefaults()
+	}
+
 	tableName := fs.String("table", "", "DynamoDB table name to restore to")
-	exportS3URI := fs.String("export", "", "S3 URI of the PITR export (s3://bucket/prefix)")
-
-	// Optional flags as specified in section 4.1
-	exportType := fs.String("type", "FULL", "Export type (FULL|INCREMENTAL)")
-	viewType := fs.String("view", "NEW", "View type (NEW|NEW_AND_OLD)")
-	region := fs.String("region", "", "AWS region (defaults to AWS_REGION env)")
+	exportS3URI := fs.String("export", "", "S3 URI of the export's manifest-summary.json, or of the directory holding it")
+	region := fs.String("region", "", "AWS region; resolved from your AWS environment when omitted")
 	resumeKey := fs.String("resume", "", "S3 URI for checkpoint file")
 	maxWorkers := fs.Int("workers", 10, "Maximum number of concurrent workers")
 	batchSize := fs.Int("batch", 25, "Batch size for DynamoDB writes (max 25)")
 	reportS3URI := fs.String("report", "", "S3 URI for the final report")
 	dryRun := fs.Bool("dry-run", false, "Read and measure the whole export without writing to the table")
-	shutdownTimeout := fs.Duration("shutdown-timeout", 5*time.Minute, "Graceful shutdown timeout")
+	shutdownTimeout := fs.Duration("shutdown-timeout", 5*time.Minute, "How long an interrupted restore has to finish in-flight writes and save its checkpoint")
 	showVersion := fs.Bool("version", false, "Print the build identity and exit")
 
-	// Parse flags as specified in section 7
-	if err := fs.Parse(os.Args[1:]); err != nil {
-		return fmt.Errorf("failed to parse flags: %w", err)
+	if err := fs.Parse(args); err != nil {
+		return nil, fmt.Errorf("failed to parse flags: %w", err)
+	}
+	if fs.NArg() > 0 {
+		fs.Usage()
+		return nil, fmt.Errorf("unexpected argument %q: ddb-pitr takes flags only (see --help)", fs.Arg(0))
 	}
 
 	// Asked before anything is validated, so the version is readable without a
 	// complete configuration.
 	if *showVersion {
-		fmt.Printf("ddb-pitr %s (commit %s, built %s)\n", version, commit, date)
-		return nil
+		fmt.Fprintf(out, "ddb-pitr %s (commit %s, built %s)\n", version, commit, date)
+		return nil, errVersionShown
 	}
 
-	// Create and validate configuration as specified in section 4.1
 	cfg := &config.Config{
 		TableName:       *tableName,
 		ExportS3URI:     *exportS3URI,
-		ExportType:      *exportType,
-		ViewType:        *viewType,
 		Region:          *region,
 		ResumeKey:       *resumeKey,
 		MaxWorkers:      *maxWorkers,
@@ -102,19 +108,36 @@ func run() error {
 		DryRun:          *dryRun,
 		ShutdownTimeout: *shutdownTimeout,
 	}
-
 	if err := cfg.Validate(); err != nil {
-		return fmt.Errorf("invalid configuration: %w", err)
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+	return cfg, nil
+}
+
+// run parses the command line and carries out the restore it describes.
+func run() error {
+	cfg, err := parseArgs(os.Args[1:], os.Stdout)
+	if errors.Is(err, errVersionShown) {
+		return nil
+	}
+	if err != nil {
+		return err
 	}
 
-	// Load AWS configuration as specified in section 3
-	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
-		awsconfig.WithRegion(cfg.Region),
-	)
+	// The region is taken from the flag when given and otherwise resolved the way the
+	// AWS CLI resolves it: environment, profile, instance metadata. Nothing resolving
+	// is reported here, naming the flag, rather than by the first request.
+	var loadOpts []func(*awsconfig.LoadOptions) error
+	if cfg.Region != "" {
+		loadOpts = append(loadOpts, awsconfig.WithRegion(cfg.Region))
+	}
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), loadOpts...)
 	if err != nil {
 		return fmt.Errorf("failed to load AWS config: %w", err)
 	}
-
+	if awsCfg.Region == "" {
+		return fmt.Errorf("no AWS region: pass --region or set one in your AWS environment")
+	}
 	// The writer owns the retry policy for DynamoDB: it paces throttling for as long
 	// as the run lives and bounds everything else. Left at the SDK's default of three
 	// attempts, every one of the writer's attempts would be up to three requests, and

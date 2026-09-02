@@ -260,7 +260,7 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 
 	// Load manifest
-	summary, err := c.manifest.Load(ctx, c.cfg.ExportS3URI)
+	summary, err := c.manifest.Load(ctx, c.cfg.ManifestURI())
 	if err != nil {
 		return fmt.Errorf("failed to load manifest: %w", err)
 	}

@@ -1437,8 +1437,6 @@ func newTestCoordinator(t *testing.T, deps testDeps) (*Coordinator, *metrics.Met
 	cfg := &config.Config{
 		TableName:       "test-table",
 		ExportS3URI:     "s3://test-bucket/test-prefix",
-		ExportType:      "FULL",
-		ViewType:        "NEW",
 		Region:          "us-west-2",
 		MaxWorkers:      1,
 		BatchSize:       25,

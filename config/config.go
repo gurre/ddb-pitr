@@ -1,6 +1,6 @@
-// Package config implements the configuration management as specified in section 4.1
-// of the design specification. It handles parsing and validation of all restore operation
-// parameters.
+// Package config holds what a restore was asked to do and checks it before any AWS
+// call is made, so a mistake in the invocation fails at the start rather than deep in
+// the run.
 package config
 
 import (
@@ -10,33 +10,49 @@ import (
 	"time"
 )
 
-// Config holds all configuration for the restore operation as defined in section 4.1
-// of the design specification. All fields correspond to the required configuration
-// parameters for the restore operation.
+// manifestSummaryName is the file every export writes its summary to.
+const manifestSummaryName = "manifest-summary.json"
+
+// Config holds all configuration for the restore operation.
+// Fields are ordered largest-to-smallest for memory alignment.
 type Config struct {
 	TableName       string        // Target DynamoDB table name
-	ExportS3URI     string        // S3 URI for the PITR export (s3://bucket/prefix)
-	ExportType      string        // "FULL"|"INCREMENTAL" - matches DynamoDB export types
-	ViewType        string        // "NEW"|"NEW_AND_OLD" - matches DynamoDB view types
-	Region          string        // AWS region for the operation
+	ExportS3URI     string        // S3 URI of the export's manifest-summary.json, or of the directory holding it
+	Region          string        // AWS region; empty means whatever the AWS environment resolves
 	ResumeKey       string        // S3 URI for checkpoint file (s3://bucket/key)
 	ReportS3URI     string        // S3 URI for the final report
-	ShutdownTimeout time.Duration // Graceful shutdown timeout
+	ShutdownTimeout time.Duration // How long an interrupted restore has to finish in-flight writes and save its checkpoint
 	MaxWorkers      int           // Maximum number of concurrent workers
 	BatchSize       int           // Batch size for DynamoDB writes (≤25)
 	DryRun          bool          // If true, don't actually write to DynamoDB
-
-	// Internal fields
-	exportBucketName string // Bucket name parsed from ExportS3URI
 }
 
-// GetExportBucketName returns the bucket name parsed from ExportS3URI
+// GetExportBucketName returns the bucket the export URI names, or the empty string
+// for a URI Validate rejects.
 func (c *Config) GetExportBucketName() string {
-	return c.exportBucketName
+	u, err := url.Parse(c.ExportS3URI)
+	if err != nil || u.Scheme != "s3" {
+		return ""
+	}
+	return u.Host
 }
 
-// Validate implements the validation requirements from section 4.1 of the spec.
-// It ensures all required fields are present and have valid values.
+// ManifestURI returns the S3 URI of the export's summary manifest. The export may be
+// given as the manifest itself or as the directory holding it, which is what an
+// operator copies from the console; either way this is what the restore reads first.
+// Example:
+//
+//	cfg := &config.Config{ExportS3URI: "s3://my-bucket/AWSDynamoDB/01234567890-abcdef"}
+//	cfg.ManifestURI() // "s3://my-bucket/AWSDynamoDB/01234567890-abcdef/manifest-summary.json"
+func (c *Config) ManifestURI() string {
+	if strings.HasSuffix(c.ExportS3URI, ".json") {
+		return c.ExportS3URI
+	}
+	return strings.TrimSuffix(c.ExportS3URI, "/") + "/" + manifestSummaryName
+}
+
+// Validate checks the configuration is one a restore can run with. Every rule here
+// fails an invocation that would otherwise fail later and less clearly.
 func (c *Config) Validate() error {
 	if c.TableName == "" {
 		return fmt.Errorf("table name is required")
@@ -49,7 +65,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("export S3 URI must start with s3://")
 	}
 
-	// Parse the ExportS3URI to extract the bucket name
 	u, err := url.Parse(c.ExportS3URI)
 	if err != nil {
 		return fmt.Errorf("invalid export S3 URI: %w", err)
@@ -62,19 +77,6 @@ func (c *Config) Validate() error {
 	if u.Host == "" {
 		return fmt.Errorf("export S3 URI must name a bucket")
 	}
-	c.exportBucketName = u.Host
-
-	if c.ExportType != "FULL" && c.ExportType != "INCREMENTAL" {
-		return fmt.Errorf("export type must be FULL or INCREMENTAL")
-	}
-
-	if c.ViewType != "NEW" && c.ViewType != "NEW_AND_OLD" {
-		return fmt.Errorf("view type must be NEW or NEW_AND_OLD")
-	}
-
-	if c.Region == "" {
-		return fmt.Errorf("region is required")
-	}
 
 	if c.MaxWorkers < 1 {
 		return fmt.Errorf("max workers must be at least 1")
@@ -82,6 +84,10 @@ func (c *Config) Validate() error {
 
 	if c.BatchSize < 1 || c.BatchSize > 25 {
 		return fmt.Errorf("batch size must be between 1 and 25")
+	}
+
+	if c.ResumeKey != "" && !strings.HasPrefix(c.ResumeKey, "s3://") {
+		return fmt.Errorf("resume S3 URI must start with s3://")
 	}
 
 	if c.ReportS3URI != "" && !strings.HasPrefix(c.ReportS3URI, "s3://") {

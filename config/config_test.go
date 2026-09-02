@@ -10,8 +10,6 @@ func validConfig() *Config {
 	return &Config{
 		TableName:       "test-table",
 		ExportS3URI:     "s3://test-bucket/prefix",
-		ExportType:      "FULL",
-		ViewType:        "NEW",
 		Region:          "us-west-2",
 		MaxWorkers:      10,
 		BatchSize:       25,
@@ -23,6 +21,48 @@ func TestValidConfig(t *testing.T) {
 	cfg := validConfig()
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("expected valid config to pass validation, got: %v", err)
+	}
+}
+
+// TestRegionIsOptional verifies a configuration without a region is accepted. The AWS
+// SDK resolves the region from the environment and profile the same way the AWS CLI
+// does, and an operator with that set up should not have to repeat it.
+func TestRegionIsOptional(t *testing.T) {
+	cfg := validConfig()
+	cfg.Region = ""
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("expected a configuration without a region to be accepted, got %v", err)
+	}
+}
+
+// TestManifestURIAcceptsTheManifestOrItsDirectory verifies the export may be named by
+// its summary manifest or by the directory holding it, with or without a trailing
+// slash, since the directory is what an operator copies out of the S3 console.
+func TestManifestURIAcceptsTheManifestOrItsDirectory(t *testing.T) {
+	const want = "s3://my-bucket/AWSDynamoDB/01234567890-abcdef/manifest-summary.json"
+	for _, uri := range []string{
+		want,
+		"s3://my-bucket/AWSDynamoDB/01234567890-abcdef/",
+		"s3://my-bucket/AWSDynamoDB/01234567890-abcdef",
+	} {
+		cfg := &Config{ExportS3URI: uri}
+		if got := cfg.ManifestURI(); got != want {
+			t.Errorf("ManifestURI(%q) = %q, want %q", uri, got, want)
+		}
+	}
+}
+
+// TestGetExportBucketNameNeedsNoValidation verifies the bucket is read straight from
+// the export URI, so it is the same whether or not Validate has run, and empty for a
+// URI Validate would reject.
+func TestGetExportBucketNameNeedsNoValidation(t *testing.T) {
+	cfg := &Config{ExportS3URI: "s3://my-bucket/some/prefix"}
+	if got := cfg.GetExportBucketName(); got != "my-bucket" {
+		t.Errorf("expected bucket name 'my-bucket', got %q", got)
+	}
+	cfg.ExportS3URI = "https://my-bucket/some/prefix"
+	if got := cfg.GetExportBucketName(); got != "" {
+		t.Errorf("expected no bucket for a non-S3 URI, got %q", got)
 	}
 }
 
@@ -82,11 +122,9 @@ func TestValidateReportsTheFirstProblem(t *testing.T) {
 	}{
 		{"table name", func(c *Config) { c.TableName = "" }, "table name"},
 		{"export URI", func(c *Config) { c.ExportS3URI = "" }, "export S3 URI"},
-		{"export type", func(c *Config) { c.ExportType = "PARTIAL" }, "export type"},
-		{"view type", func(c *Config) { c.ViewType = "OLD" }, "view type"},
-		{"region", func(c *Config) { c.Region = "" }, "region"},
 		{"max workers", func(c *Config) { c.MaxWorkers = 0 }, "max workers"},
 		{"batch size", func(c *Config) { c.BatchSize = 26 }, "batch size"},
+		{"resume URI", func(c *Config) { c.ResumeKey = "/tmp/checkpoint.json" }, "resume S3 URI"},
 		{"report URI", func(c *Config) { c.ReportS3URI = "http://bucket/report" }, "report S3 URI"},
 		{"shutdown timeout", func(c *Config) { c.ShutdownTimeout = 0 }, "shutdown timeout"},
 	}
@@ -134,73 +172,6 @@ func TestExportURIIsCheckedInOrder(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, tt.mention)
 			}
 		})
-	}
-}
-
-// TestGetExportBucketNameIsEmptyBeforeValidation verifies the parsed bucket only exists
-// once validation has run. Reading it earlier would silently address every request to an
-// empty bucket, so it must not look populated.
-func TestGetExportBucketNameIsEmptyBeforeValidation(t *testing.T) {
-	if got := validConfig().GetExportBucketName(); got != "" {
-		t.Errorf("expected no bucket before validation, got %q", got)
-	}
-}
-
-func TestInvalidExportType(t *testing.T) {
-	testCases := []string{"full", "PARTIAL", "incremental", ""}
-	for _, exportType := range testCases {
-		t.Run(exportType, func(t *testing.T) {
-			cfg := validConfig()
-			cfg.ExportType = exportType
-			if err := cfg.Validate(); err == nil {
-				t.Errorf("expected error for invalid export type: %s", exportType)
-			}
-		})
-	}
-}
-
-func TestValidExportTypes(t *testing.T) {
-	for _, exportType := range []string{"FULL", "INCREMENTAL"} {
-		t.Run(exportType, func(t *testing.T) {
-			cfg := validConfig()
-			cfg.ExportType = exportType
-			if err := cfg.Validate(); err != nil {
-				t.Errorf("expected valid export type %s to pass, got: %v", exportType, err)
-			}
-		})
-	}
-}
-
-func TestInvalidViewType(t *testing.T) {
-	testCases := []string{"new", "OLD", "new_and_old", ""}
-	for _, viewType := range testCases {
-		t.Run(viewType, func(t *testing.T) {
-			cfg := validConfig()
-			cfg.ViewType = viewType
-			if err := cfg.Validate(); err == nil {
-				t.Errorf("expected error for invalid view type: %s", viewType)
-			}
-		})
-	}
-}
-
-func TestValidViewTypes(t *testing.T) {
-	for _, viewType := range []string{"NEW", "NEW_AND_OLD"} {
-		t.Run(viewType, func(t *testing.T) {
-			cfg := validConfig()
-			cfg.ViewType = viewType
-			if err := cfg.Validate(); err != nil {
-				t.Errorf("expected valid view type %s to pass, got: %v", viewType, err)
-			}
-		})
-	}
-}
-
-func TestMissingRegion(t *testing.T) {
-	cfg := validConfig()
-	cfg.Region = ""
-	if err := cfg.Validate(); err == nil {
-		t.Error("expected error for missing region")
 	}
 }
 
@@ -309,16 +280,5 @@ func TestInvalidShutdownTimeout(t *testing.T) {
 				t.Errorf("expected error for invalid shutdown timeout: %v", timeout)
 			}
 		})
-	}
-}
-
-func TestGetExportBucketName(t *testing.T) {
-	cfg := validConfig()
-	cfg.ExportS3URI = "s3://my-bucket/some/prefix"
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("validation failed: %v", err)
-	}
-	if got := cfg.GetExportBucketName(); got != "my-bucket" {
-		t.Errorf("expected bucket name 'my-bucket', got '%s'", got)
 	}
 }

@@ -289,7 +289,6 @@ echo "Restoring from: ${FULL_MANIFEST_URI}"
 "${BIN_DIR}/ddb-pitr" \
     -table "${TARGET_TABLE}" \
     -export "${FULL_MANIFEST_URI}" \
-    -type FULL \
     -region "${REGION}"
 
 # Phase 8: Apply INCREMENTAL export
@@ -304,8 +303,6 @@ echo "Applying incremental from: ${INC_MANIFEST_URI}"
 "${BIN_DIR}/ddb-pitr" \
     -table "${TARGET_TABLE}" \
     -export "${INC_MANIFEST_URI}" \
-    -type INCREMENTAL \
-    -view NEW_AND_OLD \
     -region "${REGION}"
 
 # Phase 9: Verify data completeness

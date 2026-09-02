@@ -33,8 +33,6 @@ func TestFullIntegrationFlow(t *testing.T) {
 	cfg := &config.Config{
 		TableName:       "test-table",
 		ExportS3URI:     "s3://test-bucket/AWSDynamoDB/01768385930622-efd1a093/manifest-summary.json",
-		ExportType:      "FULL",
-		ViewType:        "NEW",
 		Region:          "us-west-2",
 		MaxWorkers:      1,
 		BatchSize:       25,
@@ -119,8 +117,6 @@ func TestEndToEndWithCoordinator(t *testing.T) {
 	cfg := &config.Config{
 		TableName:       "test-table",
 		ExportS3URI:     "s3://test-bucket/AWSDynamoDB/01768385930622-efd1a093/manifest-summary.json",
-		ExportType:      "FULL",
-		ViewType:        "NEW",
 		Region:          "us-west-2",
 		MaxWorkers:      1,
 		BatchSize:       25,
@@ -546,8 +542,6 @@ func restoreConfig(t *testing.T, exportURI string) *config.Config {
 	cfg := &config.Config{
 		TableName:       "test-table",
 		ExportS3URI:     exportURI,
-		ExportType:      "FULL",
-		ViewType:        "NEW",
 		Region:          "us-west-2",
 		MaxWorkers:      1,
 		BatchSize:       1,
