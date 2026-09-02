@@ -110,6 +110,31 @@ func TestCoordinatorSkipsCompletedFile(t *testing.T) {
 	}
 }
 
+// TestCoordinatorVerifiesOnlyTheFilesLeftToDo verifies a resumed run does not check
+// the files a previous run finished. They were checked before they were read, and
+// checking a copied file means reading it in full, so re-checking every completed
+// file would make each resume of a large copied export cost as much as the restore.
+func TestCoordinatorVerifiesOnlyTheFilesLeftToDo(t *testing.T) {
+	loader := &mockLoader{summary: manifest.Summary{
+		ExportARN: testExportARN,
+		S3Bucket:  "test-bucket",
+		DataFiles: []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}, {Key: testFileKey2, ItemCount: 1}},
+	}}
+	coord, _ := newTestCoordinator(t, testDeps{
+		loader: loader,
+		lines:  [][]byte{[]byte(`{"id":"1"}`)},
+		store:  &mockStore{state: checkpoint.State{Completed: []string{testFileKey}}},
+	})
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+
+	if got := loader.verifiedKeys(); len(got) != 1 || got[0] != testFileKey2 {
+		t.Errorf("expected only the unfinished file verified, got %v", got)
+	}
+}
+
 // TestCoordinatorCheckpointsAtInterval verifies progress is written every
 // checkpointInterval batches at the offset of the last line written, then again for the
 // trailing partial batch, and finally as a completion. Checkpointing too rarely loses
@@ -1517,6 +1542,11 @@ type mockLoader struct {
 	err       error
 	verifyErr error
 	summary   manifest.Summary
+	verified  []string // Keys handed to VerifyChecksums
+}
+
+func (m *mockLoader) verifiedKeys() []string {
+	return append([]string(nil), m.verified...)
 }
 
 func (m *mockLoader) Load(ctx context.Context, manifestS3URI string) (manifest.Summary, error) {
@@ -1535,6 +1565,9 @@ func (m *mockLoader) VerifyChecksums(ctx context.Context, bucket string, summary
 	}
 	if err := requireCallerContext(ctx); err != nil {
 		return manifest.Verification{}, err
+	}
+	for _, file := range summary.DataFiles {
+		m.verified = append(m.verified, file.Key)
 	}
 	return manifest.Verification{Verified: len(summary.DataFiles)}, nil
 }
@@ -1713,7 +1746,7 @@ func (m *mockWriter) WriteBatch(ctx context.Context, ops []itemimage.Operation) 
 	}
 	if m.failOn != "" {
 		for _, op := range ops {
-			if op.NewImage["line"].(*types.AttributeValueMemberS).Value == m.failOn {
+			if line, ok := op.NewImage["line"].(*types.AttributeValueMemberS); ok && line.Value == m.failOn {
 				m.failed.Do(func() {
 					if m.afterFailure != nil {
 						m.afterFailure()

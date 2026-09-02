@@ -2,6 +2,7 @@ package manifest
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -29,13 +30,14 @@ const testBucket = "test-bucket"
 // arrived without the marker a test put on its context, which is how a call made under a
 // substituted context is told from one made under the caller's.
 type mockS3Client struct {
-	data     map[string][]byte
-	etags    map[string]string // Custom ETags for specific keys
-	buckets  []string          // Buckets the loader asked for, in order
-	detached int
-	inFlight int32 // Calls currently in progress
-	peak     int32 // Most calls ever in progress at once
-	mu       sync.Mutex
+	data      map[string][]byte
+	etags     map[string]string // Custom ETags for specific keys
+	buckets   []string          // Buckets the loader asked for, in order
+	detached  int
+	inFlight  int32 // Calls currently in progress
+	peak      int32 // Most calls ever in progress at once
+	encrypted bool  // Objects report KMS encryption, so their ETags are not MD5s
+	mu        sync.Mutex
 }
 
 // enter notes a call starting and reports the marker for leave; together they measure
@@ -116,9 +118,11 @@ func (m *mockS3Client) HeadObject(ctx context.Context, params *s3.HeadObjectInpu
 			if etag == "" {
 				return &s3.HeadObjectOutput{}, nil
 			}
-			return &s3.HeadObjectOutput{
-				ETag: aws.String(etag),
-			}, nil
+			out := &s3.HeadObjectOutput{ETag: aws.String(etag)}
+			if m.encrypted {
+				out.ServerSideEncryption = types.ServerSideEncryptionAwsKms
+			}
+			return out, nil
 		}
 	}
 
@@ -445,6 +449,48 @@ func TestVerifyChecksumsReadsACopiedMultipartObject(t *testing.T) {
 				t.Errorf("expected 1 file counted as verified, got %d", result.Verified)
 			}
 		})
+	}
+}
+
+// TestVerifyChecksumsReadsAnEncryptedObject verifies a data file whose bucket encrypts
+// with a KMS key is verified by reading it. Such an object's ETag is opaque rather than
+// its MD5, so comparing the two would fail a legitimately copied export in exactly the
+// cross-account case copying serves.
+func TestVerifyChecksumsReadsAnEncryptedObject(t *testing.T) {
+	summary := Summary{DataFiles: []FileMeta{
+		{Key: "data-001.json.gz", ETag: "7deb4078f238dd87d6af0538152c04e9-1", MD5Base64: testMD5Base64},
+	}}
+	client := &mockS3Client{
+		etags:     map[string]string{"data-001.json.gz": "0f343b0931126a20f133d67c2b018a3b"},
+		data:      map[string][]byte{"data-001.json.gz": []byte("hello world")},
+		encrypted: true,
+	}
+
+	result, err := NewS3Loader(client).VerifyChecksums(context.Background(), testBucket, summary)
+	if err != nil {
+		t.Fatalf("expected the encrypted object verified by its content, got %v", err)
+	}
+	if result.Verified != 1 {
+		t.Errorf("expected 1 file counted as verified, got %d", result.Verified)
+	}
+}
+
+// TestVerifyChecksumsReportsCancellation verifies a verification stopped by the caller
+// does not come back as a smaller export that passed. A partial count taken for a
+// verified export would let the restore start on files nothing had checked.
+func TestVerifyChecksumsReportsCancellation(t *testing.T) {
+	summary := Summary{}
+	client := &mockS3Client{etags: map[string]string{}}
+	for i := 0; i < 8; i++ {
+		key := fmt.Sprintf("data-%03d.json.gz", i)
+		summary.DataFiles = append(summary.DataFiles, FileMeta{Key: key, ETag: "abc-1"})
+		client.etags[key] = "abc-1"
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := NewS3Loader(client).VerifyChecksums(ctx, testBucket, summary); !errors.Is(err, context.Canceled) {
+		t.Errorf("expected the cancellation reported, got %v", err)
 	}
 }
 

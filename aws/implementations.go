@@ -1,6 +1,5 @@
-// Package aws implements the AWS service abstractions as specified in section 3
-// of the design specification. This file contains the concrete implementations
-// of the service interfaces.
+// Package aws names the parts of the AWS SDK the restore depends on. This file holds
+// the report uploader and the pass-through clients.
 package aws
 
 import (
@@ -58,7 +57,7 @@ func (c *S3ClientImpl) HeadObject(ctx context.Context, params *s3.HeadObjectInpu
 	return c.client.HeadObject(ctx, params, optFns...)
 }
 
-// IAMClientImpl implements IAMClient using the AWS SDK as specified in section 4.2.
+// IAMClientImpl implements IAMClient using the AWS SDK.
 // It provides concrete implementations for simulating permissions.
 type IAMClientImpl struct {
 	client *iam.Client

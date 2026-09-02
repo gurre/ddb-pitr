@@ -22,16 +22,13 @@ jobs:
       - name: Test
         run: go test -race ./...
 
-      # config verify is stricter than run: it rejects configuration keys that run
-      # would quietly ignore, which is how a lint setting once went unenforced.
-      - name: Lint configuration
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.5.0
-          args: config verify --config ./.golangci.yml
-
+      # The action verifies the configuration against the schema before it lints
+      # (its verify input defaults to on). That is stricter than run alone, which
+      # quietly ignores keys it does not know; a lint setting once went unenforced
+      # that way.
       - name: Lint
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.5.0
+          verify: true
           args: --config ./.golangci.yml ./...

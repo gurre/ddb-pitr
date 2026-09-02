@@ -97,8 +97,9 @@ exactly as applying it once does.
 
 A checkpoint belongs to one export and to one running restore. Pointing a different
 export at it is refused rather than resumed, since file names repeat across exports.
-Starting a second restore against a checkpoint one is already using is refused as well;
-do not delete the checkpoint in response, since both restores would then start over.
+A second restore started against a checkpoint one is already using is stopped as soon
+as it tries to record progress; do not delete the checkpoint in response, since both
+restores would then start over.
 
 Without `--resume` progress is kept in memory only, and an interrupted restore starts
 over. A `--dry-run` never writes a checkpoint.
@@ -112,7 +113,9 @@ that has been replaced since the export was taken. A file that does not match fa
 restore while the target table is still untouched.
 
 An export copied to another bucket or account is verified by content, so copying does
-not stand in the way of restoring.
+not stand in the way of restoring. Reading a large copied file to verify it costs as
+much as reading it to restore it. A resumed restore verifies only the files it has
+left to do.
 
 Two things verification does not do. It does not check the target table afterwards;
 compare item counts yourself if you need that. And it says nothing about ordering: the
@@ -180,11 +183,12 @@ golangci-lint run --config ./.golangci.yml ./...
 golangci-lint config verify
 ```
 
-CI runs `config verify` before `run` on every push and pull request. It is stricter than
-`run`: it rejects configuration keys `run` quietly ignores.
+CI verifies the configuration against its schema before linting, on every push and pull
+request. That is stricter than `run` alone, which quietly ignores configuration keys it
+does not know.
 
 `gocyclo` is set to its default threshold of 30. The stricter 15 the config used to name
-was never in effect, and a few functions sit above it: `Coordinator.Run`,
+was never in effect, and four functions sit above it: `Coordinator.Run`,
 `Coordinator.worker`, `DynamoDBWriter.writeRequests` and `generateRandomItem`.
 Tightening it means splitting those first.
 

@@ -54,9 +54,9 @@ func main() {
 	}
 }
 
-// errVersionShown is returned by parseArgs when --version was asked for and answered;
-// there is nothing left to do.
-var errVersionShown = errors.New("version shown")
+// errNothingToDo is returned by parseArgs when the command line asked only for the
+// version or for help, and that has been answered.
+var errNothingToDo = errors.New("nothing to do")
 
 // parseArgs turns the command line into a validated configuration. The command takes
 // flags only: an operator who types a word before them, such as the subcommand an
@@ -85,6 +85,9 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 	showVersion := fs.Bool("version", false, "Print the build identity and exit")
 
 	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, errNothingToDo
+		}
 		return nil, fmt.Errorf("failed to parse flags: %w", err)
 	}
 	if fs.NArg() > 0 {
@@ -96,7 +99,7 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 	// complete configuration.
 	if *showVersion {
 		_, _ = fmt.Fprintf(out, "ddb-pitr %s (commit %s, built %s)\n", version, commit, date)
-		return nil, errVersionShown
+		return nil, errNothingToDo
 	}
 
 	cfg := &config.Config{
@@ -119,7 +122,7 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 // run parses the command line and carries out the restore it describes.
 func run() error {
 	cfg, err := parseArgs(os.Args[1:], os.Stdout)
-	if errors.Is(err, errVersionShown) {
+	if errors.Is(err, errNothingToDo) {
 		return nil
 	}
 	if err != nil {
@@ -191,6 +194,9 @@ func run() error {
 	// memory whatever was asked for: a later restore must not resume past work that
 	// was only ever measured.
 	var checkpointStore checkpoint.Store
+	if cfg.ResumeKey != "" && cfg.DryRun {
+		fmt.Fprintln(os.Stderr, "dry run: --resume is not used, since a dry run records no progress")
+	}
 	if cfg.ResumeKey != "" && !cfg.DryRun {
 		// Use S3Store if a resume key is provided
 		s3Store, err := checkpoint.NewS3Store(s3Client, cfg.ResumeKey)

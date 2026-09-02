@@ -1,6 +1,5 @@
-// Package coordinator implements the worker pool pattern as specified in section 5
-// of the design specification. It orchestrates the restore operation using a pool
-// of workers to process files in parallel.
+// Package coordinator drives a restore: it loads and verifies the export, hands its
+// data files to a pool of workers, checkpoints their progress and reports the outcome.
 package coordinator
 
 import (
@@ -41,8 +40,7 @@ const streamFromStart int64 = 0
 // Zero cannot mean that, since the first line of every file sits at offset zero.
 const noOffset int64 = -1
 
-// WorkerStatus represents the status of a worker as required by section 5.
-// It tracks progress and errors for monitoring and reporting.
+// WorkerStatus is what one worker has done and where it is, for the progress line.
 // Fields are ordered largest-to-smallest for optimal memory alignment.
 type WorkerStatus struct {
 	LastErrorTime time.Time // When the last error occurred (24 bytes)
@@ -100,9 +98,8 @@ func WithStreamBackoff(b Backoffer) Option {
 	}
 }
 
-// Coordinator implements the worker pool pattern from section 5.
-// It manages the restore process, including worker coordination,
-// checkpoint management, and progress reporting.
+// Coordinator runs the restore: worker coordination, checkpointing and progress
+// reporting.
 type Coordinator struct {
 	cfg            *config.Config
 	manifest       manifest.Loader
@@ -120,7 +117,7 @@ type Coordinator struct {
 	progress *progress
 	saveMu   sync.Mutex
 
-	// Worker management as specified in section 5
+	// Per-worker status, for the progress line
 	workerStatus map[int]*WorkerStatus
 	statusMu     sync.RWMutex
 
@@ -246,10 +243,18 @@ func NewCoordinator(
 	return c
 }
 
-// Run implements the main restore process as specified in section 5.
-// It sets up signal handling, loads manifests and checkpoints,
-// starts the worker pool, and coordinates the restore operation.
+// Run restores the export: it loads the manifest and the checkpoint, verifies the data
+// files still to do, and drives the worker pool over them. The caller's context is
+// what stops a run early; the caller owns any signal handling. However the run ends,
+// the checkpoint is saved once the workers have stopped, within the configured
+// shutdown timeout, so a resume picks up where this run got to.
 func (c *Coordinator) Run(ctx context.Context) error {
+	// The configuration is validated by the caller; a zero shutdown timeout is the
+	// sign it was not, and would make the final save fail on every run.
+	if c.cfg.ShutdownTimeout <= 0 {
+		return fmt.Errorf("configuration was not validated: shutdown timeout is %s", c.cfg.ShutdownTimeout)
+	}
+
 	// Parse S3 URI to validate it
 	u, err := url.Parse(c.cfg.ExportS3URI)
 	if err != nil {
@@ -265,31 +270,11 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		return fmt.Errorf("failed to load manifest: %w", err)
 	}
 
-	// Verify the export against what its manifest recorded before writing anything.
-	// A file that no longer matches means the restore would write data the export
-	// never contained, which is worth failing on while the table is still untouched.
-	// The bucket checked is the one the workers read from, not the one the manifest
-	// names: they differ for an export that was copied since it was taken.
-	fmt.Printf("Verifying %d data files against the manifest\n", len(summary.DataFiles))
-	verification, err := c.manifest.VerifyChecksums(ctx, c.cfg.GetExportBucketName(), summary)
-	if err != nil {
-		return fmt.Errorf("export failed verification: %w", err)
-	}
-	fmt.Printf("Verified %d of %d data files against the manifest\n",
-		verification.Verified, len(summary.DataFiles))
-	if len(verification.Unverified) > 0 {
-		fmt.Printf("%d data files carry no checksum that can be compared\n", len(verification.Unverified))
-	}
-
-	// Store total expected items for progress percentage calculation
-	c.totalExpectedItems = summary.ItemCount
-	c.lastReportTime = time.Now()
-
 	// A checkpoint is tied to its export by the export's identity. A manifest without
 	// one cannot be checked against any checkpoint, so it is refused before a run could
 	// record progress that a later run of some other export would resume from.
 	if summary.ExportARN == "" {
-		return fmt.Errorf("manifest at %s names no export ARN", c.cfg.ExportS3URI)
+		return fmt.Errorf("manifest at %s names no export ARN", c.cfg.ManifestURI())
 	}
 
 	// Load checkpoint
@@ -304,6 +289,35 @@ func (c *Coordinator) Run(ctx context.Context) error {
 			state.ExportID, summary.ExportARN)
 	}
 	c.progress = newProgress(summary.ExportARN, state)
+
+	// Verify the files still to do against what the manifest recorded, before writing
+	// anything. A file that no longer matches means the restore would write data the
+	// export never contained, which is worth failing on while the table is untouched.
+	// Files a previous run finished are not checked again: they were checked before
+	// they were read, and checking a copied file means reading it in full. The bucket
+	// checked is the one the workers read from, not the one the manifest names; they
+	// differ for an export that was copied since it was taken.
+	remaining := summary
+	remaining.DataFiles = make([]manifest.FileMeta, 0, len(summary.DataFiles))
+	for _, file := range summary.DataFiles {
+		if _, done := c.progress.resume(file.Key); !done {
+			remaining.DataFiles = append(remaining.DataFiles, file)
+		}
+	}
+	fmt.Printf("Verifying %d data files against the manifest\n", len(remaining.DataFiles))
+	verification, err := c.manifest.VerifyChecksums(ctx, c.cfg.GetExportBucketName(), remaining)
+	if err != nil {
+		return fmt.Errorf("export failed verification: %w", err)
+	}
+	fmt.Printf("Verified %d of %d data files against the manifest\n",
+		verification.Verified, len(remaining.DataFiles))
+	if len(verification.Unverified) > 0 {
+		fmt.Printf("%d data files carry no checksum that can be compared\n", len(verification.Unverified))
+	}
+
+	// Store total expected items for progress percentage calculation
+	c.totalExpectedItems = summary.ItemCount
+	c.lastReportTime = time.Now()
 
 	// The pool runs under its own cancellation so one worker's failure stops the rest.
 	// A file that cannot be restored ends the run at once, while the checkpoint makes
@@ -431,7 +445,7 @@ func (c *Coordinator) skipCorrupt(key string, offset int64, err error) {
 // so the operator knows the checkpoint is behind what was written.
 func shutdownError(cause, saveErr error) error {
 	if saveErr != nil {
-		return fmt.Errorf("%w (and the final checkpoint could not be saved: %v)", cause, saveErr)
+		return fmt.Errorf("%w (and the final checkpoint could not be saved: %w)", cause, saveErr)
 	}
 	return cause
 }
@@ -446,7 +460,7 @@ func (c *Coordinator) initWorker(id int) {
 	}
 }
 
-// updateWorkerStatus updates a worker's status for monitoring as specified in section 5
+// updateWorkerStatus applies fn to a worker's status and stamps it as active
 func (c *Coordinator) updateWorkerStatus(id int, fn func(*WorkerStatus)) {
 	c.statusMu.Lock()
 	defer c.statusMu.Unlock()
@@ -467,7 +481,7 @@ const bytesPerMB = 1024 * 1024
 // Fields are ordered largest-to-smallest for memory alignment.
 type progressSnapshot struct {
 	ItemsPerSec   float64 // Items written per second since the previous snapshot
-	MBPerSec      float64 // Megabytes written per second since the previous snapshot
+	MBPerSec      float64 // Megabytes of export read per second since the previous snapshot
 	Percent       float64 // Share of the manifest's item count written so far, capped at 100
 	TotalBatches  int64   // Batches written since the restore started
 	Throttles     int64
@@ -579,9 +593,8 @@ func (c *Coordinator) saveProgress(ctx context.Context) error {
 	return c.store.Save(ctx, c.progress.snapshot())
 }
 
-// worker implements the worker pool pattern from section 5.
-// It processes files from the task channel, handling batching,
-// checkpointing, and error reporting.
+// worker takes files from the task channel and restores each: streaming, decoding,
+// batching, writing and checkpointing, with the stream retried on failure.
 //
 // HOT PATH: Core processing loop that orchestrates the data pipeline.
 // Each worker runs: Stream S3 -> Decode JSON -> Batch -> Write DynamoDB

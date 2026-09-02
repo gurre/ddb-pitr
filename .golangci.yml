@@ -20,7 +20,7 @@ linters:
         - shadow
     gocyclo:
       # golangci-lint's own default. The stricter 15 this file used to ask for was
-      # never actually applied, and six functions sit above it today; see the note in
+      # never actually applied, and four functions sit above it today; see the note in
       # README's Linting section before tightening it.
       min-complexity: 30
     goconst:

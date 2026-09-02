@@ -1,6 +1,5 @@
-// Package aws implements the AWS service abstractions as specified in section 3
-// of the design specification. It provides interfaces and implementations for
-// all required AWS services.
+// Package aws names the parts of the AWS SDK the restore depends on, as interfaces the
+// SDK clients satisfy and tests can stand in for.
 package aws
 
 import (
@@ -25,7 +24,7 @@ type S3Client interface {
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
 }
 
-// IAMClient defines the interface for IAM operations as required by section 4.2.
+// IAMClient defines the interface for IAM permission simulation. Nothing uses it yet.
 // It provides methods for simulating permissions.
 type IAMClient interface {
 	SimulatePrincipalPolicy(ctx context.Context, params *iam.SimulatePrincipalPolicyInput, optFns ...func(*iam.Options)) (*iam.SimulatePrincipalPolicyOutput, error)

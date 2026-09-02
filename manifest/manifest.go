@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	json "github.com/goccy/go-json"
 	"github.com/gurre/ddb-pitr/aws"
 )
@@ -21,7 +22,8 @@ import (
 // s3URIPattern is compiled once at package level to avoid recompilation per call.
 var s3URIPattern = regexp.MustCompile(`^s3://([^/]+)/(.+)$`)
 
-// Summary contains the export metadata as defined in section 4.3 of the spec.
+// Summary is what the export's manifests say about it: the summary manifest's fields
+// and the data files the files manifest lists.
 // Example:
 //
 //	loader := manifest.NewS3Loader(client)
@@ -56,7 +58,7 @@ type Summary struct {
 	DataFiles []FileMeta // List of data files in the export
 }
 
-// FileMeta contains metadata for a single data file as defined in section 4.3.
+// FileMeta is one data file as the files manifest describes it.
 // Example:
 //
 //	for _, file := range summary.DataFiles {
@@ -111,7 +113,7 @@ func NewS3Loader(client aws.S3Client) *S3Loader {
 	return &S3Loader{client: client}
 }
 
-// Load implements the manifest loading requirements from section 4.3.
+// Load reads the summary manifest at the given URI and the files manifest it points to.
 // Example:
 //
 //	loader := manifest.NewS3Loader(client)
@@ -219,6 +221,7 @@ func (l *S3Loader) VerifyChecksums(ctx context.Context, bucket string, summary S
 		return Verification{}, fmt.Errorf("no bucket to verify the export against")
 	}
 
+	parent := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -262,6 +265,11 @@ func (l *S3Loader) VerifyChecksums(ctx context.Context, bucket string, summary S
 	if firstErr != nil {
 		return Verification{}, firstErr
 	}
+	// Stopped by the caller before every file was examined: a partial count must not
+	// be taken for a verified export.
+	if err := parent.Err(); err != nil {
+		return Verification{}, err
+	}
 	sort.Strings(result.Unverified)
 	return result, nil
 }
@@ -302,10 +310,11 @@ func (l *S3Loader) verifyFile(ctx context.Context, bucket string, file FileMeta)
 	}
 	expectedMD5Hex := fmt.Sprintf("%x", md5Bytes)
 
-	// A single-part ETag is the object's MD5; a multipart one is a digest of the parts'
-	// digests, so only reading the object can tell whether its content matches.
+	// A single-part ETag is the object's MD5, except for an object encrypted with a KMS
+	// or customer key, whose ETag is opaque. A multipart ETag is a digest of the parts'
+	// digests. In both cases only reading the object can tell whether it matches.
 	actualMD5Hex := etag
-	if isMultipartETag(etag) {
+	if isMultipartETag(etag) || isOpaqueETag(resp) {
 		actualMD5Hex, err = l.contentMD5(ctx, bucket, key)
 		if err != nil {
 			return false, fmt.Errorf("failed to read data file %s to verify it: %w", file.Key, err)
@@ -337,6 +346,16 @@ func (l *S3Loader) contentMD5(ctx context.Context, bucket, key string) (string, 
 		return "", err
 	}
 	return fmt.Sprintf("%x", digest.Sum(nil)), nil
+}
+
+// isOpaqueETag reports whether the object is encrypted in a way that stops its ETag
+// being its MD5: server-side encryption with a KMS key, or with a customer-provided key.
+func isOpaqueETag(resp *s3.HeadObjectOutput) bool {
+	switch resp.ServerSideEncryption {
+	case s3types.ServerSideEncryptionAwsKms, s3types.ServerSideEncryptionAwsKmsDsse:
+		return true
+	}
+	return resp.SSECustomerAlgorithm != nil
 }
 
 // isMultipartETag reports whether S3 built this ETag from a multipart upload, which

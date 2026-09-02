@@ -133,9 +133,12 @@ func (s *S3Store) Load(ctx context.Context) (State, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
 		return State{}, fmt.Errorf("failed to decode checkpoint: %w", err)
 	}
-	if resp.ETag != nil {
-		s.etag = *resp.ETag
+	// Without the ETag every later save would insist the object does not exist, and
+	// every one would be refused as contended.
+	if resp.ETag == nil {
+		return State{}, fmt.Errorf("checkpoint at %s came back without an ETag, so it cannot be updated safely", s.key)
 	}
+	s.etag = *resp.ETag
 
 	return state, nil
 }

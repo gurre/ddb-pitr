@@ -38,12 +38,26 @@ func TestFlagsAloneMakeAConfiguration(t *testing.T) {
 	}
 }
 
+// TestHelpIsNotAFailure verifies --help prints usage and ends the command without an
+// error. The rejection of a stray argument points the operator at --help; answering
+// that with an error and exit status 1 would look like another failure.
+func TestHelpIsNotAFailure(t *testing.T) {
+	var out bytes.Buffer
+	_, err := parseArgs([]string{"--help"}, &out)
+	if !errors.Is(err, errNothingToDo) {
+		t.Fatalf("expected help answered and nothing else, got %v", err)
+	}
+	if !strings.Contains(out.String(), "Usage:") {
+		t.Errorf("expected usage printed, got %q", out.String())
+	}
+}
+
 // TestVersionNeedsNoOtherFlags verifies --version answers on its own, before the
 // configuration is validated, so the build can be identified without a table or export.
 func TestVersionNeedsNoOtherFlags(t *testing.T) {
 	var out bytes.Buffer
 	_, err := parseArgs([]string{"--version"}, &out)
-	if !errors.Is(err, errVersionShown) {
+	if !errors.Is(err, errNothingToDo) {
 		t.Fatalf("expected the version shown and nothing else, got %v", err)
 	}
 	if !strings.Contains(out.String(), "ddb-pitr") {

@@ -1,6 +1,4 @@
-// Package metrics implements the metrics collection and reporting functionality as specified
-// in section 6 of the design specification. It handles collecting counters and histograms
-// during the restore operation and generating the final report.
+// Package metrics counts what a restore did and renders the final report.
 package metrics
 
 import (
@@ -12,8 +10,8 @@ import (
 	json "github.com/goccy/go-json"
 )
 
-// Metrics collects counters and histograms as defined in section 6 of the spec.
-// It uses atomic operations for thread-safe counter updates.
+// Metrics is the set of counters every worker reports into; each is updated
+// atomically so workers never wait on one another.
 // Fields ordered largest to smallest for memory alignment.
 type Metrics struct {
 	mu sync.RWMutex
@@ -22,7 +20,7 @@ type Metrics struct {
 	processingTime time.Duration // Total time spent processing records
 	startTime      time.Time     // When the restore operation started
 
-	// Counters as specified in section 6 (all use atomic operations)
+	// Counters (all use atomic operations)
 	recordsProcessed int64 // Items written to the table
 	batchesWritten   int64 // Number of batches written to DynamoDB
 	errors           int64 // Number of errors encountered
@@ -117,8 +115,7 @@ func (m *Metrics) RecordProcessingTime(d time.Duration) {
 	m.processingTime += d
 }
 
-// Report contains the final metrics report as defined in section 6 of the spec.
-// It includes all required fields for the JSON report output.
+// Report is the outcome of a restore, printed at the end and uploaded when asked for.
 type Report struct {
 	StartTime time.Time     `json:"startTime"` // When the restore operation started
 	EndTime   time.Time     `json:"endTime"`   // When the restore operation completed
@@ -137,8 +134,7 @@ type Report struct {
 	ByteRate       float64       `json:"byteRate"`       // Bytes per second
 }
 
-// GenerateReport generates a final report as specified in section 6.
-// It calculates all metrics and returns a Report struct ready for JSON output.
+// GenerateReport renders the counters into a Report as of now.
 func (m *Metrics) GenerateReport() Report {
 	endTime := time.Now()
 	duration := endTime.Sub(m.startTime)
@@ -174,8 +170,7 @@ func (m *Metrics) GenerateReport() Report {
 	}
 }
 
-// MarshalJSON implements json.Marshaler to format the report as JSON
-// as required by section 6 for stdout and S3 output.
+// MarshalJSON renders the durations as strings, which is how an operator reads them.
 func (r Report) MarshalJSON() ([]byte, error) {
 	type Alias Report
 	return json.Marshal(&struct {
@@ -189,8 +184,7 @@ func (r Report) MarshalJSON() ([]byte, error) {
 	})
 }
 
-// String returns a human-readable string representation of the report
-// as specified in section 6 for console output.
+// String renders the report for the console.
 func (r Report) String() string {
 	mbRead := float64(r.BytesRead) / (1024 * 1024)
 	mbPerSec := r.ByteRate / (1024 * 1024)

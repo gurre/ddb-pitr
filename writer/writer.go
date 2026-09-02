@@ -234,8 +234,8 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 					DeleteRequest: &types.DeleteRequest{Key: op.Keys},
 				})
 			default:
-				// Dropping it would send a short or empty batch and lose the item
-				// without anything saying so.
+				// A kind the writer does not know. Dropping it would send a short or
+				// empty batch and lose the item without anything saying so.
 				return fmt.Errorf("writer: operation type %d is not one the writer knows", op.Type)
 			}
 			batchBytes += int(op.Bytes)
