@@ -366,6 +366,40 @@ func TestS3Store_OverwritesOnlyTheVersionItLastWrote(t *testing.T) {
 	}
 }
 
+// TestS3Store_OnlyAFailedConditionMeansContention verifies a save refused for any
+// other reason is reported as that reason, not as contention. Telling an operator
+// another restore holds the checkpoint when S3 in fact denied access sends them
+// hunting for a run that does not exist; and both codes S3 uses for a lost race are
+// recognised, or a race lost that way would be reported as an ordinary failure.
+func TestS3Store_OnlyAFailedConditionMeansContention(t *testing.T) {
+	tests := []struct {
+		name      string
+		putErr    error
+		contended bool
+	}{
+		{"access denied", errors.New("access denied"), false},
+		{"PreconditionFailed", &smithy.GenericAPIError{Code: "PreconditionFailed"}, true},
+		{"ConditionalRequestConflict", &smithy.GenericAPIError{Code: "ConditionalRequestConflict"}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := NewS3Store(&stubS3Client{putErr: tt.putErr}, "s3://my-bucket/checkpoint.json")
+			if err != nil {
+				t.Fatalf("NewS3Store failed: %v", err)
+			}
+
+			err = store.Save(context.Background(), testState())
+			if err == nil {
+				t.Fatal("expected the save to fail")
+			}
+			if errors.Is(err, ErrCheckpointContended) != tt.contended {
+				t.Errorf("contended = %v, want %v (error %v)", !tt.contended, tt.contended, err)
+			}
+		})
+	}
+}
+
 // TestS3Store_ContentionIsNamedWithoutInvitingDeletion verifies the refusal tells the
 // operator not to delete the checkpoint. Deleting it is the instinctive response to a
 // precondition failure and the one that makes both runs write the export again.

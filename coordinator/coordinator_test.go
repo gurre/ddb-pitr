@@ -591,6 +591,25 @@ func TestCoordinatorSavesProgressWhenInterrupted(t *testing.T) {
 	}
 }
 
+// TestCoordinatorReportsAFailedFinalSave verifies a run whose workers all finished but
+// whose closing checkpoint save failed does not report success. The checkpoint would
+// be behind what was written; an operator told the run succeeded would not know a
+// resume of it repeats work, or that the store needs looking at.
+func TestCoordinatorReportsAFailedFinalSave(t *testing.T) {
+	// The worker's completion save is the first; the closing save is the second.
+	store := &mockStore{failSaveAfter: 1}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		lines: [][]byte{[]byte(`{"id":"1"}`)},
+		store: store,
+	})
+
+	err := runCoordinator(t, coord)
+	if err == nil || !strings.Contains(err.Error(), "final checkpoint") {
+		t.Errorf("expected the failed final save reported, got %v", err)
+	}
+}
+
 // TestCoordinatorStopsTheOtherWorkersWhenOneFails verifies one worker's failure ends
 // the run rather than leaving the rest to work through the export. A file that cannot
 // be restored is known within seconds; the operator should hear then, not after the
@@ -1767,12 +1786,13 @@ func (m *mockWriter) WriteBatch(ctx context.Context, ops []itemimage.Operation) 
 }
 
 type mockStore struct {
-	loadErr     error
-	saveErr     error
-	lastSaveCtx error // What the context reported on the most recent save
-	state       checkpoint.State
-	saved       []checkpoint.State
-	mu          sync.Mutex
+	loadErr       error
+	saveErr       error
+	failSaveAfter int   // Saves beyond this many fail; 0 disables
+	lastSaveCtx   error // What the context reported on the most recent save
+	state         checkpoint.State
+	saved         []checkpoint.State
+	mu            sync.Mutex
 }
 
 func (m *mockStore) Load(ctx context.Context) (checkpoint.State, error) {
@@ -1796,6 +1816,9 @@ func (m *mockStore) Save(ctx context.Context, s checkpoint.State) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.failSaveAfter > 0 && len(m.saved) >= m.failSaveAfter {
+		return errors.New("checkpoint store unavailable")
+	}
 	m.state = s
 	m.saved = append(m.saved, s)
 	m.lastSaveCtx = ctx.Err()
