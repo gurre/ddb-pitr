@@ -1,0 +1,37 @@
+name: Verify
+
+# The test and lint gate, shared by the workflow that runs on every push and pull
+# request and by the release workflow, so a tag is gated by exactly what main was.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Test and lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go test -race ./...
+
+      # config verify is stricter than run: it rejects configuration keys that run
+      # would quietly ignore, which is how a lint setting once went unenforced.
+      - name: Lint configuration
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+          args: config verify --config ./.golangci.yml
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.5.0
+          args: --config ./.golangci.yml ./...

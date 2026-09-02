@@ -11,26 +11,10 @@ permissions:
   contents: read
 
 jobs:
-  # Gate the release on the suite. A tag that does not pass is worth failing loudly
-  # before artifacts exist, not after someone has downloaded them.
+  # Gate the release on the same suite every push runs. A tag that does not pass is
+  # worth failing loudly before artifacts exist, not after someone has downloaded them.
   verify:
-    name: Test and lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Test
-        run: go test -race ./...
-
-      - name: Lint
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.5.0
-          args: --config ./.golangci.yml ./...
+    uses: ./.github/workflows/verify.yml
 
   release:
     name: Build and publish

@@ -46,12 +46,9 @@ Use this checklist when implementing tests:
 
 ### Rules
 
-- Run integration tests using integration/run.sh.
-- Dont edit integration/main_test.go if not directly asked to.
-- Never use mocks in integration tests
-- Use integration/run.sh to run integration tests
+- Run the integration tests with `go test -race ./integration/`; they drive the real streamer, decoder and writer over the exports under s3exportdata against in-memory stand-ins for S3 and DynamoDB.
+- The end-to-end check against a real AWS account is scripts/verify-pitr.sh.
 - Always print CLI commands on a single line, avoid \\n.
 - Do a code review of the uncommited changes, make sure changes align with the intended goal, only first then make a git commit using git cli. Use max 3 lines for the message and don't mention claude code or cursor.
 - Read README.md
-- Use go doc to get a glimpse of the codebase, prefer it over grep, eg `go doc ./internal/event` or `go doc ./internal/flow/batch`.
-- When making changes to postgres schemas use the migration scripts in postgres/.
+- Use go doc to get a glimpse of the codebase, prefer it over grep, eg `go doc ./coordinator` or `go doc ./writer`.

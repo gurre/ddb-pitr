@@ -4,8 +4,8 @@ project_name: ddb-pitr
 
 before:
   hooks:
-    # Dependencies are vendored, so the build needs no network. This checks the
-    # vendored tree still matches go.mod rather than fetching anything.
+    # vendor/ is not tracked, so the build fetches modules; this checks what it
+    # fetched against go.sum before anything is built from it.
     - go mod verify
 
 builds:

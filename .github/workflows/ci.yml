@@ -1,0 +1,16 @@
+name: CI
+
+# Every change is tested and linted when it lands on main and when it is proposed, so a
+# regression is found before a tag is cut rather than when one is.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/verify.yml
