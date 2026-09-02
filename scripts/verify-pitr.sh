@@ -8,6 +8,13 @@
 # 4. Triggers an INCREMENTAL export to S3
 # 5. Creates a target table and restores data using ddb-pitr
 # 6. Validates that source and target tables match exactly
+# 7. Restores the FULL export again into a third table, interrupts it part-way, and
+#    resumes it from its checkpoint to prove an interrupted restore completes
+#
+# Cost and duration: this creates three on-demand tables and two PITR exports, writes
+# ITEM_COUNT * ITEM_SIZE bytes to S3, and restores the data three times. It takes at
+# least 20 minutes whatever the size, because DynamoDB requires a warm-up before the
+# first export and 15 minutes between export times.
 #
 # Prerequisites:
 # - AWS CLI configured with appropriate permissions
@@ -75,6 +82,11 @@ cleanup() {
     echo "Deleting target table ${TARGET_TABLE}..."
     aws dynamodb delete-table --table-name "${TARGET_TABLE}" --region "${REGION}" > /dev/null 2>&1 || true
 
+    if [[ -n "${RESUME_TABLE:-}" ]]; then
+        echo "Deleting resume table ${RESUME_TABLE}..."
+        aws dynamodb delete-table --table-name "${RESUME_TABLE}" --region "${REGION}" > /dev/null 2>&1 || true
+    fi
+
     echo "Deleting S3 exports..."
     aws s3 rm "s3://${S3_BUCKET}/${S3_PREFIX}" --recursive --region "${REGION}" > /dev/null 2>&1 || true
 
@@ -87,6 +99,42 @@ cleanup() {
     exit $exit_code
 }
 trap cleanup EXIT
+
+# create_table_like creates an empty table with the same key schema and indexes as an
+# existing one, which is what a restore target has to be.
+create_table_like() {
+    local source_table="$1" new_table="$2" desc create_input
+
+    desc=$(aws dynamodb describe-table \
+        --table-name "${source_table}" \
+        --region "${REGION}" \
+        --output json \
+        --query 'Table.{AttributeDefinitions:AttributeDefinitions,KeySchema:KeySchema,LocalSecondaryIndexes:LocalSecondaryIndexes,GlobalSecondaryIndexes:GlobalSecondaryIndexes}')
+
+    create_input=$(echo "${desc}" | jq --arg name "${new_table}" '
+        . + {TableName: $name, BillingMode: "PAY_PER_REQUEST"}
+        | if .GlobalSecondaryIndexes then
+            .GlobalSecondaryIndexes |= map(del(.ProvisionedThroughput, .IndexStatus, .IndexSizeBytes, .ItemCount, .IndexArn, .Backfilling, .WarmThroughput, .OnDemandThroughput))
+          else . end
+        | if .LocalSecondaryIndexes then
+            .LocalSecondaryIndexes |= map(del(.IndexSizeBytes, .ItemCount, .IndexArn))
+          else . end
+        | del(..|nulls)
+    ')
+
+    aws dynamodb create-table --cli-input-json "${create_input}" --region "${REGION}" > /dev/null
+    aws dynamodb wait table-exists --table-name "${new_table}" --region "${REGION}"
+}
+
+# count_items reports how many items a table holds.
+count_items() {
+    aws dynamodb scan \
+        --table-name "$1" \
+        --select COUNT \
+        --region "${REGION}" \
+        --query 'Count' \
+        --output text | awk '{sum+=$1} END {print sum+0}'
+}
 
 # Get AWS account ID for table ARN
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "${REGION}")
@@ -113,6 +161,7 @@ fi
 
 TABLE_ARN="arn:aws:dynamodb:${REGION}:${ACCOUNT_ID}:table/${SOURCE_TABLE}"
 TARGET_TABLE="${SOURCE_TABLE}-target"
+RESUME_TABLE="${SOURCE_TABLE}-resume"
 
 echo "Source table: ${SOURCE_TABLE}"
 echo "Target table will be: ${TARGET_TABLE}"
@@ -249,32 +298,8 @@ echo "INCREMENTAL export completed"
 echo ""
 echo "=== Phase 6: Create target table ==="
 
-# Get source table description and extract schema
-TABLE_DESC=$(aws dynamodb describe-table \
-    --table-name "${SOURCE_TABLE}" \
-    --region "${REGION}" \
-    --output json \
-    --query 'Table.{AttributeDefinitions:AttributeDefinitions,KeySchema:KeySchema,LocalSecondaryIndexes:LocalSecondaryIndexes,GlobalSecondaryIndexes:GlobalSecondaryIndexes}')
-
-# Create target table with same schema
 echo "Creating target table ${TARGET_TABLE}..."
-CREATE_INPUT=$(echo "${TABLE_DESC}" | jq --arg name "${TARGET_TABLE}" '
-    . + {TableName: $name, BillingMode: "PAY_PER_REQUEST"}
-    | if .GlobalSecondaryIndexes then
-        .GlobalSecondaryIndexes |= map(del(.ProvisionedThroughput, .IndexStatus, .IndexSizeBytes, .ItemCount, .IndexArn, .Backfilling, .WarmThroughput, .OnDemandThroughput))
-      else . end
-    | if .LocalSecondaryIndexes then
-        .LocalSecondaryIndexes |= map(del(.IndexSizeBytes, .ItemCount, .IndexArn))
-      else . end
-    | del(..|nulls)
-')
-
-aws dynamodb create-table \
-    --cli-input-json "${CREATE_INPUT}" \
-    --region "${REGION}" > /dev/null
-
-echo "Waiting for target table to become active..."
-aws dynamodb wait table-exists --table-name "${TARGET_TABLE}" --region "${REGION}"
+create_table_like "${SOURCE_TABLE}" "${TARGET_TABLE}"
 echo "Target table created"
 
 # Phase 7: Restore FULL export
@@ -310,19 +335,8 @@ echo ""
 echo "=== Phase 9: Verify data completeness ==="
 
 # Count items in both tables (sum across all pages for large tables)
-SOURCE_COUNT=$(aws dynamodb scan \
-    --table-name "${SOURCE_TABLE}" \
-    --select COUNT \
-    --region "${REGION}" \
-    --query 'Count' \
-    --output text | awk '{sum+=$1} END {print sum}')
-
-TARGET_COUNT=$(aws dynamodb scan \
-    --table-name "${TARGET_TABLE}" \
-    --select COUNT \
-    --region "${REGION}" \
-    --query 'Count' \
-    --output text | awk '{sum+=$1} END {print sum}')
+SOURCE_COUNT=$(count_items "${SOURCE_TABLE}")
+TARGET_COUNT=$(count_items "${TARGET_TABLE}")
 
 EXPECTED_COUNT=$((ITEM_COUNT - DELETE_COUNT))
 
@@ -406,22 +420,130 @@ for i in $(seq 0 $((SAMPLE_SIZE - 1))); do
 done
 echo ""
 
-if [[ ${VERIFY_FAILED} -eq 0 ]]; then
-    echo ""
-    echo "=== VERIFICATION PASSED ==="
-    echo "Item counts match and ${SAMPLE_SIZE} sampled items verified"
-    echo ""
-    echo "Summary:"
-    echo "  - Created ${ITEM_COUNT} items (${ITEM_SIZE} bytes each)"
-    echo "  - Updated ${UPDATE_COUNT} items"
-    echo "  - Deleted ${DELETE_COUNT} items"
-    echo "  - Final count: ${EXPECTED_COUNT} items"
-    echo "  - FULL export and restore: SUCCESS"
-    echo "  - INCREMENTAL export and restore: SUCCESS"
-    echo "  - Data integrity: VERIFIED (${SAMPLE_SIZE} samples)"
-else
+if [[ ${VERIFY_FAILED} -ne 0 ]]; then
     echo ""
     echo "=== VERIFICATION FAILED ==="
     echo "Sample items differ between source and target tables"
     exit 1
 fi
+
+# Phase 10: Interrupt a restore and resume it
+#
+# The FULL export is restored again into its own table, interrupted part-way, and then
+# resumed from the checkpoint the interrupted run left behind. The restart deliberately
+# uses different worker and batch settings, because a resume is only worth having if it
+# does not depend on how the run before it was configured.
+echo ""
+echo "=== Phase 10: Interrupted restore resumes and completes ==="
+
+CHECKPOINT_KEY="${S3_PREFIX}/resume-checkpoint.json"
+CHECKPOINT_URI="s3://${S3_BUCKET}/${CHECKPOINT_KEY}"
+
+echo "Creating resume table ${RESUME_TABLE}..."
+create_table_like "${SOURCE_TABLE}" "${RESUME_TABLE}"
+
+# One worker writing a single item per request, so the restore is slow enough to have
+# a window to interrupt in.
+echo "Starting a restore to interrupt..."
+"${BIN_DIR}/ddb-pitr" \
+    -table "${RESUME_TABLE}" \
+    -export "${FULL_MANIFEST_URI}" \
+    -region "${REGION}" \
+    -resume "${CHECKPOINT_URI}" \
+    -workers 1 \
+    -batch 1 &
+PITR_PID=$!
+
+# Interrupt once progress has been recorded, so the checkpoint under test describes a
+# run that was genuinely part-way through rather than one that had done nothing.
+CHECKPOINT_SEEN=0
+for _ in $(seq 1 600); do
+    if aws s3api head-object --bucket "${S3_BUCKET}" --key "${CHECKPOINT_KEY}" --region "${REGION}" > /dev/null 2>&1; then
+        CHECKPOINT_SEEN=1
+        break
+    fi
+    kill -0 "${PITR_PID}" 2>/dev/null || break
+    sleep 0.2
+done
+
+# SIGTERM rather than SIGINT: a shell ignores SIGINT in the commands it starts in the
+# background, so a wrapper around the binary would never see one. SIGTERM is also what
+# a container runtime sends, and the restore treats the two the same way.
+INTERRUPT_RC=0
+if kill -0 "${PITR_PID}" 2>/dev/null; then
+    echo "Progress recorded; interrupting the restore"
+    kill -TERM "${PITR_PID}" 2>/dev/null || true
+fi
+wait "${PITR_PID}" || INTERRUPT_RC=$?
+
+PARTIAL_COUNT=$(count_items "${RESUME_TABLE}")
+echo "Interrupted restore exited ${INTERRUPT_RC}, having written ${PARTIAL_COUNT} of ${ITEM_COUNT} items"
+
+RESUME_RESULT="SUCCESS"
+RESUME_WAS_INTERRUPTED=1
+if [[ ${INTERRUPT_RC} -eq 0 ]]; then
+    echo ""
+    echo "WARNING: the restore finished before it could be interrupted, so resuming was"
+    echo "         not exercised. Re-run with a larger ITEM_COUNT to test it."
+    RESUME_RESULT="SKIPPED (finished before it could be interrupted)"
+    RESUME_WAS_INTERRUPTED=0
+else
+    if [[ ${CHECKPOINT_SEEN} -eq 0 ]]; then
+        echo "ERROR: the restore stopped without recording any progress"
+        exit 1
+    fi
+    if [[ "${PARTIAL_COUNT}" -ge "${ITEM_COUNT}" ]]; then
+        echo "ERROR: the interrupted restore wrote everything, so nothing was left to resume"
+        exit 1
+    fi
+fi
+
+# Resume at the default worker count and batch size, which the interrupted run did not use.
+echo "Resuming from ${CHECKPOINT_URI}..."
+RESUME_LOG=$(mktemp)
+"${BIN_DIR}/ddb-pitr" \
+    -table "${RESUME_TABLE}" \
+    -export "${FULL_MANIFEST_URI}" \
+    -region "${REGION}" \
+    -resume "${CHECKPOINT_URI}" | tee "${RESUME_LOG}"
+
+RESUMED_WRITES=$(awk '/^Total items:/ {print $3}' "${RESUME_LOG}")
+rm -f "${RESUME_LOG}"
+
+RESUMED_COUNT=$(count_items "${RESUME_TABLE}")
+echo ""
+echo "Expected items after resuming: ${ITEM_COUNT}"
+echo "Resume table items: ${RESUMED_COUNT}"
+
+# The count catches items the resume lost. Writing an item twice cannot change it,
+# since every write replaces a whole item, so a repeat is invisible here by design.
+if [[ "${RESUMED_COUNT}" != "${ITEM_COUNT}" ]]; then
+    echo "ERROR: resumed restore count mismatch! Expected ${ITEM_COUNT}, got ${RESUMED_COUNT}"
+    exit 1
+fi
+
+# What the resumed run wrote is what proves it skipped the finished work rather than
+# starting the export again.
+if [[ ${RESUME_WAS_INTERRUPTED} -eq 1 ]]; then
+    echo "Items written by the resumed run: ${RESUMED_WRITES} of ${ITEM_COUNT}"
+    if [[ "${RESUMED_WRITES}" -ge "${ITEM_COUNT}" ]]; then
+        echo "ERROR: the resumed run rewrote the whole export instead of continuing from the checkpoint"
+        exit 1
+    fi
+fi
+
+echo "Resumed restore holds every item of the FULL export"
+
+echo ""
+echo "=== VERIFICATION PASSED ==="
+echo "Item counts match and ${SAMPLE_SIZE} sampled items verified"
+echo ""
+echo "Summary:"
+echo "  - Created ${ITEM_COUNT} items (${ITEM_SIZE} bytes each)"
+echo "  - Updated ${UPDATE_COUNT} items"
+echo "  - Deleted ${DELETE_COUNT} items"
+echo "  - Final count: ${EXPECTED_COUNT} items"
+echo "  - FULL export and restore: SUCCESS"
+echo "  - INCREMENTAL export and restore: SUCCESS"
+echo "  - Data integrity: VERIFIED (${SAMPLE_SIZE} samples)"
+echo "  - Interrupted restore and resume: ${RESUME_RESULT}"
