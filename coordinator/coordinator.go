@@ -617,6 +617,11 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 		var currentOffset int64
 		var batchesSinceCheckpoint int
 
+		// Furthest line examined in this file across attempts. A corrupt line sits
+		// above the last written one, so a retry re-reads it; without this it would
+		// be counted and named again on every attempt.
+		examined, _ := c.progress.resume(file.Key)
+
 		// Stream and process the file with retries
 		var streamErr error
 		for retry := 0; retry < maxRetries; retry++ {
@@ -650,12 +655,17 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 				if byteOffset <= startOffset {
 					return nil
 				}
-				currentOffset = byteOffset
+				seen := byteOffset <= examined
+				if !seen {
+					examined = byteOffset
+				}
 
 				// Decode is the main CPU/memory bottleneck (~27% CPU, ~99% memory)
 				op, err := c.parser.Decode(line)
 				if errors.Is(err, itemimage.ErrCorrupt) {
-					c.skipCorrupt(file.Key, byteOffset, err)
+					if !seen {
+						c.skipCorrupt(file.Key, byteOffset, err)
+					}
 					return nil
 				}
 				if err != nil {
@@ -663,6 +673,7 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 					return err
 				}
 
+				currentOffset = byteOffset
 				batch = append(batch, op)
 
 				if len(batch) >= c.cfg.BatchSize {

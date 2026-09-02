@@ -750,6 +750,37 @@ func TestCoordinatorSkipsCorruptLinesAndReportsThemAtTheEnd(t *testing.T) {
 	}
 }
 
+// TestCoordinatorCountsACorruptLineOnceAcrossRetries verifies a corrupt line re-read by
+// a retried stream is not counted or named a second time. The line sits above the last
+// written one, so every attempt reads it again; a count that grew with the attempts
+// would overstate what the restore skipped, and the list an operator uses to find the
+// lines would carry duplicates.
+func TestCoordinatorCountsACorruptLineOnceAcrossRetries(t *testing.T) {
+	// Four lines, the third corrupt, and the first attempt fails after reading it.
+	streamer := &mockStreamer{
+		lines:     [][]byte{[]byte(`{"id":"1"}`), []byte(`{"id":"2"}`), []byte(`corrupt`), []byte(`{"id":"4"}`)},
+		failAfter: 3,
+	}
+	coord, m := newTestCoordinator(t, testDeps{
+		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 4}},
+		streamer: streamer,
+		decoder:  &mockDecoder{corruptLines: map[string]bool{"corrupt": true}},
+		configure: func(cfg *config.Config) {
+			cfg.BatchSize = 2
+		},
+	})
+
+	if err := runCoordinator(t, coord); !errors.Is(err, ErrRecordsSkipped) {
+		t.Fatalf("expected the run to report the skipped line, got %v", err)
+	}
+	if len(streamer.requests) != 2 {
+		t.Fatalf("expected the stream retried once, got %d attempts", len(streamer.requests))
+	}
+	if got := m.CorruptCount(); got != 1 {
+		t.Errorf("expected the corrupt line counted once, got %d", got)
+	}
+}
+
 // TestCoordinatorStillUploadsTheReportWhenLinesWereSkipped verifies the report reaches
 // S3 before the run fails for skipped lines. The report is the only durable record of
 // which lines were skipped; failing before it is written would destroy the evidence.

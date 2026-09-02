@@ -30,18 +30,17 @@ type Operation struct {
 	Type     OperationType                   // Type of operation (Put/Delete/Update)
 }
 
-// ErrCorrupt is returned when a line cannot be parsed according to the format
-// specified in section 2 of the design specification.
+// ErrCorrupt is returned, wrapped, for a line that is not a record of either export
+// format; callers match it with errors.Is.
 var ErrCorrupt = fmt.Errorf("corrupt line")
 
-// Decoder interface as defined in section 4.5 of the spec.
-// Implementations must handle decoding JSON lines into Operations.
+// Decoder turns one export line into the operation that restores it.
 type Decoder interface {
 	Decode(line []byte) (Operation, error)
 }
 
-// JSONDecoder implements the Decoder interface for JSON lines as specified in section 4.5.
-// It handles parsing the DynamoDB PITR export format described in section 2.
+// JSONDecoder decodes the JSON lines of a DynamoDB export, full or incremental, into
+// the operations that restore them.
 type JSONDecoder struct{}
 
 // NewJSONDecoder creates a new JSONDecoder instance
@@ -59,7 +58,8 @@ func NewJSONDecoder() *JSONDecoder {
 //   - Keys + OldImage: the item was deleted (new and old images view)
 //   - Keys alone: the item was deleted (new images only view)
 //
-// A delete must name what to delete, so one whose Keys are empty is corrupt.
+// A delete must name what to delete and a put must have an item to write, so a delete
+// whose Keys are empty and a put whose image is empty are corrupt.
 //
 // HOT PATH: This function processes every record from S3.
 // Profiling shows ~27% CPU time and ~99% memory allocation occurs here.
@@ -79,6 +79,9 @@ func (d *JSONDecoder) Decode(line []byte) (Operation, error) {
 		item, err := attributevalue.UnmarshalMapJSON(itemRaw)
 		if err != nil {
 			return Operation{}, fmt.Errorf("%w: failed to parse Item: %v", ErrCorrupt, err)
+		}
+		if len(item) == 0 {
+			return Operation{}, fmt.Errorf("%w: Item is empty", ErrCorrupt)
 		}
 		op.NewImage = item
 		op.Type = OpPut
@@ -112,6 +115,8 @@ func (d *JSONDecoder) Decode(line []byte) (Operation, error) {
 
 	// Determine operation type for incremental exports
 	switch {
+	case op.NewImage != nil && len(op.NewImage) == 0:
+		return Operation{}, fmt.Errorf("%w: NewImage is empty", ErrCorrupt)
 	case op.NewImage != nil && op.OldImage != nil:
 		op.Type = OpUpdate
 	case op.NewImage != nil:

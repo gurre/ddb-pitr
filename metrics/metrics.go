@@ -80,7 +80,7 @@ func (m *Metrics) RecordLost(n int64) {
 	atomic.AddInt64(&m.lostItems, n)
 }
 
-// RecordBytes adds to the bytes written counter
+// RecordBytes adds to the export bytes read behind items written
 func (m *Metrics) RecordBytes(n int64) {
 	atomic.AddInt64(&m.bytesRead, n)
 }
@@ -192,7 +192,7 @@ func (r Report) MarshalJSON() ([]byte, error) {
 // String returns a human-readable string representation of the report
 // as specified in section 6 for console output.
 func (r Report) String() string {
-	mbWritten := float64(r.BytesRead) / (1024 * 1024)
+	mbRead := float64(r.BytesRead) / (1024 * 1024)
 	mbPerSec := r.ByteRate / (1024 * 1024)
 
 	return fmt.Sprintf(
@@ -208,7 +208,7 @@ func (r Report) String() string {
 		r.CorruptCount,
 		r.Throughput,
 		mbPerSec,
-		mbWritten,
+		mbRead,
 		r.Throttles,
 		r.Retries,
 		r.LostItems,

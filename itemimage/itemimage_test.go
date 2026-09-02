@@ -428,6 +428,8 @@ func TestCorruptLineNamesWhatFailed(t *testing.T) {
 		{"unreadable OldImage", `{"Keys":{},"OldImage":"not an object"}`, "OldImage"},
 		{"nothing to apply", `{"Metadata":{}}`, "no image data"},
 		{"delete without keys", `{"Keys":{},"OldImage":{"PK":{"S":"1"}}}`, "keys"},
+		{"full export item with nothing in it", `{"Item":{}}`, "empty"},
+		{"put with nothing in it", `{"Keys":{"PK":{"S":"1"}},"NewImage":{}}`, "empty"},
 	}
 
 	for _, tt := range tests {

@@ -432,25 +432,57 @@ func TestUnprocessedRoundsDoNotConsumeTheTransientBudget(t *testing.T) {
 	}
 }
 
-// TestThrottlingExceptionIsRetriedUntilSuccess verifies the throttle an on-demand
-// table raises, which the SDK does not type, is retried for as long as it takes rather
-// than against the bounded budget. Six of them in a row is more than the budget allows
-// a passing fault, and a throttling storm on a large restore lasts far longer.
-func TestThrottlingExceptionIsRetriedUntilSuccess(t *testing.T) {
-	throttled := &smithy.GenericAPIError{Code: "ThrottlingException", Message: "Rate exceeded"}
-	client := &scriptedClient{batchErrs: []error{throttled, throttled, throttled, throttled, throttled, throttled, nil}}
-	counts := &callbackCounts{}
-	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}))
-
-	if err := w.WriteBatch(context.Background(), putOps(1)); err != nil {
-		t.Fatalf("expected the batch written once throttling eased, got %v", err)
+// TestEveryThrottleKindIsRetriedUntilSuccess verifies each way DynamoDB says "not now"
+// is treated as throttling: retried past the bounded budget and counted as a throttle.
+// Missing one would send a throttled restore down the bounded path and lose batches
+// under sustained pressure, which is exactly when a restore is most likely to be
+// running against a table it shares.
+func TestEveryThrottleKindIsRetriedUntilSuccess(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{"provisioned throughput exceeded", &types.ProvisionedThroughputExceededException{Message: ptr("throttled")}},
+		{"request limit exceeded", &types.RequestLimitExceeded{Message: ptr("throttled")}},
+		{"ThrottlingException", &smithy.GenericAPIError{Code: "ThrottlingException", Message: "Rate exceeded"}},
+		{"RequestThrottled", &smithy.GenericAPIError{Code: "RequestThrottled", Message: "Rate exceeded"}},
+		{"ThrottledException", &smithy.GenericAPIError{Code: "ThrottledException", Message: "Rate exceeded"}},
 	}
 
-	if counts.throttles != 6 {
-		t.Errorf("expected 6 throttle reports, got %d", counts.throttles)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// More throttles than the bounded budget allows, then success.
+			errs := make([]error, 0, maxTransientAttempts+2)
+			for i := 0; i <= maxTransientAttempts; i++ {
+				errs = append(errs, tt.err)
+			}
+			errs = append(errs, nil)
+			client := &scriptedClient{batchErrs: errs}
+			counts := &callbackCounts{}
+			w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}))
+
+			if err := w.WriteBatch(context.Background(), putOps(1)); err != nil {
+				t.Fatalf("expected the batch written once throttling eased, got %v", err)
+			}
+			if counts.throttles != maxTransientAttempts+1 || counts.lost != 0 {
+				t.Errorf("expected %d throttles and nothing lost, got %d and %d",
+					maxTransientAttempts+1, counts.throttles, counts.lost)
+			}
+		})
 	}
-	if counts.lost != 0 {
-		t.Errorf("expected no items lost, got %d", counts.lost)
+}
+
+// TestUnknownOperationTypeIsRefused verifies an operation of a kind the writer does
+// not know fails the batch at once, rather than being dropped from it silently.
+func TestUnknownOperationTypeIsRefused(t *testing.T) {
+	client := &scriptedClient{}
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
+
+	if err := w.WriteBatch(context.Background(), []itemimage.Operation{{Type: itemimage.OperationType(99)}}); err == nil {
+		t.Fatal("expected an unknown operation type refused")
+	}
+	if len(client.batchRequests) != 0 {
+		t.Errorf("expected nothing sent, got %d batches", len(client.batchRequests))
 	}
 }
 

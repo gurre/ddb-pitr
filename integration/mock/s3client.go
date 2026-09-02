@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	json "github.com/goccy/go-json"
 )
 
@@ -242,8 +243,9 @@ func (m *S3Client) GetObject(ctx context.Context, params *s3.GetObjectInput, opt
 		start, _ = strconv.ParseInt(match[1], 10, 64)
 		end, _ = strconv.ParseInt(match[2], 10, 64)
 		if start >= int64(len(content)) || start > end {
-			return nil, &types.InvalidObjectState{
-				Message: aws.String(fmt.Sprintf("InvalidRange: %s is outside %d bytes", *params.Range, len(content))),
+			return nil, &smithy.GenericAPIError{
+				Code:    "InvalidRange",
+				Message: fmt.Sprintf("%s is outside %d bytes", *params.Range, len(content)),
 			}
 		}
 		if end >= int64(len(content)) {
