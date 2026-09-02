@@ -1,5 +1,5 @@
-// Package checkpoint implements the checkpoint functionality as specified in section 4.7
-// of the design specification. It handles saving and loading progress for resumable operations.
+// Package checkpoint records what a restore has finished, so an interrupted run can be
+// resumed rather than restarted.
 package checkpoint
 
 import (
@@ -8,12 +8,12 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 
+	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	json "github.com/goccy/go-json"
 	"github.com/gurre/ddb-pitr/aws"
 )
@@ -55,7 +55,17 @@ type Store interface {
 	Save(ctx context.Context, s State) error
 }
 
-// S3Store implements the Store interface using AWS S3.
+// ErrCheckpointContended is returned when the checkpoint object changed underneath a
+// run, which means another restore is writing to the same checkpoint URI. Two runs
+// sharing one would each overwrite the other's progress, and the survivor would skip
+// files the other never finished.
+var ErrCheckpointContended = errors.New("checkpoint: another restore is writing this checkpoint")
+
+// S3Store implements the Store interface using AWS S3. Every save is conditional on
+// the object being the version this store last read or wrote, so two runs pointed at
+// the same checkpoint URI cannot silently interleave their progress; the second to
+// write fails with ErrCheckpointContended. A store is used by one run at a time,
+// serialised by the coordinator; it is not safe for concurrent Save calls.
 // Example:
 //
 //	client := s3.NewFromConfig(cfg)
@@ -65,6 +75,7 @@ type S3Store struct {
 	client aws.S3Client
 	bucket string
 	key    string
+	etag   string // ETag of the object as last read or written; empty when there is none
 }
 
 // NewS3Store creates a new S3Store instance from an S3 URI.
@@ -91,7 +102,9 @@ func NewS3Store(client aws.S3Client, uri string) (*S3Store, error) {
 	}, nil
 }
 
-// Load implements the checkpoint loading requirements from section 4.7.
+// Load reads the checkpoint, remembering which version it read so the next Save can
+// insist on replacing that version and no other. A checkpoint that does not exist yet
+// reads as no progress.
 // Example:
 //
 //	store := checkpoint.NewS3Store(client, "s3://my-bucket/checkpoints/restore-123.json")
@@ -106,15 +119,10 @@ func (s *S3Store) Load(ctx context.Context) (State, error) {
 		Key:    &s.key,
 	})
 	if err != nil {
-		// If the object doesn't exist, return empty state
-		// Use proper error type assertion instead of string matching
 		var noSuchKey *types.NoSuchKey
-		if errors.As(err, &noSuchKey) {
-			return State{}, nil
-		}
-		// Also check for NotFound which some S3-compatible stores return
 		var notFound *types.NotFound
-		if errors.As(err, &notFound) {
+		if errors.As(err, &noSuchKey) || errors.As(err, &notFound) {
+			s.etag = ""
 			return State{}, nil
 		}
 		return State{}, fmt.Errorf("failed to get checkpoint: %w", err)
@@ -125,11 +133,17 @@ func (s *S3Store) Load(ctx context.Context) (State, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&state); err != nil {
 		return State{}, fmt.Errorf("failed to decode checkpoint: %w", err)
 	}
+	if resp.ETag != nil {
+		s.etag = *resp.ETag
+	}
 
 	return state, nil
 }
 
-// Save implements the checkpoint saving requirements from section 4.7.
+// Save writes the checkpoint on the condition that nothing else has written it since
+// this store last read or wrote it: it must not exist if none was loaded, and must
+// still carry the last known ETag otherwise. A failed condition means another run is
+// using the same checkpoint and is reported as ErrCheckpointContended.
 // Example:
 //
 //	store := checkpoint.NewS3Store(client, "s3://my-bucket/checkpoints/restore-123.json")
@@ -148,112 +162,43 @@ func (s *S3Store) Save(ctx context.Context, state State) error {
 		return fmt.Errorf("failed to encode checkpoint: %w", err)
 	}
 
-	// Use bytes.NewReader to avoid extra allocation from string conversion
-	_, err = s.client.PutObject(ctx, &s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket: &s.bucket,
 		Key:    &s.key,
 		Body:   bytes.NewReader(data),
-	})
+	}
+	if s.etag == "" {
+		input.IfNoneMatch = awssdk.String("*")
+	} else {
+		input.IfMatch = awssdk.String(s.etag)
+	}
+
+	resp, err := s.client.PutObject(ctx, input)
 	if err != nil {
+		if isPreconditionFailure(err) {
+			return fmt.Errorf("%w at %s; do not delete it, that would make both restores write everything again",
+				ErrCheckpointContended, s.key)
+		}
 		return fmt.Errorf("failed to save checkpoint: %w", err)
 	}
-
-	return nil
-}
-
-// FileStore implements the Store interface using the local filesystem.
-// Example:
-//
-//	store := checkpoint.NewFileStore("file:///tmp/checkpoints/restore-123.json")
-//	state, err := store.Load(ctx)
-type FileStore struct {
-	path string
-}
-
-// NewFileStore creates a new FileStore instance from a file URI.
-// The path must be absolute and is cleaned to prevent path traversal attacks.
-// Example:
-//
-//	store, err := checkpoint.NewFileStore("file:///tmp/checkpoints/restore-123.json")
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-func NewFileStore(uri string) (*FileStore, error) {
-	u, err := url.Parse(uri)
-	if err != nil {
-		return nil, fmt.Errorf("invalid file URI: %w", err)
-	}
-	if u.Scheme != "file" {
-		return nil, fmt.Errorf("invalid file URI scheme: %s", u.Scheme)
-	}
-
-	// Clean the path to resolve any .. or . components
-	cleanPath := filepath.Clean(u.Path)
-
-	// Ensure path is absolute to prevent relative path attacks
-	if !filepath.IsAbs(cleanPath) {
-		return nil, fmt.Errorf("checkpoint path must be absolute: %s", cleanPath)
-	}
-
-	// Create directory if it doesn't exist
-	dir := filepath.Dir(cleanPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("failed to create directory: %w", err)
-	}
-
-	return &FileStore{
-		path: cleanPath,
-	}, nil
-}
-
-// Load implements the checkpoint loading requirements from section 4.7.
-// Example:
-//
-//	store := checkpoint.NewFileStore("file:///tmp/checkpoints/restore-123.json")
-//	state, err := store.Load(ctx)
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//	fmt.Printf("Resuming: %d files done, %d part-way\n", len(state.Completed), len(state.Offsets))
-func (f *FileStore) Load(ctx context.Context) (State, error) {
-	data, err := os.ReadFile(f.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return State{}, nil
-		}
-		return State{}, fmt.Errorf("failed to read checkpoint file: %w", err)
-	}
-
-	var state State
-	if err := json.Unmarshal(data, &state); err != nil {
-		return State{}, fmt.Errorf("failed to decode checkpoint: %w", err)
-	}
-
-	return state, nil
-}
-
-// Save implements the checkpoint saving requirements from section 4.7.
-// Example:
-//
-//	store := checkpoint.NewFileStore("file:///tmp/checkpoints/restore-123.json")
-//	state := checkpoint.State{
-//	    ExportID:  "arn:aws:dynamodb:eu-north-1:123456789012:table/orders/export/01768385930622-efd1a093",
-//	    Completed: []string{"data-001.json.gz"},
-//	    Offsets:   map[string]int64{"data-002.json.gz": 1024},
-//	}
-//	err := store.Save(ctx, state)
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-func (f *FileStore) Save(ctx context.Context, state State) error {
-	data, err := json.Marshal(state)
-	if err != nil {
-		return fmt.Errorf("failed to encode checkpoint: %w", err)
-	}
-
-	if err := os.WriteFile(f.path, data, 0644); err != nil {
-		return fmt.Errorf("failed to write checkpoint file: %w", err)
+	if resp.ETag != nil {
+		s.etag = *resp.ETag
 	}
 
 	return nil
+}
+
+// isPreconditionFailure reports whether S3 refused a conditional write. S3 answers a
+// failed IfMatch or IfNoneMatch with 412 PreconditionFailed, and two conditional writes
+// racing with 409 ConditionalRequestConflict; neither has a typed error in the SDK.
+func isPreconditionFailure(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "PreconditionFailed", "ConditionalRequestConflict":
+		return true
+	}
+	return false
 }

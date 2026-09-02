@@ -284,6 +284,13 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	c.totalExpectedItems = summary.ItemCount
 	c.lastReportTime = time.Now()
 
+	// A checkpoint is tied to its export by the export's identity. A manifest without
+	// one cannot be checked against any checkpoint, so it is refused before a run could
+	// record progress that a later run of some other export would resume from.
+	if summary.ExportARN == "" {
+		return fmt.Errorf("manifest at %s names no export ARN", c.cfg.ExportS3URI)
+	}
+
 	// Load checkpoint
 	state, err := c.store.Load(ctx)
 	if err != nil {

@@ -6,14 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	json "github.com/goccy/go-json"
 )
 
@@ -90,90 +90,6 @@ func TestMemoryStore_ConcurrentAccess(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-}
-
-func TestFileStore_SaveLoad(t *testing.T) {
-	// Create a temporary directory for the test
-	tmpDir := t.TempDir()
-	uri := "file://" + filepath.Join(tmpDir, "checkpoint.json")
-
-	store, err := NewFileStore(uri)
-	if err != nil {
-		t.Fatalf("failed to create file store: %v", err)
-	}
-
-	ctx := context.Background()
-	state := testState()
-
-	if err := store.Save(ctx, state); err != nil {
-		t.Fatalf("failed to save state: %v", err)
-	}
-
-	loaded, err := store.Load(ctx)
-	if err != nil {
-		t.Fatalf("failed to load state: %v", err)
-	}
-	assertState(t, loaded, state)
-}
-
-func TestFileStore_NonExistent(t *testing.T) {
-	tmpDir := t.TempDir()
-	uri := "file://" + filepath.Join(tmpDir, "nonexistent.json")
-
-	store, err := NewFileStore(uri)
-	if err != nil {
-		t.Fatalf("failed to create file store: %v", err)
-	}
-
-	state, err := store.Load(context.Background())
-	if err != nil {
-		t.Fatalf("failed to load non-existent state: %v", err)
-	}
-
-	// Should return empty state for non-existent file
-	if state.ExportID != "" || len(state.Completed) != 0 || len(state.Offsets) != 0 {
-		t.Errorf("expected empty state for non-existent file, got: %+v", state)
-	}
-}
-
-func TestFileStore_InvalidURI(t *testing.T) {
-	testCases := []string{
-		"s3://bucket/key",
-		"http://example.com/file",
-		"/path/without/scheme",
-	}
-
-	for _, uri := range testCases {
-		t.Run(uri, func(t *testing.T) {
-			_, err := NewFileStore(uri)
-			if err == nil {
-				t.Errorf("expected error for invalid file URI: %s", uri)
-			}
-		})
-	}
-}
-
-func TestFileStore_CreatesDirectory(t *testing.T) {
-	tmpDir := t.TempDir()
-	nestedDir := filepath.Join(tmpDir, "nested", "dir")
-	uri := "file://" + filepath.Join(nestedDir, "checkpoint.json")
-
-	store, err := NewFileStore(uri)
-	if err != nil {
-		t.Fatalf("failed to create file store: %v", err)
-	}
-
-	// Verify directory was created
-	if _, err := os.Stat(nestedDir); os.IsNotExist(err) {
-		t.Error("expected nested directory to be created")
-	}
-
-	// Verify we can save to the store
-	ctx := context.Background()
-	state := State{ExportID: "test"}
-	if err := store.Save(ctx, state); err != nil {
-		t.Fatalf("failed to save state: %v", err)
-	}
 }
 
 func TestS3Store_NewValidURI(t *testing.T) {
@@ -311,65 +227,6 @@ func TestS3Store_ReportsWriteFailure(t *testing.T) {
 	}
 }
 
-// TestFileStore_RoundTripSurvivesEncoding verifies progress written to disk comes back
-// intact. It is the only checkpoint that outlives the process without S3, so a resume
-// after a crash depends on the whole record surviving the round trip.
-func TestFileStore_RoundTripSurvivesEncoding(t *testing.T) {
-	store, err := NewFileStore("file://" + filepath.Join(t.TempDir(), "checkpoint.json"))
-	if err != nil {
-		t.Fatalf("failed to create file store: %v", err)
-	}
-
-	want := testState()
-	if err := store.Save(context.Background(), want); err != nil {
-		t.Fatalf("failed to save state: %v", err)
-	}
-
-	got, err := store.Load(context.Background())
-	if err != nil {
-		t.Fatalf("failed to load state: %v", err)
-	}
-	assertState(t, got, want)
-}
-
-// TestFileStore_ReportsUnreadableContent verifies a checkpoint file that is not valid
-// state is reported rather than read as no progress, which would silently restart the
-// restore from the top and rewrite everything.
-func TestFileStore_ReportsUnreadableContent(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "checkpoint.json")
-	if err := os.WriteFile(path, []byte("not json"), 0600); err != nil {
-		t.Fatalf("failed to write the corrupt checkpoint: %v", err)
-	}
-
-	store, err := NewFileStore("file://" + path)
-	if err != nil {
-		t.Fatalf("failed to create file store: %v", err)
-	}
-
-	if _, err := store.Load(context.Background()); err == nil {
-		t.Error("expected a corrupt checkpoint file to be reported")
-	}
-}
-
-// TestFileStore_ReportsWriteFailure verifies a checkpoint that cannot be written is
-// reported. Progress an operator believes is saved but is not makes a resume lose work.
-func TestFileStore_ReportsWriteFailure(t *testing.T) {
-	// A directory occupies the checkpoint's path, so the write cannot succeed.
-	path := filepath.Join(t.TempDir(), "checkpoint.json")
-	if err := os.Mkdir(path, 0755); err != nil {
-		t.Fatalf("failed to occupy the checkpoint path: %v", err)
-	}
-
-	store, err := NewFileStore("file://" + path)
-	if err != nil {
-		t.Fatalf("failed to create file store: %v", err)
-	}
-
-	if err := store.Save(context.Background(), testState()); err == nil {
-		t.Error("expected a failed checkpoint write to be reported")
-	}
-}
-
 // TestS3Store_SendsTheCallersContext verifies checkpoint reads and writes are made under
 // the context the caller passed. Detaching from it would leave a shutting-down restore
 // blocked on S3 with no deadline and no cancellation.
@@ -448,32 +305,104 @@ func TestS3Store_MissingObjectVariants(t *testing.T) {
 	}
 }
 
-// TestNewFileStore_RejectsRelativePaths verifies a checkpoint path that is not absolute
-// is refused. Resolving it against whatever directory the process happens to run in puts
-// the record of a restore somewhere unpredictable, and a resume would not find it.
-func TestNewFileStore_RejectsRelativePaths(t *testing.T) {
-	for _, uri := range []string{"file:checkpoints/restore.json", "file:./restore.json"} {
-		t.Run(uri, func(t *testing.T) {
-			if _, err := NewFileStore(uri); err == nil {
-				t.Errorf("expected a relative checkpoint path to be refused: %s", uri)
-			}
-		})
+// TestS3Store_CreatesTheCheckpointOnlyWhenAbsent verifies a store that loaded no
+// checkpoint insists on creating one, so two runs started against the same fresh URI
+// cannot both believe they own it: the second to write is refused.
+func TestS3Store_CreatesTheCheckpointOnlyWhenAbsent(t *testing.T) {
+	client := &stubS3Client{objects: map[string][]byte{}}
+	first, err := NewS3Store(client, "s3://my-bucket/checkpoint.json")
+	if err != nil {
+		t.Fatalf("NewS3Store failed: %v", err)
+	}
+	second, err := NewS3Store(client, "s3://my-bucket/checkpoint.json")
+	if err != nil {
+		t.Fatalf("NewS3Store failed: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := first.Load(ctx); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if _, err := second.Load(ctx); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+
+	if err := first.Save(ctx, testState()); err != nil {
+		t.Fatalf("expected the first run to create the checkpoint, got %v", err)
+	}
+	if err := second.Save(ctx, testState()); !errors.Is(err, ErrCheckpointContended) {
+		t.Errorf("expected the second run refused as contended, got %v", err)
 	}
 }
 
-// TestNewFileStore_ReportsUncreatableDirectory verifies a checkpoint directory that
-// cannot be created is reported at construction, rather than at the first save halfway
-// through a restore.
-func TestNewFileStore_ReportsUncreatableDirectory(t *testing.T) {
-	// A regular file occupies the directory's path, so it cannot be created.
-	blocker := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(blocker, []byte("x"), 0600); err != nil {
-		t.Fatalf("failed to occupy the directory path: %v", err)
+// TestS3Store_OverwritesOnlyTheVersionItLastWrote verifies successive saves by one run
+// succeed, each replacing the version the run itself wrote, while a save by a run
+// holding an older version is refused. This is what stops a run that fell behind
+// another from erasing the other's progress.
+func TestS3Store_OverwritesOnlyTheVersionItLastWrote(t *testing.T) {
+	client := &stubS3Client{objects: map[string][]byte{"checkpoint.json": []byte(`{}`)}}
+	owner, err := NewS3Store(client, "s3://my-bucket/checkpoint.json")
+	if err != nil {
+		t.Fatalf("NewS3Store failed: %v", err)
+	}
+	straggler, err := NewS3Store(client, "s3://my-bucket/checkpoint.json")
+	if err != nil {
+		t.Fatalf("NewS3Store failed: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := owner.Load(ctx); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if _, err := straggler.Load(ctx); err != nil {
+		t.Fatalf("Load failed: %v", err)
 	}
 
-	if _, err := NewFileStore("file://" + filepath.Join(blocker, "checkpoint.json")); err == nil {
-		t.Error("expected an uncreatable checkpoint directory to be reported")
+	for i := 0; i < 3; i++ {
+		if err := owner.Save(ctx, testState()); err != nil {
+			t.Fatalf("expected save %d by the owner to succeed, got %v", i+1, err)
+		}
 	}
+	if err := straggler.Save(ctx, testState()); !errors.Is(err, ErrCheckpointContended) {
+		t.Errorf("expected a save over another run's progress refused as contended, got %v", err)
+	}
+}
+
+// TestS3Store_ContentionIsNamedWithoutInvitingDeletion verifies the refusal tells the
+// operator not to delete the checkpoint. Deleting it is the instinctive response to a
+// precondition failure and the one that makes both runs write the export again.
+func TestS3Store_ContentionIsNamedWithoutInvitingDeletion(t *testing.T) {
+	client := &stubS3Client{objects: map[string][]byte{"checkpoint.json": []byte(`{}`)}}
+	store, err := NewS3Store(client, "s3://my-bucket/checkpoint.json")
+	if err != nil {
+		t.Fatalf("NewS3Store failed: %v", err)
+	}
+
+	err = store.Save(context.Background(), testState())
+	if err == nil || !strings.Contains(err.Error(), "do not delete") {
+		t.Errorf("expected the refusal to warn against deleting the checkpoint, got %v", err)
+	}
+}
+
+// TestMemoryStore_LoadDoesNotAliasItsState verifies editing what Load returned leaves
+// the store unchanged, so a caller cannot corrupt the checkpoint through a shared map.
+func TestMemoryStore_LoadDoesNotAliasItsState(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	if err := store.Save(ctx, testState()); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	loaded, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	loaded.Offsets["data-002.json.gz"] = 0
+	loaded.Completed[0] = "tampered"
+
+	again, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	assertState(t, again, testState())
 }
 
 // callerContextKey marks the context a test passed in, so a client stub can tell the
@@ -485,10 +414,28 @@ type callerContextKey struct{}
 // how a call made under a substituted context is told from one made under the caller's.
 type stubS3Client struct {
 	objects    map[string][]byte
+	etags      map[string]string // ETag per object; every write gets a new one
 	getErr     error
 	putErr     error
+	writes     int
 	detached   int
 	bodyClosed bool
+}
+
+// etag reports the current ETag of an object, minting one for objects seeded without.
+func (s *stubS3Client) etag(key string) string {
+	if s.etags == nil {
+		s.etags = map[string]string{}
+	}
+	if _, ok := s.etags[key]; !ok {
+		s.etags[key] = "seeded"
+	}
+	return s.etags[key]
+}
+
+// preconditionFailed is what S3 answers a conditional write whose condition did not hold.
+func preconditionFailed() error {
+	return &smithy.GenericAPIError{Code: "PreconditionFailed", Message: "At least one of the pre-conditions you specified did not hold"}
 }
 
 // trackedBody fails a read that arrives after Close, the way a real S3 response body
@@ -537,7 +484,9 @@ func (s *stubS3Client) GetObject(ctx context.Context, params *s3.GetObjectInput,
 	if !ok {
 		return nil, &types.NoSuchKey{}
 	}
-	return &s3.GetObjectOutput{Body: &trackedBody{reader: bytes.NewReader(data), store: s}}, nil
+	etag := s.etag(*params.Key)
+	s.bodyClosed = false
+	return &s3.GetObjectOutput{Body: &trackedBody{reader: bytes.NewReader(data), store: s}, ETag: &etag}, nil
 }
 
 func (s *stubS3Client) PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
@@ -548,12 +497,30 @@ func (s *stubS3Client) PutObject(ctx context.Context, params *s3.PutObjectInput,
 	if s.putErr != nil {
 		return nil, s.putErr
 	}
+	// The conditions are enforced the way S3 enforces them, or the guard against two
+	// runs sharing a checkpoint would ship untested.
+	_, exists := s.objects[*params.Key]
+	if params.IfNoneMatch != nil && *params.IfNoneMatch == "*" && exists {
+		return nil, preconditionFailed()
+	}
+	if params.IfMatch != nil && (!exists || *params.IfMatch != s.etag(*params.Key)) {
+		return nil, preconditionFailed()
+	}
 	data, err := io.ReadAll(params.Body)
 	if err != nil {
 		return nil, err
 	}
+	if s.objects == nil {
+		s.objects = map[string][]byte{}
+	}
 	s.objects[*params.Key] = data
-	return &s3.PutObjectOutput{}, nil
+	s.writes++
+	if s.etags == nil {
+		s.etags = map[string]string{}
+	}
+	etag := fmt.Sprintf("v%d", s.writes)
+	s.etags[*params.Key] = etag
+	return &s3.PutObjectOutput{ETag: &etag}, nil
 }
 
 func (s *stubS3Client) HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {

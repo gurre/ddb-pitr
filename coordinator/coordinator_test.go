@@ -643,6 +643,23 @@ func TestCoordinatorFailsOnWriteError(t *testing.T) {
 	}
 }
 
+// TestCoordinatorRejectsAManifestWithoutAnExportARN verifies an export that cannot be
+// identified is refused. The checkpoint is tied to an export by its ARN; without one,
+// progress recorded now would be accepted by a later run of any other export.
+func TestCoordinatorRejectsAManifestWithoutAnExportARN(t *testing.T) {
+	coord, _ := newTestCoordinator(t, testDeps{
+		loader: &mockLoader{summary: manifest.Summary{
+			S3Bucket:  "test-bucket",
+			DataFiles: []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		}},
+		lines: [][]byte{[]byte(`{"id":"1"}`)},
+	})
+
+	if err := runCoordinator(t, coord); err == nil {
+		t.Fatal("expected a manifest without an export ARN to be refused")
+	}
+}
+
 // TestCoordinatorFailsOnManifestError verifies an unreadable manifest fails before any
 // worker starts, rather than restoring an empty export.
 func TestCoordinatorFailsOnManifestError(t *testing.T) {
