@@ -43,9 +43,9 @@ func TestOperationTypeDetection(t *testing.T) {
 			wantType: OpPut,
 		},
 		{
-			name:    "Error: no image data",
-			input:   `{"Keys":{"PK":{"S":"1"}}}`,
-			wantErr: true,
+			name:     "Delete: only Keys present (new images only view)",
+			input:    `{"Keys":{"PK":{"S":"1"}}}`,
+			wantType: OpDelete,
 		},
 		{
 			name:    "Error: empty object",
@@ -426,7 +426,8 @@ func TestCorruptLineNamesWhatFailed(t *testing.T) {
 		{"unreadable Keys", `{"Keys":"not an object","NewImage":{}}`, "Keys"},
 		{"unreadable NewImage", `{"Keys":{},"NewImage":"not an object"}`, "NewImage"},
 		{"unreadable OldImage", `{"Keys":{},"OldImage":"not an object"}`, "OldImage"},
-		{"nothing to apply", `{"Keys":{"PK":{"S":"1"}}}`, "no image data"},
+		{"nothing to apply", `{"Metadata":{}}`, "no image data"},
+		{"delete without keys", `{"Keys":{},"OldImage":{"PK":{"S":"1"}}}`, "keys"},
 	}
 
 	for _, tt := range tests {
@@ -439,6 +440,61 @@ func TestCorruptLineNamesWhatFailed(t *testing.T) {
 				t.Errorf("error %q does not mention %q", err, tt.mention)
 			}
 		})
+	}
+}
+
+// TestKeysOnlyLineIsADelete verifies an incremental line carrying keys and no image
+// decodes as a delete of those keys. That is how an export taken with the new images
+// only view records a deleted item: there is no new image to give, and the old one is
+// not part of the view. Rejecting the line would leave every deleted item in the
+// restored table.
+func TestKeysOnlyLineIsADelete(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	op, err := decoder.Decode([]byte(`{"Metadata":{"WriteTimestampMicros":{"N":"1"}},"Keys":{"PK":{"S":"ITEM#1"},"SK":{"S":"META"}}}`))
+	if err != nil {
+		t.Fatalf("Decode failed: %v", err)
+	}
+	if op.Type != OpDelete {
+		t.Errorf("expected OpDelete, got %d", op.Type)
+	}
+	if pk, ok := op.Keys["PK"].(*types.AttributeValueMemberS); !ok || pk.Value != "ITEM#1" {
+		t.Errorf("expected the delete to carry the line's keys, got %v", op.Keys)
+	}
+}
+
+// TestDeleteWithoutKeysIsCorrupt verifies a delete that names nothing to delete is
+// rejected at the decoder. Sent on, it would reach DynamoDB as a delete with an empty
+// key and fail there after every retry, far from the line that caused it.
+func TestDeleteWithoutKeysIsCorrupt(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	for _, input := range []string{`{"Keys":{}}`, `{"Keys":{},"OldImage":{"PK":{"S":"1"}}}`} {
+		if _, err := decoder.Decode([]byte(input)); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("Decode(%s) = %v, want ErrCorrupt", input, err)
+		}
+	}
+}
+
+// TestOperationCarriesTheLineLength verifies every decoded operation records how long
+// the export line was. That length is what the restore reports as data read, so a
+// report's throughput is measured in bytes that were actually transferred rather than
+// estimated from attribute counts.
+func TestOperationCarriesTheLineLength(t *testing.T) {
+	decoder := NewJSONDecoder()
+
+	for _, line := range [][]byte{
+		[]byte(`{"Item":{"PK":{"S":"1"}}}`),
+		[]byte(`{"Keys":{"PK":{"S":"1"}}}`),
+		testData[0],
+	} {
+		op, err := decoder.Decode(line)
+		if err != nil {
+			t.Fatalf("Decode failed: %v", err)
+		}
+		if int(op.Bytes) != len(line) {
+			t.Errorf("Bytes = %d, want the line length %d", op.Bytes, len(line))
+		}
 	}
 }
 

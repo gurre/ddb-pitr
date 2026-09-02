@@ -9,23 +9,25 @@ import (
 	json "github.com/goccy/go-json"
 )
 
-// OperationType represents the type of DynamoDB operation as defined in section 4.5.
-// It determines how the operation should be applied to the target table.
-type OperationType int
+// OperationType says how an operation is applied to the target table.
+type OperationType uint8
 
 const (
 	OpPut    OperationType = iota // Insert or replace an item
 	OpDelete                      // Remove an item
-	OpUpdate                      // Modify an existing item
+	OpUpdate                      // Replace an item that existed before the export window
 )
 
-// Operation represents a DynamoDB operation as defined in section 4.5.
-// It contains all the data needed to perform the operation on the target table.
+// Operation is one record of an export, with everything needed to apply it to the
+// target table. An update carries the item's full new state in NewImage, since that is
+// what an incremental export records, so it is applied the same way a put is.
+// Fields are ordered largest-to-smallest for memory alignment.
 type Operation struct {
-	Type     OperationType                   // Type of operation (Put/Delete/Update)
 	Keys     map[string]types.AttributeValue // Primary key attributes
 	NewImage map[string]types.AttributeValue // New state of the item
 	OldImage map[string]types.AttributeValue // Previous state of the item
+	Bytes    int32                           // Length of the export line the operation was decoded from
+	Type     OperationType                   // Type of operation (Put/Delete/Update)
 }
 
 // ErrCorrupt is returned when a line cannot be parsed according to the format
@@ -47,13 +49,17 @@ func NewJSONDecoder() *JSONDecoder {
 	return &JSONDecoder{}
 }
 
-// Decode implements the decoding requirements from section 4.5.
-// It parses a JSON line into an Operation, handling all required fields
-// and determining the operation type based on the presence of NewImage/OldImage.
+// Decode parses one export line into an Operation and records the line's length on it.
 //
-// Supports two export formats:
-//   - FULL export: {"Item": {...}} - treated as OpPut
-//   - INCREMENTAL export: {"Keys": {...}, "NewImage": {...}, "OldImage": {...}}
+// A FULL export line is {"Item": {...}} and is a put. An INCREMENTAL export line
+// carries Keys and, depending on what happened to the item and which view the export
+// was taken with, images:
+//   - Keys + NewImage + OldImage: the item was updated (new and old images view)
+//   - Keys + NewImage: the item was inserted, or updated in a new images only export
+//   - Keys + OldImage: the item was deleted (new and old images view)
+//   - Keys alone: the item was deleted (new images only view)
+//
+// A delete must name what to delete, so one whose Keys are empty is corrupt.
 //
 // HOT PATH: This function processes every record from S3.
 // Profiling shows ~27% CPU time and ~99% memory allocation occurs here.
@@ -66,7 +72,7 @@ func (d *JSONDecoder) Decode(line []byte) (Operation, error) {
 		return Operation{}, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 
-	op := Operation{}
+	op := Operation{Bytes: int32(len(line))}
 
 	// Handle FULL export format: {"Item": {...}}
 	if itemRaw, ok := raw["Item"]; ok {
@@ -110,7 +116,10 @@ func (d *JSONDecoder) Decode(line []byte) (Operation, error) {
 		op.Type = OpUpdate
 	case op.NewImage != nil:
 		op.Type = OpPut
-	case op.OldImage != nil:
+	case op.OldImage != nil || op.Keys != nil:
+		if len(op.Keys) == 0 {
+			return Operation{}, fmt.Errorf("%w: delete names no keys", ErrCorrupt)
+		}
 		op.Type = OpDelete
 	default:
 		return Operation{}, fmt.Errorf("%w: no image data found", ErrCorrupt)
