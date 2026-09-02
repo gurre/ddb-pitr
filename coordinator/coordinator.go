@@ -9,11 +9,9 @@ import (
 	"fmt"
 	"net/url"
 	"os"
-	"os/signal"
 	"sort"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/gurre/ddb-pitr/checkpoint"
@@ -252,11 +250,6 @@ func NewCoordinator(
 // It sets up signal handling, loads manifests and checkpoints,
 // starts the worker pool, and coordinates the restore operation.
 func (c *Coordinator) Run(ctx context.Context) error {
-	// SIGTERM is what a container runtime sends to ask for a graceful stop; SIGKILL
-	// cannot be caught, so asking for it would only look like shutdown handling.
-	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer cancel()
-
 	// Parse S3 URI to validate it
 	u, err := url.Parse(c.cfg.ExportS3URI)
 	if err != nil {
@@ -304,9 +297,20 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 	c.progress = newProgress(summary.ExportARN, state)
 
-	// Set up worker pool
+	// The pool runs under its own cancellation so one worker's failure stops the rest.
+	// A file that cannot be restored ends the run at once, while the checkpoint makes
+	// resuming it cheap, rather than hours later with the failure buried in the log.
+	// The first failure is what gets reported; the others are its consequence.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	var firstFailure error
+	var failOnce sync.Once
+	fail := func(err error) {
+		failOnce.Do(func() { firstFailure = err })
+		cancelRun()
+	}
+
 	tasks := make(chan manifest.FileMeta)
-	results := make(chan error, c.cfg.MaxWorkers)
 	var wg sync.WaitGroup
 
 	// The reporter is stopped and waited for below rather than left to notice the run
@@ -325,8 +329,8 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		go func(workerID int) {
 			defer wg.Done()
 			c.initWorker(workerID)
-			if err := c.worker(ctx, workerID, tasks); err != nil {
-				results <- fmt.Errorf("worker %d failed: %w", workerID, err)
+			if err := c.worker(runCtx, workerID, tasks); err != nil {
+				fail(fmt.Errorf("worker %d failed: %w", workerID, err))
 			}
 		}(i)
 	}
@@ -338,7 +342,7 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}()
 
 	// Send tasks. Handing one to a pool that has already given up would block forever,
-	// so a pool that has exited ends dispatch and its errors are collected below.
+	// so a pool that has exited or been stopped ends dispatch.
 dispatch:
 	for _, file := range summary.DataFiles {
 		if _, done := c.progress.resume(file.Key); done {
@@ -349,26 +353,35 @@ dispatch:
 		case tasks <- file:
 		case <-workersDone:
 			break dispatch
-		case <-ctx.Done():
+		case <-runCtx.Done():
 			break dispatch
 		}
 	}
 	close(tasks)
 
 	<-workersDone
-	close(results)
 	stopReporting()
 	<-reporterDone
 
-	var errs []error
-	for err := range results {
-		errs = append(errs, err)
-	}
-	if len(errs) > 0 {
-		return fmt.Errorf("some workers failed: %w", errors.Join(errs...))
-	}
+	// Whatever the workers got through is saved once they have all stopped, however
+	// the run is ending. An interrupted run's last batches would otherwise be lost
+	// with the interval save they never reached. The caller's context may be the very
+	// thing that ended the run, so the save gets a fresh one bounded by the shutdown
+	// timeout, which is the budget an operator gave the run to stop cleanly.
+	saveCtx, cancelSave := context.WithTimeout(context.WithoutCancel(ctx), c.cfg.ShutdownTimeout)
+	defer cancelSave()
+	saveErr := c.saveProgress(saveCtx)
+
+	// An interruption or a failure is reported ahead of a failed final save: the save
+	// failing is a consequence the operator needs to know about, not the cause.
 	if err := ctx.Err(); err != nil {
-		return err
+		return shutdownError(err, saveErr)
+	}
+	if firstFailure != nil {
+		return shutdownError(firstFailure, saveErr)
+	}
+	if saveErr != nil {
+		return fmt.Errorf("failed to save final checkpoint: %w", saveErr)
 	}
 
 	// Generate and print report
@@ -406,7 +419,16 @@ func (c *Coordinator) skipCorrupt(key string, offset int64, err error) {
 	}
 }
 
-// initWorker initializes a worker's status tracking as required by section 5
+// shutdownError reports why the run stopped, noting a final save that failed with it
+// so the operator knows the checkpoint is behind what was written.
+func shutdownError(cause, saveErr error) error {
+	if saveErr != nil {
+		return fmt.Errorf("%w (and the final checkpoint could not be saved: %v)", cause, saveErr)
+	}
+	return cause
+}
+
+// initWorker initializes a worker's status tracking
 func (c *Coordinator) initWorker(id int) {
 	c.statusMu.Lock()
 	defer c.statusMu.Unlock()
@@ -514,17 +536,19 @@ func (c *Coordinator) snapshot(now time.Time) progressSnapshot {
 	return snap
 }
 
-// reportProgress implements the progress reporting requirements from section 5.
-// It periodically reports progress to stdout, overwriting the same line.
+// reportProgress prints the progress line once a second, overwriting the previous
+// one. A line shorter than its predecessor is padded so nothing of the old line shows.
 func (c *Coordinator) reportProgress(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	width := 0
 	for {
 		select {
 		case <-ticker.C:
-			// Print progress overwriting the same line
-			fmt.Printf("\r%s", c.snapshot(time.Now()))
+			line := c.snapshot(time.Now()).String()
+			fmt.Printf("\r%-*s", width, line)
+			width = len(line)
 
 		case <-ctx.Done():
 			// Print newline before exit so final output appears on new line
@@ -568,6 +592,11 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 	bucket := c.cfg.GetExportBucketName()
 
 	for file := range tasks {
+		// A file handed over as the run stops is surrendered rather than started, so
+		// stopping never means finishing whatever was in flight.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		c.updateWorkerStatus(id, func(s *WorkerStatus) {
 			s.CurrentFile = file.Key
 		})

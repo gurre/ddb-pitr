@@ -524,6 +524,87 @@ func TestCoordinatorReportsCancellationWhenInterruptedMidRetry(t *testing.T) {
 	}
 }
 
+// TestCoordinatorSavesProgressWhenInterrupted verifies a run stopped part-way through
+// a file leaves the checkpoint holding how far the writer got, with the file not marked
+// complete. This is the checkpoint's whole purpose: without a save at shutdown, every
+// batch since the last interval save is redone on resume, up to a hundred per worker.
+func TestCoordinatorSavesProgressWhenInterrupted(t *testing.T) {
+	ctx, cancel := context.WithCancel(callerContext())
+	defer cancel()
+
+	// The interrupt lands after the first batch is written.
+	writer := &mockWriter{afterWrite: cancel}
+	store := &mockStore{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:  []manifest.FileMeta{{Key: testFileKey, ItemCount: 3}},
+		lines:  resumeLines,
+		writer: writer,
+		store:  store,
+		configure: func(cfg *config.Config) {
+			cfg.BatchSize = 1
+		},
+	})
+
+	if err := coord.Run(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the run to report the interruption, got %v", err)
+	}
+
+	written := writer.writtenLines()
+	if len(written) == 0 {
+		t.Fatal("expected at least one batch written before the interrupt")
+	}
+	final := store.lastSaved()
+	if len(final.Completed) != 0 {
+		t.Errorf("expected the interrupted file not marked complete, got %v", final.Completed)
+	}
+	if want := lineOffsets(resumeLines)[len(written)-1]; final.Offsets[testFileKey] != want {
+		t.Errorf("expected the checkpoint at the last written line %d, got %v", want, final.Offsets)
+	}
+	// The caller's context is what ended the run, so the save cannot have used it.
+	if store.lastSaveCtx != nil {
+		t.Errorf("expected the final save made under a live context, got %v", store.lastSaveCtx)
+	}
+}
+
+// TestCoordinatorStopsTheOtherWorkersWhenOneFails verifies one worker's failure ends
+// the run rather than leaving the rest to work through the export. A file that cannot
+// be restored is known within seconds; the operator should hear then, not after the
+// other workers have spent hours on files that will be resumed anyway.
+func TestCoordinatorStopsTheOtherWorkersWhenOneFails(t *testing.T) {
+	// Worker A fails on file1 while worker B is held inside file2 until that failure
+	// has happened. Neither file3 nor file4 should be started.
+	released := make(chan struct{})
+	streamer := &mockStreamer{
+		lines:      resumeLines,
+		linesByKey: map[string][][]byte{testFileKey: {[]byte(`poison`)}},
+		waitFor:    map[string]chan struct{}{testFileKey2: released},
+	}
+	writer := &mockWriter{failOn: "poison", afterFailure: func() { close(released) }}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{
+			{Key: testFileKey, ItemCount: 1},
+			{Key: testFileKey2, ItemCount: 3},
+			{Key: "file3", ItemCount: 3},
+			{Key: "file4", ItemCount: 3},
+		},
+		streamer: streamer,
+		writer:   writer,
+		configure: func(cfg *config.Config) {
+			cfg.MaxWorkers = 2
+		},
+	})
+
+	err := runCoordinator(t, coord)
+	if err == nil || !strings.Contains(err.Error(), "poisoned batch") {
+		t.Fatalf("expected the run to report the failing worker's error, got %v", err)
+	}
+
+	keys := streamer.streamedKeys()
+	if len(keys) > 2 {
+		t.Errorf("expected no file started after the failure, got %v", keys)
+	}
+}
+
 // TestCoordinatorFailsWhenStreamKeepsFailing verifies a file that never streams ends the
 // restore with an error instead of being reported as a success with missing data.
 func TestCoordinatorFailsWhenStreamKeepsFailing(t *testing.T) {
@@ -1437,12 +1518,14 @@ type streamRequest struct {
 // the first attempt part-way through the file, which is what leaves a partial batch
 // buffered behind a retry.
 type mockStreamer struct {
-	lines     [][]byte
-	errs      []error
-	requests  []streamRequest
-	onAttempt func() // Runs at the start of every attempt; lets a test interrupt one
-	failAfter int    // Lines the first attempt delivers before failing; 0 disables
-	mu        sync.Mutex
+	lines      [][]byte
+	linesByKey map[string][][]byte      // Lines for particular files; others get lines
+	waitFor    map[string]chan struct{} // Files held back until the channel closes
+	errs       []error
+	requests   []streamRequest
+	onAttempt  func() // Runs at the start of every attempt; lets a test interrupt one
+	failAfter  int    // Lines the first attempt delivers before failing; 0 disables
+	mu         sync.Mutex
 }
 
 func (m *mockStreamer) Stream(ctx context.Context, bucket, key string, offset int64, fn func([]byte, int64) error) error {
@@ -1459,6 +1542,13 @@ func (m *mockStreamer) Stream(ctx context.Context, bucket, key string, offset in
 	if onAttempt != nil {
 		onAttempt()
 	}
+	if gate, ok := m.waitFor[key]; ok {
+		<-gate
+	}
+	lines := m.lines
+	if keyed, ok := m.linesByKey[key]; ok {
+		lines = keyed
+	}
 
 	if len(m.errs) > 0 {
 		err := m.errs[len(m.errs)-1]
@@ -1470,20 +1560,34 @@ func (m *mockStreamer) Stream(ctx context.Context, bucket, key string, offset in
 		}
 	}
 
-	limit := len(m.lines)
+	limit := len(lines)
 	if m.failAfter > 0 && attempt == 0 {
 		limit = m.failAfter
 	}
-	offsets := lineOffsets(m.lines)
+	offsets := lineOffsets(lines)
 	for i := 0; i < limit; i++ {
-		if err := fn(m.lines[i], offsets[i]); err != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := fn(lines[i], offsets[i]); err != nil {
 			return err
 		}
 	}
-	if limit < len(m.lines) {
+	if limit < len(lines) {
 		return errors.New("connection reset")
 	}
 	return nil
+}
+
+// streamedKeys reports the files streamed, in the order they were asked for.
+func (m *mockStreamer) streamedKeys() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	keys := make([]string, 0, len(m.requests))
+	for _, req := range m.requests {
+		keys = append(keys, req.key)
+	}
+	return keys
 }
 
 // lineOffsets reports the offset the streamer hands the callback for each line: its
@@ -1536,32 +1640,60 @@ func (m *mockWriter) writtenLines() []string {
 	return lines
 }
 
+// mockWriter records what it is handed. It fails every batch when err is set, or only
+// the batch carrying the failOn line, and then runs afterFailure once, which is how a
+// test releases another worker held back until the failure has happened. Like the real
+// writer it refuses a batch once the context has ended, and it can end the context
+// itself after a batch through afterWrite, standing in for an interrupt.
 type mockWriter struct {
-	err     error
-	batches [][]itemimage.Operation
-	mu      sync.Mutex
+	err          error
+	failOn       string
+	afterFailure func()
+	afterWrite   func()
+	batches      [][]itemimage.Operation
+	failed       sync.Once
+	mu           sync.Mutex
 }
 
 func (m *mockWriter) WriteBatch(ctx context.Context, ops []itemimage.Operation) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if m.err != nil {
 		return m.err
 	}
 	if err := requireCallerContext(ctx); err != nil {
 		return err
 	}
+	if m.failOn != "" {
+		for _, op := range ops {
+			if op.NewImage["line"].(*types.AttributeValueMemberS).Value == m.failOn {
+				m.failed.Do(func() {
+					if m.afterFailure != nil {
+						m.afterFailure()
+					}
+				})
+				return errors.New("poisoned batch")
+			}
+		}
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	// The coordinator reuses its batch slice, so keep a copy.
 	m.batches = append(m.batches, append([]itemimage.Operation(nil), ops...))
+	m.mu.Unlock()
+	if m.afterWrite != nil {
+		m.afterWrite()
+	}
 	return nil
 }
 
 type mockStore struct {
-	loadErr error
-	saveErr error
-	state   checkpoint.State
-	saved   []checkpoint.State
-	mu      sync.Mutex
+	loadErr     error
+	saveErr     error
+	lastSaveCtx error // What the context reported on the most recent save
+	state       checkpoint.State
+	saved       []checkpoint.State
+	mu          sync.Mutex
 }
 
 func (m *mockStore) Load(ctx context.Context) (checkpoint.State, error) {
@@ -1587,6 +1719,7 @@ func (m *mockStore) Save(ctx context.Context, s checkpoint.State) error {
 	defer m.mu.Unlock()
 	m.state = s
 	m.saved = append(m.saved, s)
+	m.lastSaveCtx = ctx.Err()
 	return nil
 }
 

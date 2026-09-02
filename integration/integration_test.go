@@ -654,3 +654,62 @@ func TestStreamerReadsEachByteOfTheObjectOnce(t *testing.T) {
 		t.Errorf("ranges %v stop at byte %d of %d", ranges[1:], next, size)
 	}
 }
+
+// failingWriter passes batches through to another writer until failFrom, counting from
+// one, and refuses every batch from then on. It stands in for a restore whose table
+// stopped accepting writes part-way through.
+type failingWriter struct {
+	inner    writer.Writer
+	failFrom int
+	calls    int
+}
+
+func (f *failingWriter) WriteBatch(ctx context.Context, ops []itemimage.Operation) error {
+	f.calls++
+	if f.calls >= f.failFrom {
+		return fmt.Errorf("table unavailable")
+	}
+	return f.inner.WriteBatch(ctx, ops)
+}
+
+// TestInterruptedRestoreResumesWithoutRewritingItems verifies a restore that fails
+// part-way through a gzipped file, then runs again against the same checkpoint,
+// writes every item exactly once across the two runs. No offset appears in this test:
+// it proves the checkpoint the first run saved at shutdown is one the second run can
+// resume from, through the real streamer and the real decoder.
+func TestInterruptedRestoreResumesWithoutRewritingItems(t *testing.T) {
+	mockS3 := loadFixtures(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cfg := restoreConfig(t, fullExportURI)
+	mockDynamoDB := mock.NewDynamoDBClient()
+	store := checkpoint.NewMemoryStore()
+	realWriter := writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, cfg.BatchSize, writer.Callbacks{},
+		writer.WithBackoff(writer.NewExponentialBackoff(time.Millisecond, time.Millisecond)))
+	run := func(w writer.Writer) error {
+		return coordinator.NewCoordinator(cfg, manifest.NewS3Loader(mockS3), s3streamer.NewS3Streamer(mockS3),
+			itemimage.NewJSONDecoder(), w, store, nil, metrics.NewMetrics(),
+			coordinator.WithStreamBackoff(writer.NewExponentialBackoff(time.Millisecond, time.Millisecond)),
+		).Run(ctx)
+	}
+
+	// The first run writes one item and then loses its table.
+	if err := run(&failingWriter{inner: realWriter, failFrom: 2}); err == nil {
+		t.Fatal("expected the first run to fail")
+	}
+	if got := len(mockDynamoDB.GetBatchWrites()); got != 1 {
+		t.Fatalf("expected the first run to have written 1 batch, got %d", got)
+	}
+
+	if err := run(realWriter); err != nil {
+		t.Fatalf("expected the second run to finish, got %v", err)
+	}
+
+	if got := len(mockDynamoDB.GetTableContents(cfg.TableName)); got != 3 {
+		t.Errorf("expected all 3 items in the table, got %d", got)
+	}
+	if got := len(mockDynamoDB.GetBatchWrites()); got != 3 {
+		t.Errorf("expected 3 batch writes across both runs, one per item, got %d", got)
+	}
+}

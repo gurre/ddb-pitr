@@ -9,6 +9,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -123,9 +125,16 @@ func run() error {
 	rawS3Client := s3.NewFromConfig(awsCfg)
 	s3Client := aws.NewS3Client(rawS3Client)
 
-	// Create context with graceful shutdown handling
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// Ctrl-C or a container runtime's SIGTERM asks the restore to stop: workers finish
+	// their current batch and the checkpoint is saved. The handler is removed as soon
+	// as it fires, so a second signal takes the default disposition and kills the
+	// process, for the operator who cannot wait for a clean stop.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		stop()
+	}()
 
 	// Create metrics for tracking progress
 	m := metrics.NewMetrics()
