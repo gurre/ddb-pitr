@@ -82,7 +82,7 @@ func TestMetricsCountersConcurrency(t *testing.T) {
 				m.RecordRetry()
 				m.RecordLost(1)
 				m.RecordBytes(100)
-				m.RecordProcessed()
+				m.RecordProcessed(1)
 			}
 		}()
 	}
@@ -107,7 +107,7 @@ func TestMetricsCountersConcurrency(t *testing.T) {
 // with correctly formatted duration field.
 func TestReportMarshalJSON(t *testing.T) {
 	m := NewMetrics()
-	m.RecordProcessed()
+	m.RecordProcessed(1)
 	m.RecordThrottle()
 	m.RecordRetry()
 	m.RecordLost(5)
@@ -193,7 +193,7 @@ func TestReportCarriesTheWholeRun(t *testing.T) {
 	m := NewMetrics()
 	// Every value is distinct so a field taking another's value cannot look correct.
 	for i := 0; i < 7; i++ {
-		m.RecordProcessed()
+		m.RecordProcessed(1)
 	}
 	for i := 0; i < 3; i++ {
 		m.RecordBatchWritten()
@@ -308,7 +308,7 @@ func TestReportDividesWorkByElapsedTime(t *testing.T) {
 	m.startTime = time.Now().Add(-2 * time.Second)
 
 	for i := 0; i < 100; i++ {
-		m.RecordProcessed()
+		m.RecordProcessed(1)
 	}
 	m.RecordBytes(2048)
 
@@ -348,8 +348,8 @@ func TestMetricsHappyPath(t *testing.T) {
 	m := NewMetrics()
 
 	// Record some metrics
-	m.RecordProcessed()
-	m.RecordProcessed()
+	m.RecordProcessed(1)
+	m.RecordProcessed(1)
 	m.RecordBatchWritten()
 	m.RecordError()
 	m.RecordCorrupt()

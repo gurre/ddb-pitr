@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -33,10 +34,21 @@ var (
 	date    = "unknown"
 )
 
+// exitSkipped is the status of a restore that ran to the end but skipped lines it could
+// not decode. It is told apart from exitFailed because the remedy differs: the table
+// holds everything else, and running again changes nothing.
+const (
+	exitFailed  = 1
+	exitSkipped = 3
+)
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		if errors.Is(err, coordinator.ErrRecordsSkipped) {
+			os.Exit(exitSkipped)
+		}
+		os.Exit(exitFailed)
 	}
 }
 

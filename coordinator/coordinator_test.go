@@ -614,27 +614,64 @@ func TestCoordinatorRejectsNonS3Export(t *testing.T) {
 	}
 }
 
-// TestCoordinatorCountsCorruptLines verifies a line the decoder rejects as corrupt is
-// counted and skipped rather than failing the restore, since one bad line in a
-// multi-terabyte export should not cost the whole run.
-func TestCoordinatorCountsCorruptLines(t *testing.T) {
+// TestCoordinatorSkipsCorruptLinesAndReportsThemAtTheEnd verifies a line the decoder
+// rejects is counted and skipped, the rest of the export is restored, and the run then
+// ends with an error naming the count. One bad line in a multi-terabyte export must
+// not cost the whole run, but a restore that dropped records cannot claim success.
+// The decoder is the real one, because the sentinel it returns is wrapped, and a check
+// that only matched the bare sentinel would take every corrupt line for a fatal error.
+func TestCoordinatorSkipsCorruptLinesAndReportsThemAtTheEnd(t *testing.T) {
 	writer := &mockWriter{}
+	streamer := &mockStreamer{lines: [][]byte{
+		[]byte(`{"Item":{"pk":{"S":"1"}}}`), []byte(`{not json`), []byte(`{"Item":{"pk":{"S":"2"}}}`),
+	}}
 	coord, m := newTestCoordinator(t, testDeps{
-		files:   []manifest.FileMeta{{Key: testFileKey, ItemCount: 2}},
-		lines:   [][]byte{[]byte(`corrupt`), []byte(`{"id":"1"}`)},
-		decoder: &mockDecoder{corruptLines: map[string]bool{"corrupt": true}},
-		writer:  writer,
+		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 3}},
+		streamer: streamer,
+		decoder:  itemimage.NewJSONDecoder(),
+		writer:   writer,
 	})
 
-	if err := runCoordinator(t, coord); err != nil {
-		t.Fatalf("coordinator failed: %v", err)
+	err := runCoordinator(t, coord)
+	if !errors.Is(err, ErrRecordsSkipped) || !strings.Contains(err.Error(), "1 lines") {
+		t.Fatalf("expected the run to end with the skipped count, got %v", err)
 	}
 
-	if len(writer.batches) != 1 || len(writer.batches[0]) != 1 {
-		t.Errorf("expected only the decodable line written, got %v", writer.batches)
+	var written int
+	for _, batch := range writer.batches {
+		written += len(batch)
+	}
+	if written != 2 {
+		t.Errorf("expected the two decodable lines written, got %d", written)
+	}
+	if len(streamer.requests) != 1 {
+		t.Errorf("expected the file streamed once, got %d attempts", len(streamer.requests))
 	}
 	if got := m.GenerateReport().CorruptCount; got != 1 {
 		t.Errorf("expected 1 corrupt line recorded, got %d", got)
+	}
+}
+
+// TestCoordinatorStillUploadsTheReportWhenLinesWereSkipped verifies the report reaches
+// S3 before the run fails for skipped lines. The report is the only durable record of
+// which lines were skipped; failing before it is written would destroy the evidence.
+func TestCoordinatorStillUploadsTheReportWhenLinesWereSkipped(t *testing.T) {
+	uploader := &mockUploader{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		lines:    [][]byte{[]byte(`corrupt`)},
+		decoder:  &mockDecoder{corruptLines: map[string]bool{"corrupt": true}},
+		uploader: uploader,
+		configure: func(cfg *config.Config) {
+			cfg.ReportS3URI = testReportURI
+		},
+	})
+
+	if err := runCoordinator(t, coord); !errors.Is(err, ErrRecordsSkipped) {
+		t.Fatalf("expected the run to report skipped records, got %v", err)
+	}
+	if len(uploader.uris) != 1 {
+		t.Errorf("expected the report uploaded despite the skipped line, got %v", uploader.uris)
 	}
 }
 
@@ -1227,7 +1264,7 @@ func TestInitWorkerRecordsTheWorkersOwnID(t *testing.T) {
 type testDeps struct {
 	loader    *mockLoader
 	streamer  *mockStreamer
-	decoder   *mockDecoder
+	decoder   itemimage.Decoder
 	writer    *mockWriter
 	store     *mockStore
 	uploader  *mockUploader
@@ -1464,14 +1501,15 @@ func lineOffsets(lines [][]byte) []int64 {
 
 // mockDecoder turns every line into a put operation carrying the line itself, so a
 // test can tell from what reached the writer which lines were written. Lines it is
-// told to treat as corrupt fail with the corrupt sentinel.
+// told to treat as corrupt fail the way the real decoder fails: with the sentinel
+// wrapped, never bare.
 type mockDecoder struct {
 	corruptLines map[string]bool
 }
 
 func (m *mockDecoder) Decode(line []byte) (itemimage.Operation, error) {
 	if m.corruptLines[string(line)] {
-		return itemimage.Operation{}, itemimage.ErrCorrupt
+		return itemimage.Operation{}, fmt.Errorf("%w: unreadable", itemimage.ErrCorrupt)
 	}
 	return itemimage.Operation{
 		Type: itemimage.OpPut,

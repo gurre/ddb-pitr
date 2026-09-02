@@ -23,7 +23,7 @@ type Metrics struct {
 	startTime      time.Time     // When the restore operation started
 
 	// Counters as specified in section 6 (all use atomic operations)
-	recordsProcessed int64 // Total number of records processed
+	recordsProcessed int64 // Items written to the table
 	batchesWritten   int64 // Number of batches written to DynamoDB
 	errors           int64 // Number of errors encountered
 	corruptCount     int64 // Number of corrupt records found
@@ -40,9 +40,9 @@ func NewMetrics() *Metrics {
 	}
 }
 
-// RecordProcessed increments the processed records counter
-func (m *Metrics) RecordProcessed() {
-	atomic.AddInt64(&m.recordsProcessed, 1)
+// RecordProcessed adds n to the count of items written to the table
+func (m *Metrics) RecordProcessed(n int64) {
+	atomic.AddInt64(&m.recordsProcessed, n)
 }
 
 // RecordBatchWritten increments the written batches counter
@@ -58,6 +58,11 @@ func (m *Metrics) RecordError() {
 // RecordCorrupt increments the corrupt records counter
 func (m *Metrics) RecordCorrupt() {
 	atomic.AddInt64(&m.corruptCount, 1)
+}
+
+// CorruptCount returns how many export lines could not be decoded and were skipped
+func (m *Metrics) CorruptCount() int64 {
+	return atomic.LoadInt64(&m.corruptCount)
 }
 
 // RecordThrottle increments the throttle events counter
@@ -121,7 +126,7 @@ type Report struct {
 	// ProcessingTime is the time workers spent writing, summed across the pool. Held
 	// against Duration it separates a restore limited by DynamoDB from one limited by S3.
 	ProcessingTime time.Duration `json:"processingTime"`
-	TotalItems     int64         `json:"totalItems"`     // Total number of items processed
+	TotalItems     int64         `json:"totalItems"`     // Items written to the table; skipped lines are not counted
 	BatchesWritten int64         `json:"batchesWritten"` // Number of batches written to DynamoDB
 	CorruptCount   int64         `json:"corruptCount"`   // Number of corrupt items found
 	Throttles      int64         `json:"throttles"`      // Number of throttle events

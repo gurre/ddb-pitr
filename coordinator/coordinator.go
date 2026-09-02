@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -73,6 +74,11 @@ type Backoffer interface {
 // record an unfinished file as complete, which a resume would then skip.
 var errBackoffStopped = errors.New("coordinator: backoff stopped before the file was finished")
 
+// ErrRecordsSkipped is returned when the restore ran to the end but skipped lines it
+// could not decode. The table holds everything else the export contained, so this is
+// told apart from a restore that did not finish; the two call for different responses.
+var ErrRecordsSkipped = errors.New("restore finished but skipped records")
+
 // stopRetrying reports why the retry loop is giving up. It never returns nil.
 func stopRetrying(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
@@ -121,10 +127,11 @@ type Coordinator struct {
 	statusMu     sync.RWMutex
 
 	// Progress tracking for percentage and throughput calculation
-	totalExpectedItems int64     // Total items expected from manifest
-	lastReportTime     time.Time // Last progress report timestamp
-	lastReportItems    int64     // Items count at last report
-	lastReportBytes    int64     // Bytes count at last report
+	corruptNamed       atomic.Int64 // Skipped lines named on stderr so far
+	totalExpectedItems int64        // Total items expected from manifest
+	lastReportTime     time.Time    // Last progress report timestamp
+	lastReportItems    int64        // Items count at last report
+	lastReportBytes    int64        // Bytes count at last report
 }
 
 // progress is the single owner of how far the restore has got. Workers report into
@@ -376,7 +383,27 @@ dispatch:
 		fmt.Printf("Report uploaded to %s\n", c.cfg.ReportS3URI)
 	}
 
+	// Judged after the report is out, so the record of what was skipped survives the
+	// failure it causes.
+	if skipped := c.metrics.CorruptCount(); skipped > 0 {
+		return fmt.Errorf("%w: %d lines could not be decoded; running again will not change that",
+			ErrRecordsSkipped, skipped)
+	}
+
 	return nil
+}
+
+// corruptLinesNamed caps how many skipped lines are named on stderr. The count in the
+// report covers the rest; naming every one of a badly damaged file would drown the log.
+const corruptLinesNamed = 20
+
+// skipCorrupt records a line that could not be decoded and names the first few, with
+// the file and offset an operator needs to find them.
+func (c *Coordinator) skipCorrupt(key string, offset int64, err error) {
+	c.metrics.RecordCorrupt()
+	if c.corruptNamed.Add(1) <= corruptLinesNamed {
+		fmt.Fprintf(os.Stderr, "skipping %s at offset %d: %v\n", key, offset, err)
+	}
 }
 
 // initWorker initializes a worker's status tracking as required by section 5
@@ -590,8 +617,8 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 
 				// Decode is the main CPU/memory bottleneck (~27% CPU, ~99% memory)
 				op, err := c.parser.Decode(line)
-				if err == itemimage.ErrCorrupt {
-					c.metrics.RecordCorrupt()
+				if errors.Is(err, itemimage.ErrCorrupt) {
+					c.skipCorrupt(file.Key, byteOffset, err)
 					return nil
 				}
 				if err != nil {
@@ -600,7 +627,6 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 				}
 
 				batch = append(batch, op)
-				c.metrics.RecordProcessed()
 
 				if len(batch) >= c.cfg.BatchSize {
 					batchesSinceCheckpoint++
@@ -660,6 +686,7 @@ func (c *Coordinator) writeBatch(ctx context.Context, id int, batch []itemimage.
 	}
 	c.metrics.RecordProcessingTime(time.Since(start))
 	c.metrics.RecordBatchWritten()
+	c.metrics.RecordProcessed(int64(len(batch)))
 
 	c.updateWorkerStatus(id, func(s *WorkerStatus) {
 		s.ItemsWritten += int64(len(batch))
