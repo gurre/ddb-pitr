@@ -23,35 +23,41 @@ func TestDiscardWritesNothing(t *testing.T) {
 	if err := w.WriteBatch(context.Background(), ops); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
-	if err := w.Flush(context.Background()); err != nil {
-		t.Errorf("Flush failed: %v", err)
-	}
 }
 
 // TestDiscardReportsWhatARestoreWouldWrite verifies a dry run still measures the export,
-// since a report saying nothing was written would make the run pointless. Sizes match
-// the real writer's estimates so the two runs are comparable.
+// since a report saying nothing was written would make the run pointless. It reports
+// the same items and bytes the real writer reports for the same operations, so the
+// dry run's figures are the restore's figures.
 func TestDiscardReportsWhatARestoreWouldWrite(t *testing.T) {
-	var gotItems, gotBytes int
-	w := NewDiscard(Callbacks{OnWrite: func(items, bytes int) { gotItems, gotBytes = items, bytes }})
-
-	// Two single-attribute puts at 150 each, plus a delete carrying two keys at 200.
 	ops := append(putOps(2), itemimage.Operation{
-		Type: itemimage.OpDelete,
+		Type:  itemimage.OpDelete,
+		Bytes: 70,
 		Keys: map[string]types.AttributeValue{
 			"PK": &types.AttributeValueMemberS{Value: "USER#9"},
-			"SK": &types.AttributeValueMemberS{Value: "PROFILE"},
 		},
 	})
-	if err := w.WriteBatch(context.Background(), ops); err != nil {
+
+	var dryItems, dryBytes int
+	dry := NewDiscard(Callbacks{OnWrite: func(items, bytes int) { dryItems, dryBytes = items, bytes }})
+	if err := dry.WriteBatch(context.Background(), ops); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
 
-	if gotItems != 3 {
-		t.Errorf("expected 3 items reported, got %d", gotItems)
+	var realItems, realBytes int
+	real := NewDynamoDBWriter(&scriptedClient{}, "test-table", 25,
+		Callbacks{OnWrite: func(items, bytes int) { realItems, realBytes = items, bytes }},
+		WithBackoff(&instantBackoff{}))
+	if err := real.WriteBatch(context.Background(), ops); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
 	}
-	if gotBytes != 500 {
-		t.Errorf("expected 500 bytes reported, got %d", gotBytes)
+
+	if dryItems != realItems || dryBytes != realBytes {
+		t.Errorf("dry run reported %d items and %d bytes, the restore %d and %d",
+			dryItems, dryBytes, realItems, realBytes)
+	}
+	if dryItems != 3 || dryBytes == 0 {
+		t.Errorf("expected 3 items and their bytes reported, got %d and %d", dryItems, dryBytes)
 	}
 }
 
@@ -82,8 +88,5 @@ func TestDiscardHonoursCancellation(t *testing.T) {
 
 	if err := w.WriteBatch(ctx, putOps(1)); !errors.Is(err, context.Canceled) {
 		t.Errorf("WriteBatch = %v, want context.Canceled", err)
-	}
-	if err := w.Flush(ctx); !errors.Is(err, context.Canceled) {
-		t.Errorf("Flush = %v, want context.Canceled", err)
 	}
 }

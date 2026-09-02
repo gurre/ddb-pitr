@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.43.1
 	github.com/aws/aws-sdk-go-v2/service/iam v1.31.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.80.2
+	github.com/aws/smithy-go v1.22.2
 	github.com/goccy/go-json v0.10.5
 	github.com/gurre/s3streamer v0.2.0
 )
@@ -30,6 +31,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.22.7 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.26.7 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.30.7 // indirect
-	github.com/aws/smithy-go v1.22.2 // indirect
 	github.com/dsnet/compress v0.0.1 // indirect
 )

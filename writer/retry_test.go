@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go"
 	"github.com/gurre/ddb-pitr/itemimage"
 )
 
@@ -303,36 +303,15 @@ func TestBatchWriteStopsRetryingWhenContextEnds(t *testing.T) {
 // The wait is only cut short when the restore is stopping, and the batch has not been
 // written. Returning no error would let the coordinator count those items as written and
 // checkpoint past them, so an interrupted restore would resume having silently skipped a
-// batch. Both retry loops carry the same hazard, so both are covered.
+// batch.
 func TestWriteSurrendersBatchWhenBackoffStops(t *testing.T) {
-	tests := []struct {
-		name   string
-		client *scriptedClient
-		ops    []itemimage.Operation
-	}{
-		{
-			name:   "batched put",
-			client: &scriptedClient{batchErrs: []error{throttle()}},
-			ops:    putOps(1),
-		},
-		{
-			name:   "individual update",
-			client: &scriptedClient{updateErrs: []error{throttle()}},
-			ops:    []itemimage.Operation{updateOp()},
-		},
-	}
+	client := &scriptedClient{batchErrs: []error{throttle()}}
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&stoppedBackoff{}))
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			w := NewDynamoDBWriter(tt.client, "test-table", 25, Callbacks{},
-				WithBackoff(&stoppedBackoff{}))
-
-			// The context is live, so a caller reading the context's own error would
-			// find nothing wrong and report the batch as written.
-			if err := w.WriteBatch(context.Background(), tt.ops); err == nil {
-				t.Error("expected a surrendered batch to be reported as an error")
-			}
-		})
+	// The context is live, so a caller reading the context's own error would find
+	// nothing wrong and report the batch as written.
+	if err := w.WriteBatch(context.Background(), putOps(1)); err == nil {
+		t.Error("expected a surrendered batch to be reported as an error")
 	}
 }
 
@@ -371,42 +350,44 @@ func TestBatchWriteSplitsOversizedInput(t *testing.T) {
 	}
 }
 
-// TestBatchWriteContinuesPastUpdateOnlyBatch verifies a batch made up entirely of
-// updates does not end the split loop: updates go out individually and the batches
-// after them must still be written.
-func TestBatchWriteContinuesPastUpdateOnlyBatch(t *testing.T) {
+// TestUpdateOnlyBatchIsOneBatchWrite verifies a batch made up entirely of updates is
+// written as one BatchWriteItem, the same as puts, rather than as one call per item.
+func TestUpdateOnlyBatchIsOneBatchWrite(t *testing.T) {
 	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 1, Callbacks{}, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
 
-	ops := []itemimage.Operation{updateOp(), putOps(1)[0]}
+	ops := []itemimage.Operation{updateOp(), updateOp(), updateOp()}
 	if err := w.WriteBatch(context.Background(), ops); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
 
-	if len(client.batchRequests) != 1 {
-		t.Errorf("expected the put following the update to be written, got %d batches", len(client.batchRequests))
+	if len(client.batchRequests) != 1 || len(client.batchRequests[0]["test-table"]) != 3 {
+		t.Errorf("expected one batch of 3 puts, got %v", client.batchRequests)
 	}
 }
 
-// TestBatchWriteReportsEstimatedBytes verifies the byte count handed to the metrics
-// callback accumulates over the batch and covers deletes as well as puts, since it
-// drives the reported throughput.
-func TestBatchWriteReportsEstimatedBytes(t *testing.T) {
+// TestReportedBytesAreTheLineLengthsRead verifies the byte count handed to the metrics
+// callback is the sum of the export lines behind the batch, deletes included. That is
+// what the report calls data read, so it has to be bytes that were actually
+// transferred rather than a figure derived from attribute counts.
+func TestReportedBytesAreTheLineLengthsRead(t *testing.T) {
 	client := &scriptedClient{}
 	var gotItems, gotBytes int
 	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{
 		OnWrite: func(items, bytes int) { gotItems, gotBytes = items, bytes },
 	}, WithBackoff(&instantBackoff{}))
 
-	// Items are estimated at 100 bytes base plus 50 per attribute: two single-attribute
-	// puts at 150 each, plus a delete carrying two key attributes at 200.
 	ops := append(putOps(2), itemimage.Operation{
-		Type: itemimage.OpDelete,
+		Type:  itemimage.OpDelete,
+		Bytes: 70,
 		Keys: map[string]types.AttributeValue{
 			"PK": &types.AttributeValueMemberS{Value: "USER#9"},
-			"SK": &types.AttributeValueMemberS{Value: "PROFILE"},
 		},
 	})
+	want := 0
+	for _, op := range ops {
+		want += int(op.Bytes)
+	}
 	if err := w.WriteBatch(context.Background(), ops); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}
@@ -414,245 +395,85 @@ func TestBatchWriteReportsEstimatedBytes(t *testing.T) {
 	if gotItems != 3 {
 		t.Errorf("expected 3 items reported, got %d", gotItems)
 	}
-	if gotBytes != 500 {
-		t.Errorf("expected 500 bytes reported, got %d", gotBytes)
+	if gotBytes != want {
+		t.Errorf("expected %d bytes reported, got %d", want, gotBytes)
 	}
 }
 
-// TestUpdateItemBuildsSetAndRemoveExpression pins the update expression for an item
-// that gains one attribute and loses another. Attributes present in the old image but
-// absent from the new one must be removed, or a restored item keeps stale data.
-func TestUpdateItemBuildsSetAndRemoveExpression(t *testing.T) {
-	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
-
-	op := itemimage.Operation{
-		Type: itemimage.OpUpdate,
-		Keys: map[string]types.AttributeValue{
-			"PK": &types.AttributeValueMemberS{Value: "USER#1"},
-		},
-		// "name" appears in both images and must be set, not removed.
-		OldImage: map[string]types.AttributeValue{
-			"PK":   &types.AttributeValueMemberS{Value: "USER#1"},
-			"name": &types.AttributeValueMemberS{Value: "Janet"},
-			"city": &types.AttributeValueMemberS{Value: "Stockholm"},
-		},
-		NewImage: map[string]types.AttributeValue{
-			"PK":   &types.AttributeValueMemberS{Value: "USER#1"},
-			"name": &types.AttributeValueMemberS{Value: "Jane"},
-		},
+// TestUnprocessedRoundsDoNotConsumeTheTransientBudget verifies a batch that DynamoDB
+// keeps accepting in part, then fails once for a passing reason, is still written. A
+// hot partition routinely hands items back unprocessed several rounds running; if
+// those rounds counted against the bounded budget, the first passing fault after them
+// would declare the batch lost.
+func TestUnprocessedRoundsDoNotConsumeTheTransientBudget(t *testing.T) {
+	leftover := []types.WriteRequest{{PutRequest: &types.PutRequest{
+		Item: map[string]types.AttributeValue{"PK": &types.AttributeValueMemberS{Value: "USER#1"}},
+	}}}
+	partial := &dynamodb.BatchWriteItemOutput{UnprocessedItems: map[string][]types.WriteRequest{"test-table": leftover}}
+	client := &scriptedClient{
+		batchOutputs: []*dynamodb.BatchWriteItemOutput{partial, partial, partial, partial, partial, nil, nil},
+		batchErrs:    []error{nil, nil, nil, nil, nil, &types.InternalServerError{Message: ptr("500")}, nil},
 	}
-
-	if err := w.WriteBatch(context.Background(), []itemimage.Operation{op}); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
-	}
-
-	if len(client.updateCalls) != 1 {
-		t.Fatalf("expected 1 UpdateItem call, got %d", len(client.updateCalls))
-	}
-	input := client.updateCalls[0]
-
-	const want = "SET #name = :name REMOVE #city"
-	if got := *input.UpdateExpression; got != want {
-		t.Errorf("update expression = %q, want %q", got, want)
-	}
-	if got := input.ExpressionAttributeNames; got["#name"] != "name" || got["#city"] != "city" || len(got) != 2 {
-		t.Errorf("attribute names = %v, want #name and #city", got)
-	}
-	if got := input.ExpressionAttributeValues; len(got) != 1 || got[":name"] == nil {
-		t.Errorf("attribute values = %v, want only :name", got)
-	}
-}
-
-// TestUpdateItemOmitsValuesWhenOnlyRemoving verifies a removal-only update carries no
-// expression values. DynamoDB rejects an UpdateItem that declares values it never uses.
-func TestUpdateItemOmitsValuesWhenOnlyRemoving(t *testing.T) {
-	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
-
-	op := itemimage.Operation{
-		Type: itemimage.OpUpdate,
-		Keys: map[string]types.AttributeValue{
-			"PK": &types.AttributeValueMemberS{Value: "USER#1"},
-		},
-		OldImage: map[string]types.AttributeValue{
-			"PK":      &types.AttributeValueMemberS{Value: "USER#1"},
-			"city":    &types.AttributeValueMemberS{Value: "Stockholm"},
-			"zip":     &types.AttributeValueMemberS{Value: "11122"},
-			"street":  &types.AttributeValueMemberS{Value: "Kungsgatan"},
-			"country": &types.AttributeValueMemberS{Value: "SE"},
-			"phone":   &types.AttributeValueMemberS{Value: "+46"},
-			"email":   &types.AttributeValueMemberS{Value: "jane@example.com"},
-		},
-		NewImage: map[string]types.AttributeValue{
-			"PK": &types.AttributeValueMemberS{Value: "USER#1"},
-		},
-	}
-
-	if err := w.WriteBatch(context.Background(), []itemimage.Operation{op}); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
-	}
-
-	if len(client.updateCalls) != 1 {
-		t.Fatalf("expected 1 UpdateItem call, got %d", len(client.updateCalls))
-	}
-	input := client.updateCalls[0]
-
-	if input.ExpressionAttributeValues != nil {
-		t.Errorf("expected no expression values, got %v", input.ExpressionAttributeValues)
-	}
-	// Every non-key attribute of the old image must be removed, whatever order the
-	// image is walked in; a partial REMOVE leaves stale attributes on the item.
-	expr := *input.UpdateExpression
-	if !strings.HasPrefix(expr, "REMOVE ") {
-		t.Fatalf("update expression = %q, want a REMOVE clause", expr)
-	}
-	for _, attr := range []string{"#city", "#zip", "#street", "#country", "#phone", "#email"} {
-		if !strings.Contains(expr, attr) {
-			t.Errorf("update expression %q is missing %s", expr, attr)
-		}
-	}
-	if got := len(input.ExpressionAttributeNames); got != 6 {
-		t.Errorf("expected 6 attribute names, got %d", got)
-	}
-}
-
-// TestUpdateItemSkipsKeyOnlyChange verifies an update that touches nothing but the key
-// attributes is not sent. DynamoDB rejects an UpdateItem with an empty expression.
-func TestUpdateItemSkipsKeyOnlyChange(t *testing.T) {
-	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
-
-	op := itemimage.Operation{
-		Type: itemimage.OpUpdate,
-		Keys: map[string]types.AttributeValue{
-			"PK": &types.AttributeValueMemberS{Value: "USER#1"},
-		},
-		OldImage: map[string]types.AttributeValue{
-			"PK": &types.AttributeValueMemberS{Value: "USER#1"},
-		},
-		NewImage: map[string]types.AttributeValue{
-			"PK": &types.AttributeValueMemberS{Value: "USER#1"},
-		},
-	}
-
-	if err := w.WriteBatch(context.Background(), []itemimage.Operation{op}); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
-	}
-
-	if len(client.updateCalls) != 0 {
-		t.Errorf("expected no UpdateItem call, got %d", len(client.updateCalls))
-	}
-}
-
-// TestUpdateItemOnlySetsChangedAttributes verifies an update whose old image holds
-// nothing but the key produces a bare SET, with no dangling REMOVE clause.
-func TestUpdateItemOnlySetsChangedAttributes(t *testing.T) {
-	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
-
-	if err := w.WriteBatch(context.Background(), []itemimage.Operation{updateOp()}); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
-	}
-
-	if len(client.updateCalls) != 1 {
-		t.Fatalf("expected 1 UpdateItem call, got %d", len(client.updateCalls))
-	}
-	const want = "SET #name = :name"
-	if got := *client.updateCalls[0].UpdateExpression; got != want {
-		t.Errorf("update expression = %q, want %q", got, want)
-	}
-}
-
-// TestUpdateItemRetriesThrottlingUntilSuccess verifies individual updates survive
-// throttling the same way batches do; updates bypass BatchWriteItem entirely.
-func TestUpdateItemRetriesThrottlingUntilSuccess(t *testing.T) {
-	client := &scriptedClient{updateErrs: []error{throttle(), throttle(), nil}}
-	counts := &callbackCounts{}
-	backoff := &instantBackoff{}
-	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(backoff))
-
-	if err := w.WriteBatch(context.Background(), []itemimage.Operation{updateOp()}); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
-	}
-
-	if counts.throttles != 2 {
-		t.Errorf("expected 2 throttle reports, got %d", counts.throttles)
-	}
-	if counts.retries != 1 {
-		t.Errorf("expected 1 retry report, got %d", counts.retries)
-	}
-	if len(backoff.attempts) != 2 || backoff.attempts[0] != 0 || backoff.attempts[1] != 1 {
-		t.Errorf("expected waits for attempts 0 and 1, got %v", backoff.attempts)
-	}
-}
-
-// TestUpdateItemRetriesTransientErrorWithoutCountingThrottle verifies a non-throttling
-// update failure is retried and counted as a retry rather than as capacity pressure.
-func TestUpdateItemRetriesTransientErrorWithoutCountingThrottle(t *testing.T) {
-	client := &scriptedClient{updateErrs: []error{errors.New("connection reset"), nil}}
-	counts := &callbackCounts{}
-	backoff := &instantBackoff{}
-	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(backoff))
-
-	if err := w.WriteBatch(context.Background(), []itemimage.Operation{updateOp()}); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
-	}
-
-	if counts.retries != 1 {
-		t.Errorf("expected 1 retry report, got %d", counts.retries)
-	}
-	if counts.throttles != 0 {
-		t.Errorf("expected no throttle report, got %d", counts.throttles)
-	}
-	if len(backoff.attempts) != 1 || backoff.attempts[0] != 0 {
-		t.Errorf("expected a single wait for attempt 0, got %v", backoff.attempts)
-	}
-}
-
-// TestUpdateItemSurrendersAfterMaxRetries verifies a persistently failing update is
-// given the same bounded budget as a batch and is then reported as a single lost item.
-func TestUpdateItemSurrendersAfterMaxRetries(t *testing.T) {
-	client := &scriptedClient{updateErrs: []error{errors.New("internal server error")}}
 	counts := &callbackCounts{}
 	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}))
 
-	if err := w.WriteBatch(context.Background(), []itemimage.Operation{updateOp()}); err == nil {
-		t.Fatal("expected an error after the retry budget is spent")
+	if err := w.WriteBatch(context.Background(), putOps(3)); err != nil {
+		t.Fatalf("expected the batch written after the fault, got %v", err)
 	}
 
-	if len(client.updateCalls) != 6 {
-		t.Errorf("expected 6 UpdateItem attempts, got %d", len(client.updateCalls))
+	if counts.lost != 0 {
+		t.Errorf("expected no items lost, got %d", counts.lost)
 	}
-	if counts.lost != 1 {
-		t.Errorf("expected 1 lost item, got %d", counts.lost)
+	if counts.throttles != 5 {
+		t.Errorf("expected the 5 partial rounds counted as throttles, got %d", counts.throttles)
+	}
+	if counts.writes != 3 {
+		t.Errorf("expected the 3 items reported written, got %d", counts.writes)
 	}
 }
 
-// TestUpdateItemReportsOneItemWritten verifies an update reports exactly one item to
-// the metrics callback, since updates are not batched, and reports no retry when it
-// is accepted on the first attempt.
-func TestUpdateItemReportsOneItemWritten(t *testing.T) {
-	client := &scriptedClient{}
+// TestThrottlingExceptionIsRetriedUntilSuccess verifies the throttle an on-demand
+// table raises, which the SDK does not type, is retried for as long as it takes rather
+// than against the bounded budget. Six of them in a row is more than the budget allows
+// a passing fault, and a throttling storm on a large restore lasts far longer.
+func TestThrottlingExceptionIsRetriedUntilSuccess(t *testing.T) {
+	throttled := &smithy.GenericAPIError{Code: "ThrottlingException", Message: "Rate exceeded"}
+	client := &scriptedClient{batchErrs: []error{throttled, throttled, throttled, throttled, throttled, throttled, nil}}
 	counts := &callbackCounts{}
-	var gotItems, gotBytes int
-	callbacks := counts.callbacks()
-	callbacks.OnWrite = func(items, bytes int) { gotItems, gotBytes = items, bytes }
-	w := NewDynamoDBWriter(client, "test-table", 25, callbacks, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}))
 
-	if err := w.WriteBatch(context.Background(), []itemimage.Operation{updateOp()}); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
+	if err := w.WriteBatch(context.Background(), putOps(1)); err != nil {
+		t.Fatalf("expected the batch written once throttling eased, got %v", err)
 	}
 
-	if gotItems != 1 {
-		t.Errorf("expected 1 item reported, got %d", gotItems)
+	if counts.throttles != 6 {
+		t.Errorf("expected 6 throttle reports, got %d", counts.throttles)
 	}
-	// The new image carries the key plus one attribute: 100 base + 2*50.
-	if gotBytes != 200 {
-		t.Errorf("expected 200 bytes reported, got %d", gotBytes)
+	if counts.lost != 0 {
+		t.Errorf("expected no items lost, got %d", counts.lost)
 	}
-	if counts.retries != 0 {
-		t.Errorf("expected no retry reported, got %d", counts.retries)
+}
+
+// TestLostCountIsWhatRemainedUnwritten verifies a batch given up after part of it was
+// accepted reports only the leftover as lost. Reporting the original batch size would
+// overstate the loss, and the lost count is what an operator uses to judge the restore.
+func TestLostCountIsWhatRemainedUnwritten(t *testing.T) {
+	leftover := []types.WriteRequest{{PutRequest: &types.PutRequest{
+		Item: map[string]types.AttributeValue{"PK": &types.AttributeValueMemberS{Value: "USER#1"}},
+	}}}
+	client := &scriptedClient{
+		batchOutputs: []*dynamodb.BatchWriteItemOutput{{UnprocessedItems: map[string][]types.WriteRequest{"test-table": leftover}}},
+		batchErrs:    []error{nil, errors.New("validation failed")},
+	}
+	counts := &callbackCounts{}
+	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}))
+
+	if err := w.WriteBatch(context.Background(), putOps(3)); err == nil {
+		t.Fatal("expected the batch given up")
+	}
+
+	if counts.lost != 1 {
+		t.Errorf("expected only the 1 unwritten item reported lost, got %d", counts.lost)
 	}
 }
 
@@ -661,7 +482,8 @@ func putOps(n int) []itemimage.Operation {
 	ops := make([]itemimage.Operation, 0, n)
 	for i := 0; i < n; i++ {
 		ops = append(ops, itemimage.Operation{
-			Type: itemimage.OpPut,
+			Type:  itemimage.OpPut,
+			Bytes: int32(40 + i),
 			NewImage: map[string]types.AttributeValue{
 				"PK": &types.AttributeValueMemberS{Value: "USER#" + string(rune('A'+i))},
 			},
@@ -673,7 +495,8 @@ func putOps(n int) []itemimage.Operation {
 // updateOp builds an update that sets one non-key attribute.
 func updateOp() itemimage.Operation {
 	return itemimage.Operation{
-		Type: itemimage.OpUpdate,
+		Type:  itemimage.OpUpdate,
+		Bytes: 60,
 		Keys: map[string]types.AttributeValue{
 			"PK": &types.AttributeValueMemberS{Value: "USER#1"},
 		},
@@ -749,9 +572,7 @@ func (b *contextRecordingBackoff) Wait(ctx context.Context, attempt int) bool {
 type scriptedClient struct {
 	batchOutputs  []*dynamodb.BatchWriteItemOutput
 	batchErrs     []error
-	updateErrs    []error
 	batchRequests []map[string][]types.WriteRequest
-	updateCalls   []*dynamodb.UpdateItemInput
 	detached      int // Calls that arrived without the caller's context
 }
 
@@ -778,17 +599,6 @@ func (c *scriptedClient) BatchWriteItem(ctx context.Context, params *dynamodb.Ba
 		return out, nil
 	}
 	return &dynamodb.BatchWriteItemOutput{}, nil
-}
-
-func (c *scriptedClient) UpdateItem(ctx context.Context, params *dynamodb.UpdateItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
-	c.noteContext(ctx)
-	call := len(c.updateCalls)
-	c.updateCalls = append(c.updateCalls, params)
-
-	if err := scriptedAt(c.updateErrs, call); err != nil {
-		return nil, err
-	}
-	return &dynamodb.UpdateItemOutput{}, nil
 }
 
 // scriptedAt returns the entry for the given call, repeating the last one once the

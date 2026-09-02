@@ -38,8 +38,8 @@ func TestNewMetricsCounters(t *testing.T) {
 	// Record bytes written
 	m.RecordBytes(1024)
 	m.RecordBytes(2048)
-	if got := m.BytesWritten(); got != 3072 {
-		t.Errorf("BytesWritten() = %d, want 3072", got)
+	if got := m.BytesRead(); got != 3072 {
+		t.Errorf("BytesRead() = %d, want 3072", got)
 	}
 
 	// Record errors
@@ -59,8 +59,8 @@ func TestNewMetricsCounters(t *testing.T) {
 	if report.LostItems != 15 {
 		t.Errorf("report.LostItems = %d, want 15", report.LostItems)
 	}
-	if report.BytesWritten != 3072 {
-		t.Errorf("report.BytesWritten = %d, want 3072", report.BytesWritten)
+	if report.BytesRead != 3072 {
+		t.Errorf("report.BytesRead = %d, want 3072", report.BytesRead)
 	}
 }
 
@@ -98,8 +98,8 @@ func TestMetricsCountersConcurrency(t *testing.T) {
 	if got := m.LostItems(); got != expected {
 		t.Errorf("LostItems() = %d, want %d", got, expected)
 	}
-	if got := m.BytesWritten(); got != expected*100 {
-		t.Errorf("BytesWritten() = %d, want %d", got, expected*100)
+	if got := m.BytesRead(); got != expected*100 {
+		t.Errorf("BytesRead() = %d, want %d", got, expected*100)
 	}
 }
 
@@ -150,8 +150,8 @@ func TestReportMarshalJSON(t *testing.T) {
 	if _, ok := parsed["lostItems"]; !ok {
 		t.Error("missing lostItems field")
 	}
-	if _, ok := parsed["bytesWritten"]; !ok {
-		t.Error("missing bytesWritten field")
+	if _, ok := parsed["bytesRead"]; !ok {
+		t.Error("missing bytesRead field")
 	}
 }
 
@@ -233,7 +233,7 @@ func TestReportCarriesTheWholeRun(t *testing.T) {
 		{"Throttles", report.Throttles, 2},
 		{"Retries", report.Retries, 4},
 		{"LostItems", report.LostItems, 6},
-		{"BytesWritten", report.BytesWritten, 8},
+		{"BytesRead", report.BytesRead, 8},
 	} {
 		if tt.got != tt.want {
 			t.Errorf("report.%s = %d, want %d", tt.name, tt.got, tt.want)
@@ -264,7 +264,7 @@ func TestReportStringLabelsEveryCount(t *testing.T) {
 		"Total items: 11 in 22 batches\n" +
 		"Corrupt items: 33\n" +
 		"Throughput: 44.00 items/sec (0.00 MB/s)\n" +
-		"Data written: 0.00 MB\n" +
+		"Data read: 0.00 MB\n" +
 		"Throttles: 55 | Retries: 66 | Lost: 77"
 	if got := report.String(); got != want {
 		t.Errorf("report string =\n%s\nwant\n%s", got, want)
@@ -327,16 +327,16 @@ func TestReportDividesWorkByElapsedTime(t *testing.T) {
 // since the byte counters are meaningless to read at restore scale.
 func TestReportStringConvertsBytesToMegabytes(t *testing.T) {
 	report := Report{
-		BytesWritten: 1000 * 1024 * 1024,
-		ByteRate:     500 * 1024 * 1024,
-		TotalItems:   7,
+		BytesRead:  1000 * 1024 * 1024,
+		ByteRate:   500 * 1024 * 1024,
+		TotalItems: 7,
 	}
 
 	str := report.String()
 
 	// The full field is matched, since a substring would also be found inside a much
 	// larger wrong number.
-	if !strings.Contains(str, "Data written: 1000.00 MB\n") {
+	if !strings.Contains(str, "Data read: 1000.00 MB\n") {
 		t.Errorf("expected 1000.00 MB written in:\n%s", str)
 	}
 	if !strings.Contains(str, "(500.00 MB/s)") {

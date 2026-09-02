@@ -364,11 +364,6 @@ dispatch:
 		return err
 	}
 
-	// Flush any remaining items
-	if err := c.writer.Flush(ctx); err != nil {
-		return fmt.Errorf("failed to flush writer: %w", err)
-	}
-
 	// Generate and print report
 	report := c.metrics.GenerateReport()
 	fmt.Println(report)
@@ -458,7 +453,7 @@ func (c *Coordinator) snapshot(now time.Time) progressSnapshot {
 	}
 	c.statusMu.RUnlock()
 
-	bytesWritten := c.metrics.BytesWritten()
+	bytesRead := c.metrics.BytesRead()
 
 	snap := progressSnapshot{
 		TotalBatches:  totalBatches,
@@ -471,7 +466,7 @@ func (c *Coordinator) snapshot(now time.Time) progressSnapshot {
 
 	if elapsed := now.Sub(c.lastReportTime).Seconds(); elapsed > 0 {
 		itemsDelta := totalItems - c.lastReportItems
-		bytesDelta := bytesWritten - c.lastReportBytes
+		bytesDelta := bytesRead - c.lastReportBytes
 		snap.ItemsPerSec = float64(itemsDelta) / elapsed
 		snap.MBPerSec = float64(bytesDelta) / bytesPerMB / elapsed
 	}
@@ -487,7 +482,7 @@ func (c *Coordinator) snapshot(now time.Time) progressSnapshot {
 
 	c.lastReportTime = now
 	c.lastReportItems = totalItems
-	c.lastReportBytes = bytesWritten
+	c.lastReportBytes = bytesRead
 
 	return snap
 }

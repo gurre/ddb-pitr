@@ -30,7 +30,7 @@ type Metrics struct {
 	throttles        int64 // Number of throttle events (ProvisionedThroughputExceeded)
 	retries          int64 // Number of successful retries after transient failures
 	lostItems        int64 // Number of items that failed permanently
-	bytesWritten     int64 // Total bytes written to DynamoDB
+	bytesRead        int64 // Export bytes read behind the items written
 }
 
 // NewMetrics creates a new Metrics instance with initialized counters
@@ -77,7 +77,7 @@ func (m *Metrics) RecordLost(n int64) {
 
 // RecordBytes adds to the bytes written counter
 func (m *Metrics) RecordBytes(n int64) {
-	atomic.AddInt64(&m.bytesWritten, n)
+	atomic.AddInt64(&m.bytesRead, n)
 }
 
 // Throttles returns the current throttle count
@@ -95,9 +95,9 @@ func (m *Metrics) LostItems() int64 {
 	return atomic.LoadInt64(&m.lostItems)
 }
 
-// BytesWritten returns the current bytes written count
-func (m *Metrics) BytesWritten() int64 {
-	return atomic.LoadInt64(&m.bytesWritten)
+// BytesRead returns the export bytes read behind every item written so far
+func (m *Metrics) BytesRead() int64 {
+	return atomic.LoadInt64(&m.bytesRead)
 }
 
 // Errors returns the current error count
@@ -127,7 +127,7 @@ type Report struct {
 	Throttles      int64         `json:"throttles"`      // Number of throttle events
 	Retries        int64         `json:"retries"`        // Number of successful retries
 	LostItems      int64         `json:"lostItems"`      // Number of items that failed permanently
-	BytesWritten   int64         `json:"bytesWritten"`   // Total bytes written
+	BytesRead      int64         `json:"bytesRead"`      // Export bytes read behind the items written
 	Throughput     float64       `json:"throughput"`     // Items processed per second
 	ByteRate       float64       `json:"byteRate"`       // Bytes per second
 }
@@ -139,7 +139,7 @@ func (m *Metrics) GenerateReport() Report {
 	duration := endTime.Sub(m.startTime)
 
 	totalItems := atomic.LoadInt64(&m.recordsProcessed)
-	bytesWritten := atomic.LoadInt64(&m.bytesWritten)
+	bytesRead := atomic.LoadInt64(&m.bytesRead)
 
 	m.mu.RLock()
 	processingTime := m.processingTime
@@ -149,7 +149,7 @@ func (m *Metrics) GenerateReport() Report {
 	var throughput, byteRate float64
 	if duration > 0 {
 		throughput = float64(totalItems) / duration.Seconds()
-		byteRate = float64(bytesWritten) / duration.Seconds()
+		byteRate = float64(bytesRead) / duration.Seconds()
 	}
 
 	return Report{
@@ -163,7 +163,7 @@ func (m *Metrics) GenerateReport() Report {
 		Throttles:      atomic.LoadInt64(&m.throttles),
 		Retries:        atomic.LoadInt64(&m.retries),
 		LostItems:      atomic.LoadInt64(&m.lostItems),
-		BytesWritten:   bytesWritten,
+		BytesRead:      bytesRead,
 		Throughput:     throughput,
 		ByteRate:       byteRate,
 	}
@@ -187,7 +187,7 @@ func (r Report) MarshalJSON() ([]byte, error) {
 // String returns a human-readable string representation of the report
 // as specified in section 6 for console output.
 func (r Report) String() string {
-	mbWritten := float64(r.BytesWritten) / (1024 * 1024)
+	mbWritten := float64(r.BytesRead) / (1024 * 1024)
 	mbPerSec := r.ByteRate / (1024 * 1024)
 
 	return fmt.Sprintf(
@@ -195,7 +195,7 @@ func (r Report) String() string {
 			"Total items: %d in %d batches\n"+
 			"Corrupt items: %d\n"+
 			"Throughput: %.2f items/sec (%.2f MB/s)\n"+
-			"Data written: %.2f MB\n"+
+			"Data read: %.2f MB\n"+
 			"Throttles: %d | Retries: %d | Lost: %d",
 		r.Duration,
 		r.TotalItems,

@@ -1,5 +1,5 @@
-// Package writer implements the DynamoDB writing functionality as specified in section 4.6
-// of the design specification. It handles writing batches of operations to DynamoDB.
+// Package writer applies decoded export operations to a DynamoDB table in batches,
+// surviving throttling and transient failures with paced retries.
 package writer
 
 import (
@@ -7,20 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/smithy-go"
 	"github.com/gurre/ddb-pitr/aws"
 	"github.com/gurre/ddb-pitr/itemimage"
 )
 
-// Writer interface as defined in section 4.6 of the spec.
-// Implementations must handle writing batches of operations to DynamoDB.
+// Writer applies batches of operations to the target table. A batch that returns
+// without error was written in full; nothing is held back for a later call.
 type Writer interface {
 	WriteBatch(ctx context.Context, ops []itemimage.Operation) error
-	Flush(ctx context.Context) error
 }
 
 // Callbacks allows the writer to report metrics without coupling to a specific metrics implementation.
@@ -28,8 +27,8 @@ type Writer interface {
 type Callbacks struct {
 	OnThrottle func()                 // Called on throttle event
 	OnRetry    func()                 // Called on successful retry after transient failure
-	OnLost     func(count int)        // Called when items fail permanently after max retries
-	OnWrite    func(items, bytes int) // Called on successful write with item count and byte size
+	OnLost     func(count int)        // Called with the items still unwritten when a batch is given up
+	OnWrite    func(items, bytes int) // Called on successful write with item count and the export bytes behind them
 }
 
 // Backoffer paces the wait between retry attempts.
@@ -66,8 +65,8 @@ func WithBackoff(b Backoffer) Option {
 	}
 }
 
-// DynamoDBWriter implements the Writer interface using AWS DynamoDB as specified in section 4.6.
-// It handles batching operations and retrying with exponential backoff.
+// DynamoDBWriter implements Writer with BatchWriteItem, retrying throttled batches for
+// as long as the context lives and other failures a bounded number of times.
 // Fields are ordered largest-to-smallest for memory alignment.
 type DynamoDBWriter struct {
 	callbacks Callbacks
@@ -79,6 +78,11 @@ type DynamoDBWriter struct {
 
 // maxBatchSize is DynamoDB's hard limit on the number of requests BatchWriteItem accepts.
 const maxBatchSize = 25
+
+// maxTransientAttempts bounds how often a batch is retried after a failure that is not
+// throttling. Throttling is retried for as long as the context lives, since capacity
+// refills; anything else is given this many further attempts and then given up.
+const maxTransientAttempts = 5
 
 // NewDynamoDBWriter creates a new DynamoDBWriter instance with the specified batch size and callbacks.
 // The batch size must be within DynamoDB's limits: a non-positive one leaves the split
@@ -106,32 +110,25 @@ func NewDynamoDBWriter(client aws.DynamoDBClient, tableName string, batchSize in
 	return w
 }
 
-// isThrottlingError returns true if the error is a DynamoDB throughput throttling error.
-// These errors indicate temporary capacity constraints and should trigger backoff and retry.
-//
-// DynamoDB throttles in four scenarios:
-//  1. Key range throughput exceeded - hot partition, affects both provisioned and on-demand
-//  2. Provisioned throughput exceeded - RCU/WCU exhausted in provisioned mode
-//  3. Account-level service quotas exceeded - per-table limits in on-demand mode
-//  4. On-demand maximum throughput exceeded - configured cost control limits
-//
-// All scenarios return ProvisionedThroughputExceededException or RequestLimitExceeded.
-// These are recoverable by waiting - capacity refills over time.
+// isThrottlingError reports whether DynamoDB refused the request for want of capacity,
+// which waiting will fix. Provisioned tables raise ProvisionedThroughputExceededException
+// and account-level limits RequestLimitExceeded, both of which the SDK types. On-demand
+// tables raise ThrottlingException, which the SDK does not type and which arrives as a
+// generic API error carrying that code.
 func isThrottlingError(err error) bool {
 	var throughputErr *types.ProvisionedThroughputExceededException
 	var requestLimitErr *types.RequestLimitExceeded
-	return errors.As(err, &throughputErr) || errors.As(err, &requestLimitErr)
-}
-
-// estimateItemSize returns an approximate byte size for a DynamoDB item.
-// Uses a simple heuristic: 100 bytes base + 50 bytes per attribute.
-// This avoids expensive serialization while providing reasonable estimates.
-func estimateItemSize(item map[string]types.AttributeValue) int {
-	if item == nil {
-		return 0
+	if errors.As(err, &throughputErr) || errors.As(err, &requestLimitErr) {
+		return true
 	}
-	// Base overhead + estimated bytes per attribute
-	return 100 + len(item)*50
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		switch apiErr.ErrorCode() {
+		case "ThrottlingException", "RequestThrottled", "ThrottledException":
+			return true
+		}
+	}
+	return false
 }
 
 // ExponentialBackoff doubles the wait after every attempt up to Max, then adds
@@ -202,25 +199,21 @@ func shiftLimit(base, max time.Duration) int {
 	return limit
 }
 
-// WriteBatch implements the batch writing requirements from section 4.6.
-// It splits operations into batches of size w.batchSize and writes them to DynamoDB.
-// Handles Put and Delete operations via BatchWriteItem, and Update operations via UpdateItem.
+// WriteBatch splits the operations into batches of at most batchSize and writes each
+// with BatchWriteItem. Puts and updates both replace the whole item with its new
+// image: an export's new image is the item's complete state, so replacing is exactly
+// what applying the change means, and it needs no per-attribute expression that an
+// attribute name could break. Deletes remove the item by key.
 //
 // HOT PATH: Called for every batch of decoded items.
 // Profiling shows ~13% CPU time with most overhead in:
 //   - BatchWriteItem API calls (network latency)
 //   - Retry backoff sleeps for throttling
-//
-// Performance notes:
-//   - Batch size of 25 (DynamoDB max) minimizes API calls
-//   - Put/Delete operations are batched; Update operations are individual API calls
-//   - Exponential backoff handles DynamoDB throttling
 func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operation) error {
 	if len(ops) == 0 {
 		return nil
 	}
 
-	// Split into batches of size w.batchSize
 	for i := 0; i < len(ops); i += w.batchSize {
 		end := i + w.batchSize
 		if end > len(ops) {
@@ -228,239 +221,95 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 		}
 		batch := ops[i:end]
 
-		// Convert operations to DynamoDB requests and estimate byte size
 		requests := make([]types.WriteRequest, 0, len(batch))
 		batchBytes := 0
 		for _, op := range batch {
 			switch op.Type {
-			case itemimage.OpPut:
+			case itemimage.OpPut, itemimage.OpUpdate:
 				requests = append(requests, types.WriteRequest{
-					PutRequest: &types.PutRequest{
-						Item: op.NewImage,
-					},
+					PutRequest: &types.PutRequest{Item: op.NewImage},
 				})
-				batchBytes += estimateItemSize(op.NewImage)
 			case itemimage.OpDelete:
 				requests = append(requests, types.WriteRequest{
-					DeleteRequest: &types.DeleteRequest{
-						Key: op.Keys,
-					},
+					DeleteRequest: &types.DeleteRequest{Key: op.Keys},
 				})
-				// Deletes have minimal size (just keys)
-				batchBytes += estimateItemSize(op.Keys)
-			case itemimage.OpUpdate:
-				// For updates, we need to use UpdateItem
-				// This is handled separately since it can't be batched
-				if err := w.updateItem(ctx, op); err != nil {
-					return fmt.Errorf("failed to update item: %w", err)
-				}
 			}
+			batchBytes += int(op.Bytes)
 		}
 
-		if len(requests) == 0 {
-			continue
-		}
-
-		// Write the batch
-		input := &dynamodb.BatchWriteItemInput{
-			RequestItems: map[string][]types.WriteRequest{
-				w.tableName: requests,
-			},
-		}
-
-		// Track items in current batch for callbacks
-		itemsInBatch := len(requests)
-
-		// Retry with exponential backoff.
-		// Throttling errors retry indefinitely until context is cancelled.
-		// Other errors fail after maxRetries attempts.
-		const maxRetries = 5
-		attempt := 0
-		hadRetry := false
-		for {
-			output, err := w.client.BatchWriteItem(ctx, input)
-			if err != nil {
-				if isThrottlingError(err) {
-					// Throttling: wait and retry indefinitely
-					if w.callbacks.OnThrottle != nil {
-						w.callbacks.OnThrottle()
-					}
-					if !w.backoff.Wait(ctx, attempt) {
-						return stopRetrying(ctx)
-					}
-					attempt++
-					hadRetry = true
-					continue
-				}
-				// Non-throttling error: retry up to maxRetries
-				if attempt < maxRetries {
-					if !w.backoff.Wait(ctx, attempt) {
-						return stopRetrying(ctx)
-					}
-					attempt++
-					hadRetry = true
-					continue
-				}
-				// Permanent failure - record lost items
-				if w.callbacks.OnLost != nil {
-					w.callbacks.OnLost(itemsInBatch)
-				}
-				return fmt.Errorf("failed to write batch after %d retries: %w", maxRetries, err)
-			}
-
-			// Handle unprocessed items (indicates throttling)
-			if len(output.UnprocessedItems) > 0 {
-				if w.callbacks.OnThrottle != nil {
-					w.callbacks.OnThrottle()
-				}
-				input.RequestItems = output.UnprocessedItems
-				if !w.backoff.Wait(ctx, attempt) {
-					return stopRetrying(ctx)
-				}
-				attempt++
-				hadRetry = true
-				continue
-			}
-
-			// Success - record retry if we had one
-			if hadRetry && w.callbacks.OnRetry != nil {
-				w.callbacks.OnRetry()
-			}
-			// Record successful write
-			if w.callbacks.OnWrite != nil {
-				w.callbacks.OnWrite(itemsInBatch, batchBytes)
-			}
-			break
+		if err := w.writeRequests(ctx, requests, batchBytes); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-// Flush implements the flush requirements from section 4.6.
-// Since we write immediately, this is a no-op.
-func (w *DynamoDBWriter) Flush(ctx context.Context) error {
-	// No-op since we write immediately
-	return nil
-}
-
-// updateItem is a helper function that handles individual UpdateItem operations
-// as required by section 4.6 for operations that can't be batched.
-// It uses SET for new/modified attributes and REMOVE for deleted attributes.
-func (w *DynamoDBWriter) updateItem(ctx context.Context, op itemimage.Operation) error {
-	// Build update expression and attribute maps
-	// Preallocate with estimated capacity based on typical item size
-	setExpr := make([]string, 0, len(op.NewImage))
-	removeExpr := make([]string, 0, len(op.OldImage))
-	values := make(map[string]types.AttributeValue, len(op.NewImage))
-	names := make(map[string]string, len(op.NewImage)+len(op.OldImage))
-
-	// Track which attributes are being modified (exist in NewImage)
-	modifiedAttrs := make(map[string]bool, len(op.NewImage))
-
-	// Process NEW image for SET operations
-	for k, v := range op.NewImage {
-		// Skip if this is a key attribute (exists in Keys)
-		if _, isKey := op.Keys[k]; isKey {
-			continue
-		}
-		setExpr = append(setExpr, fmt.Sprintf("#%s = :%s", k, k))
-		values[":"+k] = v
-		names["#"+k] = k
-		modifiedAttrs[k] = true
+// writeRequests sends one batch and keeps resending whatever DynamoDB did not accept.
+//
+// Two things can send it round again, and they are budgeted apart. Throttling, whether
+// as an error or as items handed back unprocessed, is retried for as long as the
+// context lives: capacity refills, and giving up would lose items to a condition that
+// waiting cures. Any other failure is retried maxTransientAttempts times and then the
+// batch is given up, so a poisoned batch cannot stall the restore. Counting both
+// against one budget would let a hot partition's partial acceptances spend the
+// transient budget, and a single passing fault would then lose the batch.
+func (w *DynamoDBWriter) writeRequests(ctx context.Context, requests []types.WriteRequest, batchBytes int) error {
+	items := len(requests)
+	input := &dynamodb.BatchWriteItemInput{
+		RequestItems: map[string][]types.WriteRequest{w.tableName: requests},
 	}
 
-	// Process OLD image for REMOVE operations
-	// Attributes that exist in OldImage but not in NewImage should be removed
-	for k := range op.OldImage {
-		// Skip if this is a key attribute (exists in Keys)
-		if _, isKey := op.Keys[k]; isKey {
-			continue
-		}
-		if !modifiedAttrs[k] {
-			// Attribute exists in OLD but not in NEW - remove it
-			removeExpr = append(removeExpr, fmt.Sprintf("#%s", k))
-			names["#"+k] = k
-		}
-	}
-
-	if len(setExpr) == 0 && len(removeExpr) == 0 {
-		return nil // No changes to make
-	}
-
-	// Build the final update expression combining SET and REMOVE clauses
-	var updateExpr string
-	if len(setExpr) > 0 {
-		updateExpr = "SET " + strings.Join(setExpr, ", ")
-	}
-	if len(removeExpr) > 0 {
-		if updateExpr != "" {
-			updateExpr += " "
-		}
-		updateExpr += "REMOVE " + strings.Join(removeExpr, ", ")
-	}
-
-	input := &dynamodb.UpdateItemInput{
-		TableName:                &w.tableName,
-		Key:                      op.Keys,
-		UpdateExpression:         &updateExpr,
-		ExpressionAttributeNames: names,
-	}
-
-	// Only set ExpressionAttributeValues if we have SET expressions
-	if len(values) > 0 {
-		input.ExpressionAttributeValues = values
-	}
-
-	// Estimate byte size for the update
-	updateBytes := estimateItemSize(op.NewImage)
-
-	// Retry with exponential backoff.
-	// Throttling errors retry indefinitely until context is cancelled.
-	const maxRetries = 5
-	attempt := 0
-	hadRetry := false
+	throttleRounds := 0
+	transientAttempts := 0
 	for {
-		_, err := w.client.UpdateItem(ctx, input)
+		output, err := w.client.BatchWriteItem(ctx, input)
 		if err != nil {
 			if isThrottlingError(err) {
-				// Throttling: wait and retry indefinitely
-				if w.callbacks.OnThrottle != nil {
-					w.callbacks.OnThrottle()
-				}
-				if !w.backoff.Wait(ctx, attempt) {
+				w.reportThrottle()
+				if !w.backoff.Wait(ctx, throttleRounds+transientAttempts) {
 					return stopRetrying(ctx)
 				}
-				attempt++
-				hadRetry = true
+				throttleRounds++
 				continue
 			}
-			// Non-throttling error: retry up to maxRetries
-			if attempt < maxRetries {
-				if !w.backoff.Wait(ctx, attempt) {
+			if transientAttempts < maxTransientAttempts {
+				if !w.backoff.Wait(ctx, throttleRounds+transientAttempts) {
 					return stopRetrying(ctx)
 				}
-				attempt++
-				hadRetry = true
+				transientAttempts++
 				continue
 			}
-			// Permanent failure - record lost item
+			// Whatever has not been accepted by now is what the restore loses.
 			if w.callbacks.OnLost != nil {
-				w.callbacks.OnLost(1)
+				w.callbacks.OnLost(len(input.RequestItems[w.tableName]))
 			}
-			return fmt.Errorf("failed to update item after %d retries: %w", maxRetries, err)
+			return fmt.Errorf("failed to write batch after %d retries: %w", maxTransientAttempts, err)
 		}
 
-		// Success - record retry if we had one
-		if hadRetry && w.callbacks.OnRetry != nil {
+		// Items handed back unprocessed are DynamoDB throttling part of the batch.
+		if len(output.UnprocessedItems) > 0 {
+			w.reportThrottle()
+			input.RequestItems = output.UnprocessedItems
+			if !w.backoff.Wait(ctx, throttleRounds+transientAttempts) {
+				return stopRetrying(ctx)
+			}
+			throttleRounds++
+			continue
+		}
+
+		if throttleRounds+transientAttempts > 0 && w.callbacks.OnRetry != nil {
 			w.callbacks.OnRetry()
 		}
-		// Record successful write
 		if w.callbacks.OnWrite != nil {
-			w.callbacks.OnWrite(1, updateBytes)
+			w.callbacks.OnWrite(items, batchBytes)
 		}
-		break
+		return nil
 	}
+}
 
-	return nil
+func (w *DynamoDBWriter) reportThrottle() {
+	if w.callbacks.OnThrottle != nil {
+		w.callbacks.OnThrottle()
+	}
 }

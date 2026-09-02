@@ -11,11 +11,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
-// DynamoDBClient defines the interface for DynamoDB operations as required by section 4.6.
-// It provides methods for batch writing and updating items.
+// DynamoDBClient is what the writer needs of DynamoDB: batch writes, which cover puts
+// and deletes alike.
 type DynamoDBClient interface {
 	BatchWriteItem(ctx context.Context, params *dynamodb.BatchWriteItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.BatchWriteItemOutput, error)
-	UpdateItem(ctx context.Context, params *dynamodb.UpdateItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
 }
 
 // S3Client defines the interface for S3 operations as required by sections 4.3 and 4.4.

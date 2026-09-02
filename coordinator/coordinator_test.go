@@ -1518,10 +1518,6 @@ func (m *mockWriter) WriteBatch(ctx context.Context, ops []itemimage.Operation) 
 	return nil
 }
 
-func (m *mockWriter) Flush(ctx context.Context) error {
-	return requireCallerContext(ctx)
-}
-
 type mockStore struct {
 	loadErr error
 	saveErr error

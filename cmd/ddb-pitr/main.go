@@ -101,8 +101,13 @@ func run() error {
 		return fmt.Errorf("failed to load AWS config: %w", err)
 	}
 
-	// Initialize AWS clients as specified in section 3
-	dynamoClient := aws.NewDynamoDBClient(dynamodb.NewFromConfig(awsCfg))
+	// The writer owns the retry policy for DynamoDB: it paces throttling for as long
+	// as the run lives and bounds everything else. Left at the SDK's default of three
+	// attempts, every one of the writer's attempts would be up to three requests, and
+	// the throttle count the operator watches would be a third of the truth.
+	dynamoClient := aws.NewDynamoDBClient(dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) {
+		o.RetryMaxAttempts = 1
+	}))
 	rawS3Client := s3.NewFromConfig(awsCfg)
 	s3Client := aws.NewS3Client(rawS3Client)
 

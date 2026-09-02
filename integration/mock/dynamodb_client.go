@@ -12,13 +12,13 @@ import (
 )
 
 // DynamoDBClient is a mock implementation of aws.DynamoDBClient interface for testing.
-// It stores items using composite keys derived from all key attributes.
+// It stores items using composite keys derived from all key attributes. A put replaces
+// the whole item and a delete removes it, which is all BatchWriteItem does.
 type DynamoDBClient struct {
 	// Thread-safe map of table data: tableName -> compositeKey -> attributes
 	tableData     map[string]map[string]map[string]types.AttributeValue
 	mu            sync.RWMutex
 	batchWrites   []dynamodb.BatchWriteItemInput
-	updateItems   []dynamodb.UpdateItemInput
 	failNextWrite bool
 	failMu        sync.Mutex
 }
@@ -28,7 +28,6 @@ func NewDynamoDBClient() *DynamoDBClient {
 	return &DynamoDBClient{
 		tableData:   make(map[string]map[string]map[string]types.AttributeValue),
 		batchWrites: make([]dynamodb.BatchWriteItemInput, 0),
-		updateItems: make([]dynamodb.UpdateItemInput, 0),
 	}
 }
 
@@ -118,14 +117,13 @@ func (m *DynamoDBClient) shouldFail() bool {
 // BatchWriteItem implements the DynamoDBClient interface for batch writing items.
 // Uses composite keys for proper storage of items with pk+sk.
 func (m *DynamoDBClient) BatchWriteItem(ctx context.Context, params *dynamodb.BatchWriteItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.BatchWriteItemOutput, error) {
-	m.batchWrites = append(m.batchWrites, *params)
-
 	if m.shouldFail() {
 		return nil, fmt.Errorf("simulated batch write failure")
 	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.batchWrites = append(m.batchWrites, *params)
 
 	for tableName, writeRequests := range params.RequestItems {
 		if _, exists := m.tableData[tableName]; !exists {
@@ -150,95 +148,6 @@ func (m *DynamoDBClient) BatchWriteItem(ctx context.Context, params *dynamodb.Ba
 	return &dynamodb.BatchWriteItemOutput{
 		UnprocessedItems: make(map[string][]types.WriteRequest),
 	}, nil
-}
-
-// UpdateItem implements the DynamoDBClient interface for updating individual items.
-// It parses and applies SET and REMOVE expressions to properly update item attributes.
-func (m *DynamoDBClient) UpdateItem(ctx context.Context, params *dynamodb.UpdateItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
-	m.updateItems = append(m.updateItems, *params)
-
-	if m.shouldFail() {
-		return nil, fmt.Errorf("simulated update failure")
-	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	tableName := *params.TableName
-
-	if _, exists := m.tableData[tableName]; !exists {
-		m.tableData[tableName] = make(map[string]map[string]types.AttributeValue)
-	}
-
-	compositeKey := extractCompositeKey(params.Key)
-
-	// Create item if it doesn't exist
-	if _, exists := m.tableData[tableName][compositeKey]; !exists {
-		m.tableData[tableName][compositeKey] = make(map[string]types.AttributeValue)
-		for k, v := range params.Key {
-			m.tableData[tableName][compositeKey][k] = v
-		}
-	}
-
-	item := m.tableData[tableName][compositeKey]
-
-	// Parse and apply update expression
-	if params.UpdateExpression != nil {
-		expr := *params.UpdateExpression
-
-		// Handle SET expressions: SET #attr1 = :val1, #attr2 = :val2
-		if idx := strings.Index(expr, "SET "); idx != -1 {
-			setEnd := strings.Index(expr, " REMOVE")
-			setExpr := expr[idx+4:]
-			if setEnd > idx {
-				setExpr = expr[idx+4 : setEnd]
-			}
-
-			// Parse SET assignments
-			assignments := strings.Split(setExpr, ", ")
-			for _, assignment := range assignments {
-				parts := strings.Split(strings.TrimSpace(assignment), " = ")
-				if len(parts) != 2 {
-					continue
-				}
-				attrNameRef := strings.TrimSpace(parts[0])
-				valueRef := strings.TrimSpace(parts[1])
-
-				// Resolve attribute name from ExpressionAttributeNames
-				attrName := attrNameRef
-				if params.ExpressionAttributeNames != nil {
-					if resolved, ok := params.ExpressionAttributeNames[attrNameRef]; ok {
-						attrName = resolved
-					}
-				}
-
-				// Resolve value from ExpressionAttributeValues
-				if params.ExpressionAttributeValues != nil {
-					if val, ok := params.ExpressionAttributeValues[valueRef]; ok {
-						item[attrName] = val
-					}
-				}
-			}
-		}
-
-		// Handle REMOVE expressions: REMOVE #attr1, #attr2
-		if idx := strings.Index(expr, "REMOVE "); idx != -1 {
-			removeExpr := expr[idx+7:]
-			attrs := strings.Split(removeExpr, ", ")
-			for _, attr := range attrs {
-				attrNameRef := strings.TrimSpace(attr)
-				attrName := attrNameRef
-				if params.ExpressionAttributeNames != nil {
-					if resolved, ok := params.ExpressionAttributeNames[attrNameRef]; ok {
-						attrName = resolved
-					}
-				}
-				delete(item, attrName)
-			}
-		}
-	}
-
-	return &dynamodb.UpdateItemOutput{}, nil
 }
 
 // GetTableContents returns the contents of a table for verification
@@ -274,18 +183,9 @@ func (m *DynamoDBClient) ItemExists(tableName string, key map[string]types.Attri
 
 // GetBatchWrites returns the batch write requests that were made
 func (m *DynamoDBClient) GetBatchWrites() []dynamodb.BatchWriteItemInput {
-	return m.batchWrites
-}
-
-// GetUpdateItems returns the update item requests that were made
-func (m *DynamoDBClient) GetUpdateItems() []dynamodb.UpdateItemInput {
-	return m.updateItems
-}
-
-// ClearHistory clears the history of operations
-func (m *DynamoDBClient) ClearHistory() {
-	m.batchWrites = make([]dynamodb.BatchWriteItemInput, 0)
-	m.updateItems = make([]dynamodb.UpdateItemInput, 0)
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]dynamodb.BatchWriteItemInput(nil), m.batchWrites...)
 }
 
 // ClearTableData clears all table data

@@ -17,8 +17,7 @@ import (
 	"github.com/gurre/ddb-pitr/metrics"
 )
 
-// DynamoDBClientImpl implements DynamoDBClient using the AWS SDK as specified in section 4.6.
-// It provides concrete implementations for batch writing and updating items.
+// DynamoDBClientImpl implements DynamoDBClient using the AWS SDK.
 type DynamoDBClientImpl struct {
 	client *dynamodb.Client
 }
@@ -31,11 +30,6 @@ func NewDynamoDBClient(client *dynamodb.Client) *DynamoDBClientImpl {
 // BatchWriteItem implements the DynamoDBClient interface for batch writing items
 func (c *DynamoDBClientImpl) BatchWriteItem(ctx context.Context, params *dynamodb.BatchWriteItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.BatchWriteItemOutput, error) {
 	return c.client.BatchWriteItem(ctx, params, optFns...)
-}
-
-// UpdateItem implements the DynamoDBClient interface for updating individual items
-func (c *DynamoDBClientImpl) UpdateItem(ctx context.Context, params *dynamodb.UpdateItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error) {
-	return c.client.UpdateItem(ctx, params, optFns...)
 }
 
 // S3ClientImpl implements S3Client using the AWS SDK as specified in sections 4.3 and 4.4.
