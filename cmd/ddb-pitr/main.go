@@ -66,8 +66,10 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 	fs := flag.NewFlagSet("ddb-pitr", flag.ContinueOnError)
 	fs.SetOutput(out)
 	fs.Usage = func() {
-		fmt.Fprintln(out, "Usage: ddb-pitr --table TABLE --export s3://BUCKET/PREFIX/AWSDynamoDB/EXPORT-ID/ [flags]")
-		fmt.Fprintln(out)
+		// Usage goes to whatever the caller gave for output; a write failing there
+		// has nowhere better to be reported.
+		_, _ = fmt.Fprintln(out, "Usage: ddb-pitr --table TABLE --export s3://BUCKET/PREFIX/AWSDynamoDB/EXPORT-ID/ [flags]")
+		_, _ = fmt.Fprintln(out)
 		fs.PrintDefaults()
 	}
 
@@ -93,7 +95,7 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 	// Asked before anything is validated, so the version is readable without a
 	// complete configuration.
 	if *showVersion {
-		fmt.Fprintf(out, "ddb-pitr %s (commit %s, built %s)\n", version, commit, date)
+		_, _ = fmt.Fprintf(out, "ddb-pitr %s (commit %s, built %s)\n", version, commit, date)
 		return nil, errVersionShown
 	}
 
