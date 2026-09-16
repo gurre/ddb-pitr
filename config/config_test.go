@@ -66,6 +66,64 @@ func TestGetExportBucketNameNeedsNoValidation(t *testing.T) {
 	}
 }
 
+// TestCheckpointURIDefaultsIntoTheExportsBucket verifies a restore told nothing about
+// checkpoints still gets one, in the bucket the export is already in. A restore that is
+// only resumable when an operator remembered a flag is one that loses a day's reading
+// the first time a machine goes away.
+func TestCheckpointURIDefaultsIntoTheExportsBucket(t *testing.T) {
+	const want = "s3://backups/ddb-pitr/checkpoints/01234567890-abcdef.orders.json"
+	// The export given as its manifest or as its directory is the same export, so it
+	// must not resolve to two checkpoints.
+	for _, uri := range []string{
+		"s3://backups/AWSDynamoDB/01234567890-abcdef",
+		"s3://backups/AWSDynamoDB/01234567890-abcdef/",
+		"s3://backups/AWSDynamoDB/01234567890-abcdef//",
+		"s3://backups/AWSDynamoDB/01234567890-abcdef/manifest-summary.json",
+	} {
+		cfg := &Config{TableName: "orders", ExportS3URI: uri}
+		if got := cfg.CheckpointURI(); got != want {
+			t.Errorf("CheckpointURI() for %q = %q, want %q", uri, got, want)
+		}
+	}
+}
+
+// TestCheckpointURISeparatesRestoresOfOneExport verifies the derived checkpoint names
+// the target table. The same export restored into two tables is two restores, and a
+// checkpoint shared between them would let the second skip files the first finished and
+// call the half-empty table done.
+func TestCheckpointURISeparatesRestoresOfOneExport(t *testing.T) {
+	const export = "s3://backups/AWSDynamoDB/01234567890-abcdef"
+	first := (&Config{TableName: "orders", ExportS3URI: export}).CheckpointURI()
+	second := (&Config{TableName: "orders-replica", ExportS3URI: export}).CheckpointURI()
+	if first == second {
+		t.Errorf("two tables share the checkpoint %q", first)
+	}
+}
+
+// TestCheckpointURIHonoursWhatWasAskedFor verifies --resume overrides the default and
+// that a run asked to record nothing records nothing, dry runs included: a later real
+// restore must not resume past work that was only measured.
+func TestCheckpointURIHonoursWhatWasAskedFor(t *testing.T) {
+	base := func() *Config {
+		return &Config{TableName: "orders", ExportS3URI: "s3://backups/AWSDynamoDB/0123-abc"}
+	}
+	cfg := base()
+	cfg.ResumeKey = "s3://elsewhere/checkpoints/mine.json"
+	if got := cfg.CheckpointURI(); got != cfg.ResumeKey {
+		t.Errorf("CheckpointURI() = %q, want the URI --resume named", got)
+	}
+	for name, spoil := range map[string]func(*Config){
+		"--no-resume": func(c *Config) { c.NoResume = true },
+		"--dry-run":   func(c *Config) { c.DryRun = true },
+	} {
+		cfg := base()
+		spoil(cfg)
+		if got := cfg.CheckpointURI(); got != "" {
+			t.Errorf("CheckpointURI() with %s = %q, want no checkpoint", name, got)
+		}
+	}
+}
+
 func TestMissingTableName(t *testing.T) {
 	cfg := validConfig()
 	cfg.TableName = ""
@@ -127,6 +185,14 @@ func TestValidateReportsTheFirstProblem(t *testing.T) {
 		{"resume URI", func(c *Config) { c.ResumeKey = "/tmp/checkpoint.json" }, "resume S3 URI"},
 		{"report URI", func(c *Config) { c.ReportS3URI = "http://bucket/report" }, "report S3 URI"},
 		{"shutdown timeout", func(c *Config) { c.ShutdownTimeout = 0 }, "shutdown timeout"},
+		// A checkpoint and a report are each one object, so a URI naming only a bucket
+		// has nowhere to write. Left to the request, the report would only be found out
+		// at the end of the restore it was meant to record.
+		{"resume URI without a key", func(c *Config) { c.ResumeKey = "s3://bucket" }, "bucket and a key"},
+		{"report URI without a key", func(c *Config) { c.ReportS3URI = "s3://bucket/" }, "bucket and a key"},
+		{"resume and no-resume together", func(c *Config) {
+			c.ResumeKey, c.NoResume = "s3://bucket/checkpoint.json", true
+		}, "one or the other"},
 	}
 
 	for _, tt := range tests {

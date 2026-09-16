@@ -405,6 +405,48 @@ func TestCoordinatorMarksFileComplete(t *testing.T) {
 	}
 }
 
+// TestCoordinatorSavesACompletedFileBeforeTheRunEnds verifies a file is written to the
+// checkpoint the moment it is finished, not left to the save at shutdown. A machine
+// losing power or a second Ctrl-C reaches no shutdown save at all, and without this the
+// run would lose every file finished since the last interval save rather than the one
+// each worker had in hand.
+func TestCoordinatorSavesACompletedFileBeforeTheRunEnds(t *testing.T) {
+	// One worker takes file1 and then file2, whose only line the writer refuses, so the
+	// run ends having finished file1 and nothing after it.
+	store := &mockStore{}
+	streamer := &mockStreamer{
+		lines:      [][]byte{[]byte(`{"id":"1"}`)},
+		linesByKey: map[string][][]byte{testFileKey2: {[]byte(`poison`)}},
+	}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}, {Key: testFileKey2, ItemCount: 1}},
+		streamer: streamer,
+		writer:   &mockWriter{failOn: "poison"},
+		store:    store,
+		configure: func(cfg *config.Config) {
+			cfg.MaxWorkers = 1
+		},
+	})
+
+	if err := runCoordinator(t, coord); err == nil {
+		t.Fatal("expected the run to fail on the second file")
+	}
+
+	// A save carrying file1 as complete before the last one is the proof: the last save
+	// is the one at shutdown, and a run killed outright never reaches it.
+	saves := store.savedStates()
+	completedBeforeShutdown := false
+	for _, s := range saves[:max(len(saves)-1, 0)] {
+		if len(s.Completed) == 1 && s.Completed[0] == testFileKey {
+			completedBeforeShutdown = true
+		}
+	}
+	if !completedBeforeShutdown {
+		t.Errorf("expected file1 recorded complete before the shutdown save, got %d saves ending %v",
+			len(saves), store.lastSaved().Completed)
+	}
+}
+
 // TestCoordinatorRecordsEveryWorkersProgress verifies a checkpoint carries what the
 // whole pool has done, not just the worker that happened to take it. One worker's save
 // overwriting another's is how a resume comes to skip files nobody finished.
@@ -743,6 +785,28 @@ func TestCoordinatorFailsOnCheckpointSaveError(t *testing.T) {
 	}
 }
 
+// TestCoordinatorRefusesAnUnwritableCheckpointBeforeWriting verifies a checkpoint that
+// cannot be written stops the restore while the table is still untouched. The default
+// checkpoint goes in the export's own bucket, which a cross-account restore often reads
+// without being allowed to write; finding that out at the first finished file would
+// leave a half-restored table and hours of reading to redo.
+func TestCoordinatorRefusesAnUnwritableCheckpointBeforeWriting(t *testing.T) {
+	writer := &mockWriter{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:  []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		lines:  [][]byte{[]byte(`{"id":"1"}`)},
+		writer: writer,
+		store:  &mockStore{saveErr: errors.New("access denied")},
+	})
+
+	if err := runCoordinator(t, coord); err == nil {
+		t.Fatal("expected an error when the checkpoint cannot be written")
+	}
+	if len(writer.batches) != 0 {
+		t.Errorf("expected nothing written to the table, got %d batches", len(writer.batches))
+	}
+}
+
 // TestCoordinatorRejectsNonS3Export verifies the export location is rejected before any
 // AWS call when it is not an S3 URI.
 func TestCoordinatorRejectsNonS3Export(t *testing.T) {
@@ -764,14 +828,16 @@ func TestCoordinatorRejectsNonS3Export(t *testing.T) {
 // that only matched the bare sentinel would take every corrupt line for a fatal error.
 func TestCoordinatorSkipsCorruptLinesAndReportsThemAtTheEnd(t *testing.T) {
 	writer := &mockWriter{}
+	store := &mockStore{}
 	streamer := &mockStreamer{lines: [][]byte{
 		[]byte(`{"Item":{"pk":{"S":"1"}}}`), []byte(`{not json`), []byte(`{"Item":{"pk":{"S":"2"}}}`),
 	}}
-	coord, m := newTestCoordinator(t, testDeps{
+	coord, _ := newTestCoordinator(t, testDeps{
 		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 3}},
 		streamer: streamer,
 		decoder:  itemimage.NewJSONDecoder(),
 		writer:   writer,
+		store:    store,
 	})
 
 	err := runCoordinator(t, coord)
@@ -789,8 +855,8 @@ func TestCoordinatorSkipsCorruptLinesAndReportsThemAtTheEnd(t *testing.T) {
 	if len(streamer.requests) != 1 {
 		t.Errorf("expected the file streamed once, got %d attempts", len(streamer.requests))
 	}
-	if got := m.GenerateReport().CorruptCount; got != 1 {
-		t.Errorf("expected 1 corrupt line recorded, got %d", got)
+	if got := store.lastSaved().Skipped; got != 1 {
+		t.Errorf("expected the checkpoint to record 1 skipped line, got %d", got)
 	}
 }
 
@@ -805,10 +871,12 @@ func TestCoordinatorCountsACorruptLineOnceAcrossRetries(t *testing.T) {
 		lines:     [][]byte{[]byte(`{"id":"1"}`), []byte(`{"id":"2"}`), []byte(`corrupt`), []byte(`{"id":"4"}`)},
 		failAfter: 3,
 	}
-	coord, m := newTestCoordinator(t, testDeps{
+	store := &mockStore{}
+	coord, _ := newTestCoordinator(t, testDeps{
 		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 4}},
 		streamer: streamer,
 		decoder:  &mockDecoder{corruptLines: map[string]bool{"corrupt": true}},
+		store:    store,
 		configure: func(cfg *config.Config) {
 			cfg.BatchSize = 2
 		},
@@ -820,8 +888,43 @@ func TestCoordinatorCountsACorruptLineOnceAcrossRetries(t *testing.T) {
 	if len(streamer.requests) != 2 {
 		t.Fatalf("expected the stream retried once, got %d attempts", len(streamer.requests))
 	}
-	if got := m.CorruptCount(); got != 1 {
+	if got := store.lastSaved().Skipped; got != 1 {
 		t.Errorf("expected the corrupt line counted once, got %d", got)
+	}
+}
+
+// TestCoordinatorStillReportsLinesAnEarlierRunSkipped verifies a resumed restore ends
+// with the skipped-records error even though every file it could skip lines in was
+// already finished. The lines are gone for good, and a resume does not re-read the
+// files holding them, so counting only what this process saw would let an operator who
+// re-runs a restore "to be safe" collect a success that contradicts the first run.
+func TestCoordinatorStillReportsLinesAnEarlierRunSkipped(t *testing.T) {
+	store := &mockStore{state: checkpoint.State{
+		ExportID:  testExportARN,
+		Completed: []string{testFileKey},
+		Skipped:   2,
+	}}
+	uploader := &mockUploader{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 2}, {Key: testFileKey2, ItemCount: 1}},
+		lines:    [][]byte{[]byte(`{"id":"1"}`)},
+		store:    store,
+		uploader: uploader,
+		configure: func(cfg *config.Config) {
+			cfg.ReportS3URI = testReportURI
+		},
+	})
+
+	err := runCoordinator(t, coord)
+	if !errors.Is(err, ErrRecordsSkipped) || !strings.Contains(err.Error(), "2 lines") {
+		t.Fatalf("expected the resumed run to report the 2 lines an earlier run skipped, got %v", err)
+	}
+	// A report contradicting the error it is filed alongside is worse than no report.
+	if got := uploader.lastReport().CorruptCount; got != 2 {
+		t.Errorf("expected the uploaded report to name all 2 skipped lines, got %d", got)
+	}
+	if got := store.lastSaved().Skipped; got != 2 {
+		t.Errorf("expected the count to survive the run that did not add to it, got %d", got)
 	}
 }
 
@@ -1365,7 +1468,7 @@ func TestCoordinatorCountsWhatItWrote(t *testing.T) {
 		t.Fatalf("coordinator failed: %v", err)
 	}
 
-	report := m.GenerateReport()
+	report := m.GenerateReport(0)
 	if report.TotalItems != 6 {
 		t.Errorf("TotalItems = %d, want 6", report.TotalItems)
 	}
@@ -1825,6 +1928,13 @@ func (m *mockStore) Save(ctx context.Context, s checkpoint.State) error {
 	return nil
 }
 
+// savedStates returns every state saved so far, in order.
+func (m *mockStore) savedStates() []checkpoint.State {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]checkpoint.State(nil), m.saved...)
+}
+
 func (m *mockStore) lastSaved() checkpoint.State {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1849,9 +1959,10 @@ func (m *mockStore) savedOffsets(key string) []int64 {
 }
 
 type mockUploader struct {
-	err  error
-	uris []string
-	mu   sync.Mutex
+	err     error
+	uris    []string
+	reports []metrics.Report
+	mu      sync.Mutex
 }
 
 func (m *mockUploader) UploadReport(ctx context.Context, uri string, report metrics.Report) error {
@@ -1861,5 +1972,16 @@ func (m *mockUploader) UploadReport(ctx context.Context, uri string, report metr
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.uris = append(m.uris, uri)
+	m.reports = append(m.reports, report)
 	return m.err
+}
+
+// lastReport returns the report most recently uploaded, or a zero report if none was.
+func (m *mockUploader) lastReport() metrics.Report {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.reports) == 0 {
+		return metrics.Report{}
+	}
+	return m.reports[len(m.reports)-1]
 }

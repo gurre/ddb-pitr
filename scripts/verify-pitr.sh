@@ -34,6 +34,9 @@ TARGET_TABLE="pitr-verify-target-${TIMESTAMP}"
 S3_BUCKET="${PITR_TEST_BUCKET:?Error: PITR_TEST_BUCKET environment variable must be set}"
 REGION="${AWS_REGION:-us-east-1}"
 S3_PREFIX="verify/${SOURCE_TABLE}"
+# Where a restore records progress when it was not told where, which is what Phase 7
+# checks actually happens.
+DEFAULT_CHECKPOINT_PREFIX="ddb-pitr/checkpoints"
 
 # Test parameters - defaults target 256MB of data (65536 items * 4KB each)
 ITEM_COUNT="${ITEM_COUNT:-65536}"
@@ -89,6 +92,14 @@ cleanup() {
 
     echo "Deleting S3 exports..."
     aws s3 rm "s3://${S3_BUCKET}/${S3_PREFIX}" --recursive --region "${REGION}" > /dev/null 2>&1 || true
+
+    # Checkpoints a restore wrote for itself land outside the export prefix, so they are
+    # removed by the tables they belong to; the bucket may be shared with other runs.
+    echo "Deleting default checkpoints..."
+    aws s3 rm "s3://${S3_BUCKET}/${DEFAULT_CHECKPOINT_PREFIX}" --recursive --region "${REGION}" \
+        --exclude "*" \
+        --include "*.${TARGET_TABLE}.json" \
+        --include "*.${RESUME_TABLE:-no-such-table}.json" > /dev/null 2>&1 || true
 
     if [[ $exit_code -eq 0 ]]; then
         echo "Cleanup complete. Verification PASSED."
@@ -315,6 +326,17 @@ echo "Restoring from: ${FULL_MANIFEST_URI}"
     -table "${TARGET_TABLE}" \
     -export "${FULL_MANIFEST_URI}" \
     -region "${REGION}"
+
+# Nothing above named a checkpoint, so this proves a plain restore is resumable. An
+# operator who never reads the flags still gets one, which is the whole point of the
+# default; a restore that quietly recorded nothing would only be found out by an
+# interruption, when it is too late to choose differently.
+DEFAULT_CHECKPOINT_KEY="${DEFAULT_CHECKPOINT_PREFIX}/${FULL_MANIFEST_DIR%/}.${TARGET_TABLE}.json"
+if ! aws s3api head-object --bucket "${S3_BUCKET}" --key "${DEFAULT_CHECKPOINT_KEY}" --region "${REGION}" > /dev/null 2>&1; then
+    echo "ERROR: a restore given no --resume recorded no checkpoint at ${DEFAULT_CHECKPOINT_KEY}"
+    exit 1
+fi
+echo "Progress was recorded at s3://${S3_BUCKET}/${DEFAULT_CHECKPOINT_KEY} without being asked for"
 
 # Phase 8: Apply INCREMENTAL export
 echo ""

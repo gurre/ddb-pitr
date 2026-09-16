@@ -36,7 +36,7 @@ func (s *MemoryStore) Save(ctx context.Context, state State) error {
 
 // copyState duplicates the slice and map a State carries.
 func copyState(state State) State {
-	out := State{ExportID: state.ExportID}
+	out := State{ExportID: state.ExportID, Skipped: state.Skipped}
 	if state.Completed != nil {
 		out.Completed = append([]string(nil), state.Completed...)
 	}

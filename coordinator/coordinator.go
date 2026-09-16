@@ -138,6 +138,7 @@ type progress struct {
 	exportID  string              // Export this progress belongs to
 	completed map[string]struct{} // Files processed to the end
 	offsets   map[string]int64    // Offset of the last line written, per file still in progress
+	skipped   int64               // Lines that could not be decoded, over every run so far
 	mu        sync.Mutex
 }
 
@@ -147,6 +148,7 @@ func newProgress(exportID string, state checkpoint.State) *progress {
 		completed: make(map[string]struct{}, len(state.Completed)),
 		offsets:   make(map[string]int64, len(state.Offsets)),
 		exportID:  exportID,
+		skipped:   state.Skipped,
 	}
 	for _, key := range state.Completed {
 		p.completed[key] = struct{}{}
@@ -192,6 +194,22 @@ func (p *progress) complete(key string) {
 	p.completed[key] = struct{}{}
 }
 
+// skip counts a line that could not be decoded. The count spans runs, because the line
+// is in a file a resume will not read again: once the file is finished, this is the only
+// record left that the line was ever there.
+func (p *progress) skip() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.skipped++
+}
+
+// skipped reports how many lines this restore could not decode, over every run so far.
+func (p *progress) skippedCount() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.skipped
+}
+
 // snapshot renders the current progress as the state to persist. Completed files are
 // sorted so two checkpoints of the same progress are byte-identical.
 func (p *progress) snapshot() checkpoint.State {
@@ -209,7 +227,7 @@ func (p *progress) snapshot() checkpoint.State {
 		offsets[key] = offset
 	}
 
-	return checkpoint.State{ExportID: p.exportID, Completed: completed, Offsets: offsets}
+	return checkpoint.State{ExportID: p.exportID, Completed: completed, Offsets: offsets, Skipped: p.skipped}
 }
 
 // NewCoordinator creates a new Coordinator instance with all required dependencies
@@ -290,6 +308,15 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 	c.progress = newProgress(summary.ExportARN, state)
 
+	// Progress is written once before anything else, which settles two questions while
+	// the table is still untouched: whether the checkpoint can be written at all, and
+	// whether another restore already owns it. Left until the first file finished, a
+	// bucket that only grants reads, or a second restore sharing one checkpoint, would
+	// be found out with the table part-way restored and hours of reading to redo.
+	if saveErr := c.saveProgress(ctx); saveErr != nil {
+		return fmt.Errorf("failed to record progress before starting: %w", saveErr)
+	}
+
 	// Verify the files still to do against what the manifest recorded, before writing
 	// anything. A file that no longer matches means the restore would write data the
 	// export never contained, which is worth failing on while the table is untouched.
@@ -364,7 +391,8 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}()
 
 	// Send tasks. Handing one to a pool that has already given up would block forever,
-	// so a pool that has exited or been stopped ends dispatch.
+	// so a pool that has exited or been stopped ends dispatch. This is the only place a
+	// file a previous run finished is dropped; the workers see only what is left to do.
 dispatch:
 	for _, file := range summary.DataFiles {
 		if _, done := c.progress.resume(file.Key); done {
@@ -407,7 +435,7 @@ dispatch:
 	}
 
 	// Generate and print report
-	report := c.metrics.GenerateReport()
+	report := c.metrics.GenerateReport(c.progress.skippedCount())
 	fmt.Println(report)
 
 	// Upload report to S3 if configured
@@ -419,8 +447,10 @@ dispatch:
 	}
 
 	// Judged after the report is out, so the record of what was skipped survives the
-	// failure it causes.
-	if skipped := c.metrics.CorruptCount(); skipped > 0 {
+	// failure it causes. The count is the restore's, not this run's: a resume does not
+	// re-read the files the skipped lines are in, so judging on what this process saw
+	// would turn the last run of an export that lost records into a clean one.
+	if skipped := c.progress.skippedCount(); skipped > 0 {
 		return fmt.Errorf("%w: %d lines could not be decoded; running again will not change that",
 			ErrRecordsSkipped, skipped)
 	}
@@ -433,9 +463,11 @@ dispatch:
 const corruptLinesNamed = 20
 
 // skipCorrupt records a line that could not be decoded and names the first few, with
-// the file and offset an operator needs to find them.
+// the file and offset an operator needs to find them. The count goes to progress rather
+// than to the metrics, because it has to outlive the process: only the lines this run
+// read past are named here, while the count covers every run of the restore.
 func (c *Coordinator) skipCorrupt(key string, offset int64, err error) {
-	c.metrics.RecordCorrupt()
+	c.progress.skip()
 	if c.corruptNamed.Add(1) <= corruptLinesNamed {
 		fmt.Fprintf(os.Stderr, "skipping %s at offset %d: %v\n", key, offset, err)
 	}
@@ -585,8 +617,10 @@ func (c *Coordinator) reportProgress(ctx context.Context) {
 const checkpointInterval = 100
 
 // saveProgress persists a snapshot of what the restore has finished. Snapshotting and
-// writing under one lock keeps the stored state monotonic: without it a worker that
-// snapshotted earlier could win the race to S3 and undo a later worker's progress.
+// writing under one lock keeps the stored state monotonic. Nothing is skipped without
+// it, since every snapshot is a subset of every later one and files are only ever added;
+// an out-of-order write would cost a resume the work between the two snapshots, which
+// the lock is cheap enough to avoid.
 func (c *Coordinator) saveProgress(ctx context.Context) error {
 	c.saveMu.Lock()
 	defer c.saveMu.Unlock()
@@ -622,9 +656,8 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 			s.CurrentFile = file.Key
 		})
 
-		if _, done := c.progress.resume(file.Key); done {
-			continue
-		}
+		// Files a previous run finished never reach here: dispatch drops them, and each
+		// file goes to one worker, so nothing can complete a file between the two.
 
 		// Offset of the last line handed to the writer, and batches since the last save.
 		var currentOffset int64

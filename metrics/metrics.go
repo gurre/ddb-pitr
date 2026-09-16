@@ -24,7 +24,6 @@ type Metrics struct {
 	recordsProcessed int64 // Items written to the table
 	batchesWritten   int64 // Number of batches written to DynamoDB
 	errors           int64 // Number of errors encountered
-	corruptCount     int64 // Number of corrupt records found
 	throttles        int64 // Number of throttle events (ProvisionedThroughputExceeded)
 	retries          int64 // Number of successful retries after transient failures
 	lostItems        int64 // Number of items that failed permanently
@@ -51,16 +50,6 @@ func (m *Metrics) RecordBatchWritten() {
 // RecordError increments the errors counter
 func (m *Metrics) RecordError() {
 	atomic.AddInt64(&m.errors, 1)
-}
-
-// RecordCorrupt increments the corrupt records counter
-func (m *Metrics) RecordCorrupt() {
-	atomic.AddInt64(&m.corruptCount, 1)
-}
-
-// CorruptCount returns how many export lines could not be decoded and were skipped
-func (m *Metrics) CorruptCount() int64 {
-	return atomic.LoadInt64(&m.corruptCount)
 }
 
 // RecordThrottle increments the throttle events counter
@@ -125,17 +114,27 @@ type Report struct {
 	ProcessingTime time.Duration `json:"processingTime"`
 	TotalItems     int64         `json:"totalItems"`     // Items written to the table; skipped lines are not counted
 	BatchesWritten int64         `json:"batchesWritten"` // Number of batches written to DynamoDB
-	CorruptCount   int64         `json:"corruptCount"`   // Number of corrupt items found
-	Throttles      int64         `json:"throttles"`      // Number of throttle events
-	Retries        int64         `json:"retries"`        // Number of successful retries
-	LostItems      int64         `json:"lostItems"`      // Number of items that failed permanently
-	BytesRead      int64         `json:"bytesRead"`      // Export bytes read behind the items written
-	Throughput     float64       `json:"throughput"`     // Items processed per second
-	ByteRate       float64       `json:"byteRate"`       // Bytes per second
+	// CorruptCount is how many export lines could not be decoded. Unlike every other
+	// count here it belongs to the restore rather than to this run of it: those lines
+	// are lost for good, and a resumed run does not re-read the files they are in.
+	CorruptCount int64   `json:"corruptCount"`
+	Throttles    int64   `json:"throttles"`  // Number of throttle events
+	Retries      int64   `json:"retries"`    // Number of successful retries
+	LostItems    int64   `json:"lostItems"`  // Number of items that failed permanently
+	BytesRead    int64   `json:"bytesRead"`  // Export bytes read behind the items written
+	Throughput   float64 `json:"throughput"` // Items processed per second
+	ByteRate     float64 `json:"byteRate"`   // Bytes per second
 }
 
-// GenerateReport renders the counters into a Report as of now.
-func (m *Metrics) GenerateReport() Report {
+// GenerateReport renders the counters into a Report as of now. The skipped-line count
+// comes from the caller because it is the one number here that spans runs: the counters
+// hold what this process did, while a resumed restore has to report every line the
+// export lost, including those an earlier run read past.
+// Example:
+//
+//	report := m.GenerateReport(0) // a restore that skipped nothing
+//	fmt.Println(report)
+func (m *Metrics) GenerateReport(skipped int64) Report {
 	endTime := time.Now()
 	duration := endTime.Sub(m.startTime)
 
@@ -160,7 +159,7 @@ func (m *Metrics) GenerateReport() Report {
 		ProcessingTime: processingTime,
 		TotalItems:     totalItems,
 		BatchesWritten: atomic.LoadInt64(&m.batchesWritten),
-		CorruptCount:   atomic.LoadInt64(&m.corruptCount),
+		CorruptCount:   skipped,
 		Throttles:      atomic.LoadInt64(&m.throttles),
 		Retries:        atomic.LoadInt64(&m.retries),
 		LostItems:      atomic.LoadInt64(&m.lostItems),

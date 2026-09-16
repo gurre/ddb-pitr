@@ -76,12 +76,13 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 	tableName := fs.String("table", "", "DynamoDB table name to restore to")
 	exportS3URI := fs.String("export", "", "S3 URI of the export's manifest-summary.json, or of the directory holding it")
 	region := fs.String("region", "", "AWS region; resolved from your AWS environment when omitted")
-	resumeKey := fs.String("resume", "", "S3 URI for checkpoint file")
+	resumeKey := fs.String("resume", "", "S3 URI to record progress in; defaults to a key in the export's own bucket")
+	noResume := fs.Bool("no-resume", false, "Record no progress, so an interrupted restore starts over")
 	maxWorkers := fs.Int("workers", 10, "Maximum number of concurrent workers")
 	batchSize := fs.Int("batch", 25, "Batch size for DynamoDB writes (max 25)")
 	reportS3URI := fs.String("report", "", "S3 URI for the final report")
 	dryRun := fs.Bool("dry-run", false, "Read and measure the whole export without writing to the table")
-	shutdownTimeout := fs.Duration("shutdown-timeout", 5*time.Minute, "How long an interrupted restore has to finish in-flight writes and save its checkpoint")
+	shutdownTimeout := fs.Duration("shutdown-timeout", 5*time.Minute, "How long an interrupted restore has to record where it stopped")
 	showVersion := fs.Bool("version", false, "Print the build identity and exit")
 
 	if err := fs.Parse(args); err != nil {
@@ -111,12 +112,34 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 		BatchSize:       *batchSize,
 		ReportS3URI:     *reportS3URI,
 		DryRun:          *dryRun,
+		NoResume:        *noResume,
 		ShutdownTimeout: *shutdownTimeout,
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 	return cfg, nil
+}
+
+// newCheckpointStore returns where the restore will record its progress. A configuration
+// that names a checkpoint gets one in S3, which outlives the process and is what a resume
+// reads; anything else gets memory, which does not, and says so. A dry run is always the
+// latter, whatever was asked for, so a later restore cannot resume past work that was
+// only ever measured.
+func newCheckpointStore(cfg *config.Config, client aws.S3Client) (checkpoint.Store, error) {
+	uri := cfg.CheckpointURI()
+	if uri == "" {
+		if !cfg.DryRun {
+			fmt.Fprintln(os.Stderr, "no-resume: progress is not recorded, so an interruption starts this restore over")
+		}
+		return checkpoint.NewMemoryStore(), nil
+	}
+	store, err := checkpoint.NewS3Store(client, uri)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create checkpoint store: %w", err)
+	}
+	fmt.Printf("Recording progress at %s\n", uri)
+	return store, nil
 }
 
 // run parses the command line and carries out the restore it describes.
@@ -153,9 +176,10 @@ func run() error {
 	rawS3Client := s3.NewFromConfig(awsCfg)
 	s3Client := aws.NewS3Client(rawS3Client)
 
-	// Ctrl-C or a container runtime's SIGTERM asks the restore to stop: workers finish
-	// their current batch and the checkpoint is saved. The handler is removed as soon
-	// as it fires, so a second signal takes the default disposition and kills the
+	// Ctrl-C or a container runtime's SIGTERM asks the restore to stop: writes in flight
+	// are abandoned and the checkpoint is saved, which costs the resume those batches and
+	// nothing else, since their offsets were never recorded. The handler is removed as
+	// soon as it fires, so a second signal takes the default disposition and kills the
 	// process, for the operator who cannot wait for a clean stop.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -190,23 +214,12 @@ func run() error {
 		ddbWriter = writer.NewDynamoDBWriter(dynamoClient, cfg.TableName, cfg.BatchSize, writerCallbacks)
 	}
 
-	// Set up the checkpoint store based on ResumeKey. A dry run keeps its progress in
-	// memory whatever was asked for: a later restore must not resume past work that
-	// was only ever measured.
-	var checkpointStore checkpoint.Store
 	if cfg.ResumeKey != "" && cfg.DryRun {
 		fmt.Fprintln(os.Stderr, "dry run: --resume is not used, since a dry run records no progress")
 	}
-	if cfg.ResumeKey != "" && !cfg.DryRun {
-		// Use S3Store if a resume key is provided
-		s3Store, err := checkpoint.NewS3Store(s3Client, cfg.ResumeKey)
-		if err != nil {
-			return fmt.Errorf("failed to create checkpoint store: %w", err)
-		}
-		checkpointStore = s3Store
-	} else {
-		// Use in-memory store if no resume key provided
-		checkpointStore = checkpoint.NewMemoryStore()
+	checkpointStore, err := newCheckpointStore(cfg, s3Client)
+	if err != nil {
+		return err
 	}
 
 	// Create report uploader if report URI is provided. The variable is declared as the

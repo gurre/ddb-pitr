@@ -38,6 +38,11 @@ type State struct {
 	Completed []string         `json:"completed"` // Keys of data files processed to the end
 	ExportID  string           `json:"exportId"`  // Identity of the export this progress belongs to
 	Offsets   map[string]int64 `json:"offsets"`   // Offset of the last line written, per file still in progress
+	// Skipped is how many lines this restore could not decode, over every run so far.
+	// It is durable because the loss is: a resume does not re-read the files those
+	// lines are in, so without it the last run would report a clean restore of an
+	// export that lost records.
+	Skipped int64 `json:"skipped"`
 }
 
 // Store interface defines the contract for saving and loading checkpoint state.

@@ -8,7 +8,7 @@ AWS DynamoDB Point-in-Time Recovery can export table data to S3, but provides no
 
 - Stream multi-terabyte exports without loading into memory
 - Parallel workers with configurable concurrency
-- Checkpoint to S3 so an interrupted restore resumes where it stopped, at any worker count
+- Resumable by default: an interrupted restore picks up where it stopped, at any worker count, without having been asked to
 - Every data file checked against the manifest before the first write, including exports that were copied to another bucket
 - Automatic throttling handling with exponential backoff
 - Dry-run mode that reads and measures the whole export without writing
@@ -52,8 +52,8 @@ ddb-pitr --table my-table --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef
 # Read and measure the whole export without writing anything to the table
 ddb-pitr --table my-table --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef/ --dry-run
 
-# Resumable restore with an S3 checkpoint (safe to interrupt and restart)
-ddb-pitr --table my-table --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef/ --resume s3://my-bucket/checkpoints/restore-001.json
+# Record progress somewhere other than the export's bucket, for an export you may only read
+ddb-pitr --table my-table --export s3://source-bucket/AWSDynamoDB/01234567890-abcdef/ --resume s3://my-bucket/checkpoints/restore-001.json
 
 # High-throughput restore for a large export
 ddb-pitr --table my-table --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef/ --workers 50 --batch 25
@@ -65,7 +65,9 @@ ddb-pitr --table my-table-replica --export s3://source-bucket/AWSDynamoDB/012345
 Exit status is 0 when every record in the export was applied, 3 when the restore
 finished but skipped records it could not read (the first few are named on stderr with
 their file and offset, and the report records the total), and 1 when the restore did
-not finish. Running a restore that exited 3 again does not change its outcome.
+not finish. Running a restore that exited 3 again does not change its outcome, and with
+`--resume` it exits 3 again: those records are gone for good, and the count follows the
+restore rather than the run that found them.
 
 ## Configuration
 
@@ -77,32 +79,107 @@ not finish. Running a restore that exited 3 again does not change its outcome.
 ### Optional Flags
 
 - `--region`: AWS region. Left out, the region comes from your AWS environment or profile the same way the AWS CLI resolves it, and the restore fails early if nothing resolves.
-- `--resume`: S3 URI where progress is recorded, which is what makes an interrupted restore resumable. Without it, progress is kept in memory and an interrupted restore starts over.
+- `--resume`: S3 URI of the object progress is recorded in, naming a bucket and a key. Left out, progress goes to a key in the export's own bucket. See [Checkpoint and resume](#checkpoint-and-resume).
+- `--no-resume`: record no progress at all, so an interrupted restore starts over. For an export in a bucket you may read but not write.
 - `--workers`: how many files are read and written in parallel (default 10).
 - `--batch`: how many items go in one DynamoDB write (max and default 25). Together with `--workers` this sets how hard the restore pushes the target table; lowering them is the remedy for sustained throttling.
-- `--report`: S3 URI for the final report. It is printed to stdout either way.
+- `--report`: S3 URI for the final report, naming a bucket and a key. It is printed to stdout either way.
 - `--dry-run`: read, decode and measure the whole export without writing to the table and without recording a checkpoint, so a later real restore cannot skip work that was only measured.
-- `--shutdown-timeout`: how long an interrupted restore has to finish its in-flight writes and record where it stopped (default 5m).
+- `--shutdown-timeout`: how long an interrupted restore has to record where it stopped (default 5m). Writes already in flight when the interruption arrives are abandoned rather than finished; a resume redoes them.
 - `--version`: print the build identity and exit.
 
-## Resuming an interrupted restore
+## Checkpoint and resume
+
+### What a resume guarantees
 
 A restore that is interrupted, whether by Ctrl-C, a container runtime's SIGTERM, a lost
-network or the machine going away, can be restarted with the same `--resume` URI and
-will finish the export. Nothing in the export is dropped by the interruption: work that
-was done is not repeated, and work that was not done is picked up, whatever `--workers`
-is set to on either run. A few items may be written a second time. That is safe, because
-every write replaces or removes a whole item, so applying it twice leaves the table
-exactly as applying it once does.
+network or the machine going away, can be run again with the same flags and will finish
+the export. Nothing in the export is dropped by the interruption: work that was done is
+not repeated, and work that was not done is picked up.
 
-A checkpoint belongs to one export and to one running restore. Pointing a different
-export at it is refused rather than resumed, since file names repeat across exports.
-A second restore started against a checkpoint one is already using is stopped as soon
-as it tries to record progress; do not delete the checkpoint in response, since both
-restores would then start over.
+Three things hold across the interruption.
 
-Without `--resume` progress is kept in memory only, and an interrupted restore starts
-over. A `--dry-run` never writes a checkpoint.
+- **No record is lost.** Every record the export contains ends up applied, whichever run
+  applied it.
+- **A few records are applied twice.** The batches in flight when the interruption
+  arrived are abandoned and redone. That is safe: every write replaces or removes a whole
+  item, so applying it twice leaves the table exactly as applying it once does.
+- **The shape of the second run is yours to choose.** `--workers`, `--batch` and even the
+  machine can all differ from the first run. Progress is recorded per data file, not per
+  worker, so nothing about how the first run was spread out is baked into it.
+
+### Where progress is recorded
+
+Progress goes to one small JSON object in S3. Left to itself the restore puts it in the
+export's own bucket, so a restore is resumable without anyone having thought about it:
+
+```
+s3://<export bucket>/ddb-pitr/checkpoints/<export id>.<table>.json
+```
+
+It sits outside the export's own directory, which stays exactly as DynamoDB wrote it. The
+key names both the export and the target table, because one export restored into two
+tables is two restores; sharing a checkpoint between them would let the second skip what
+the first finished and call a half-filled table done.
+
+Two flags change this.
+
+- `--resume s3://bucket/key` puts the checkpoint where you say instead. Use it when the
+  export is in a bucket you may read but not write, which is the usual shape of a
+  cross-account restore.
+- `--no-resume` records nothing. An interrupted restore then starts over from the
+  beginning of the export.
+
+A `--dry-run` never records progress, whatever else was asked for, so a later real
+restore cannot skip work that was only measured.
+
+> **Upgrading.** Earlier versions wrote nothing unless `--resume` said where, so an
+> invocation that worked before now needs `s3:PutObject` on the export's bucket and will
+> stop at the start without it. If the credentials you restore with may only read that
+> bucket, add `--resume` pointing somewhere writable, or `--no-resume` to keep the old
+> behaviour of starting over after an interruption.
+
+### Starting a restore
+
+Having read the export's manifest and any checkpoint already there, the restore writes
+the checkpoint once before it reads a single data file or writes a single item. That
+settles two questions while the target table is still untouched: whether the checkpoint
+can be written at all, and whether another restore already owns it. A restore that cannot
+record its progress stops there rather than discovering it hours in, with the table
+part-way filled.
+
+So a restore into a read-only export bucket fails immediately, and the fix is to name a
+writable location with `--resume` or to accept `--no-resume`.
+
+### One checkpoint, one restore
+
+A checkpoint belongs to one export and to one running restore.
+
+Pointing a different export at an existing checkpoint is refused rather than resumed,
+since file names repeat across exports and a resume would skip files by name collision.
+
+Two restores sharing one checkpoint is caught too: the second is stopped as soon as it
+tries to record progress. **Do not delete the checkpoint in response.** Deleting it makes
+both restores start over. Let the stopped one stay stopped, or give it its own `--resume`
+URI.
+
+### Records that cannot be read
+
+A line the restore cannot decode is skipped rather than failing the run, and the restore
+exits 3. Those records are gone for good: a resume does not read the files they were in
+again, so running the restore a second time cannot recover them.
+
+The count follows the restore rather than the run that found it. A resumed restore of an
+export that lost records still exits 3 and still names the count in its report, even
+though this run read past nothing. Re-running to be sure will not turn a 3 into a 0.
+
+The first twenty skipped lines are named on stderr with their file and offset, which is
+what you need to go and look at them in the export.
+
+### What a resume does not do
+
+It does not make a restore safe to run twice against a table something else is writing
+to, and it does not order anything. See [Verification](#verification).
 
 ## Verification
 

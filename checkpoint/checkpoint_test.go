@@ -18,12 +18,14 @@ import (
 )
 
 // testState is the progress a partly-finished restore would have recorded: one file
-// done and another part-way through.
+// done, another part-way through, and a line it could not decode. Every field is set,
+// because a store that quietly drops one loses progress a resume is owed.
 func testState() State {
 	return State{
 		ExportID:  "arn:aws:dynamodb:eu-north-1:123456789012:table/orders/export/01768385930622-efd1a093",
 		Completed: []string{"data-001.json.gz"},
 		Offsets:   map[string]int64{"data-002.json.gz": 1024},
+		Skipped:   3,
 	}
 }
 

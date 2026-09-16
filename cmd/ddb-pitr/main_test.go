@@ -5,6 +5,9 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/gurre/ddb-pitr/checkpoint"
+	"github.com/gurre/ddb-pitr/config"
 )
 
 // TestPositionalArgumentsAreRejectedByName verifies a word typed before the flags ends
@@ -35,6 +38,59 @@ func TestFlagsAloneMakeAConfiguration(t *testing.T) {
 	}
 	if cfg.Region != "" {
 		t.Errorf("expected no region when none was given, got %q", cfg.Region)
+	}
+}
+
+// TestTheDocumentedInvocationIsResumable verifies the shortest invocation the README
+// shows comes out resumable, without the operator having named a checkpoint. A restore
+// that only records progress when someone remembered a flag loses the whole export the
+// first time a machine goes away mid-run.
+func TestTheDocumentedInvocationIsResumable(t *testing.T) {
+	var out bytes.Buffer
+	cfg, err := parseArgs([]string{"--table", "orders", "--export", "s3://bucket/AWSDynamoDB/01234567890-abcdef/"}, &out)
+	if err != nil {
+		t.Fatalf("expected the flags accepted, got %v", err)
+	}
+	const want = "s3://bucket/ddb-pitr/checkpoints/01234567890-abcdef.orders.json"
+	if got := cfg.CheckpointURI(); got != want {
+		t.Errorf("CheckpointURI() = %q, want %q", got, want)
+	}
+}
+
+// TestNoResumeIsCarriedIntoTheConfiguration verifies --no-resume reaches the
+// configuration, which is the only way an operator can turn off a checkpoint they have
+// nowhere to write, such as an export in a bucket they may only read.
+func TestNoResumeIsCarriedIntoTheConfiguration(t *testing.T) {
+	var out bytes.Buffer
+	cfg, err := parseArgs([]string{"--table", "orders", "--export", "s3://bucket/export/", "--no-resume"}, &out)
+	if err != nil {
+		t.Fatalf("expected the flags accepted, got %v", err)
+	}
+	if got := cfg.CheckpointURI(); got != "" {
+		t.Errorf("expected no checkpoint with --no-resume, got %q", got)
+	}
+}
+
+// TestDefaultInvocationGetsADurableCheckpoint verifies the store behind a plain restore
+// is the one that outlives the process, and that --no-resume gets the one that does not.
+// Which store is wired in is the whole of whether a restore can be resumed.
+func TestDefaultInvocationGetsADurableCheckpoint(t *testing.T) {
+	cfg := &config.Config{TableName: "orders", ExportS3URI: "s3://bucket/AWSDynamoDB/0123-abc/"}
+	store, err := newCheckpointStore(cfg, nil)
+	if err != nil {
+		t.Fatalf("expected a checkpoint store, got %v", err)
+	}
+	if _, ok := store.(*checkpoint.S3Store); !ok {
+		t.Errorf("expected progress recorded in S3, got %T", store)
+	}
+
+	cfg.NoResume = true
+	store, err = newCheckpointStore(cfg, nil)
+	if err != nil {
+		t.Fatalf("expected a checkpoint store, got %v", err)
+	}
+	if _, ok := store.(*checkpoint.MemoryStore); !ok {
+		t.Errorf("expected --no-resume to record nothing durable, got %T", store)
 	}
 }
 

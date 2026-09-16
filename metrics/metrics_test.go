@@ -49,7 +49,7 @@ func TestNewMetricsCounters(t *testing.T) {
 	}
 
 	// Verify report includes new counters
-	report := m.GenerateReport()
+	report := m.GenerateReport(0)
 	if report.Throttles != 2 {
 		t.Errorf("report.Throttles = %d, want 2", report.Throttles)
 	}
@@ -113,7 +113,7 @@ func TestReportMarshalJSON(t *testing.T) {
 	m.RecordLost(5)
 	m.RecordBytes(1024)
 
-	report := m.GenerateReport()
+	report := m.GenerateReport(0)
 	data, err := json.Marshal(report)
 	if err != nil {
 		t.Fatalf("Marshal failed: %v", err)
@@ -176,12 +176,12 @@ func TestProcessingTimeIsSafeUnderConcurrentWriters(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for j := 0; j < batches; j++ {
-			m.GenerateReport()
+			m.GenerateReport(0)
 		}
 	}()
 	wg.Wait()
 
-	if got := m.GenerateReport().ProcessingTime; got != workers*batches*time.Millisecond {
+	if got := m.GenerateReport(0).ProcessingTime; got != workers*batches*time.Millisecond {
 		t.Errorf("ProcessingTime = %v, want %v", got, workers*batches*time.Millisecond)
 	}
 }
@@ -198,9 +198,6 @@ func TestReportCarriesTheWholeRun(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		m.RecordBatchWritten()
 	}
-	for i := 0; i < 5; i++ {
-		m.RecordCorrupt()
-	}
 	for i := 0; i < 2; i++ {
 		m.RecordThrottle()
 	}
@@ -211,7 +208,7 @@ func TestReportCarriesTheWholeRun(t *testing.T) {
 	m.RecordBytes(8)
 	m.RecordProcessingTime(9 * time.Millisecond)
 
-	report := m.GenerateReport()
+	report := m.GenerateReport(5)
 
 	if report.StartTime.IsZero() {
 		t.Error("report carries no start time")
@@ -280,7 +277,7 @@ func TestRecordProcessingTime(t *testing.T) {
 	m.RecordProcessingTime(100 * time.Millisecond)
 	m.RecordProcessingTime(200 * time.Millisecond)
 
-	if got := m.GenerateReport().ProcessingTime; got != 300*time.Millisecond {
+	if got := m.GenerateReport(0).ProcessingTime; got != 300*time.Millisecond {
 		t.Errorf("ProcessingTime = %v, want 300ms", got)
 	}
 }
@@ -294,7 +291,7 @@ func TestReportCountsBatches(t *testing.T) {
 	m.RecordBatchWritten()
 	m.RecordBatchWritten()
 
-	if got := m.GenerateReport().BatchesWritten; got != 3 {
+	if got := m.GenerateReport(0).BatchesWritten; got != 3 {
 		t.Errorf("BatchesWritten = %d, want 3", got)
 	}
 }
@@ -312,7 +309,7 @@ func TestReportDividesWorkByElapsedTime(t *testing.T) {
 	}
 	m.RecordBytes(2048)
 
-	report := m.GenerateReport()
+	report := m.GenerateReport(0)
 
 	// Elapsed is just over two seconds, so the rates sit just under half the totals.
 	if report.Throughput > 50 || report.Throughput < 49 {
@@ -352,13 +349,12 @@ func TestMetricsHappyPath(t *testing.T) {
 	m.RecordProcessed(1)
 	m.RecordBatchWritten()
 	m.RecordError()
-	m.RecordCorrupt()
 
 	// Simulate some processing time
 	time.Sleep(100 * time.Millisecond)
 
 	// Generate report
-	report := m.GenerateReport()
+	report := m.GenerateReport(1)
 
 	// Verify results
 	if report.TotalItems != 2 {
