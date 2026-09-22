@@ -7,10 +7,13 @@ AWS DynamoDB Point-in-Time Recovery can export table data to S3, but provides no
 ## Features
 
 - Stream multi-terabyte exports without loading into memory
-- Parallel workers with configurable concurrency
+- Writes spread across the whole target table rather than the few partitions the files
+  in flight happen to belong to
+- Write rate that follows the table's capacity, so a small table restores at its
+  capacity and a large one is not held back
 - Resumable by default: an interrupted restore picks up where it stopped, at any worker count, without having been asked to
 - Every data file checked against the manifest before the first write, including exports that were copied to another bucket
-- Automatic throttling handling with exponential backoff
+- Automatic throttling handling
 - Dry-run mode that reads and measures the whole export without writing
 
 ## Supported Operations
@@ -56,7 +59,7 @@ ddb-pitr --table my-table --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef
 ddb-pitr --table my-table --export s3://source-bucket/AWSDynamoDB/01234567890-abcdef/ --resume s3://my-bucket/checkpoints/restore-001.json
 
 # High-throughput restore for a large export
-ddb-pitr --table my-table --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef/ --workers 50 --batch 25
+ddb-pitr --table my-table --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef/ --readers 200 --workers 50
 
 # Cross-region restore, keeping the report
 ddb-pitr --table my-table-replica --export s3://source-bucket/AWSDynamoDB/01234567890-abcdef/manifest-summary.json --region eu-west-1 --report s3://dest-bucket/reports/restore-001.json
@@ -81,8 +84,9 @@ restore rather than the run that found them.
 - `--region`: AWS region. Left out, the region comes from your AWS environment or profile the same way the AWS CLI resolves it, and the restore fails early if nothing resolves.
 - `--resume`: S3 URI of the object progress is recorded in, naming a bucket and a key. Left out, progress goes to a key in the export's own bucket. See [Checkpoint and resume](#checkpoint-and-resume).
 - `--no-resume`: record no progress at all, so an interrupted restore starts over. For an export in a bucket you may read but not write.
-- `--workers`: how many files are read and written in parallel (default 10).
-- `--batch`: how many items go in one DynamoDB write (max and default 25). Together with `--workers` this sets how hard the restore pushes the target table; lowering them is the remedy for sustained throttling.
+- `--readers`: how many of the export's data files are read at once (default 50). This is how widely the restore's writes are spread over the target table. See [Using the whole table](#using-the-whole-table).
+- `--workers`: how many writes to the target table are in flight at once (default 10).
+- `--batch`: the largest number of items the restore will put in one DynamoDB write (max and default 25). It is an upper bound, not a fixed size: a table that cannot accept that many gets smaller writes without being asked.
 - `--report`: S3 URI for the final report, naming a bucket and a key. It is printed to stdout either way.
 - `--dry-run`: read, decode and measure the whole export without writing to the table and without recording a checkpoint, so a later real restore cannot skip work that was only measured.
 - `--shutdown-timeout`: how long an interrupted restore has to record where it stopped (default 5m). Writes already in flight when the interruption arrives are abandoned rather than finished; a resume redoes them.
@@ -104,9 +108,9 @@ Three things hold across the interruption.
 - **A few records are applied twice.** The batches in flight when the interruption
   arrived are abandoned and redone. That is safe: every write replaces or removes a whole
   item, so applying it twice leaves the table exactly as applying it once does.
-- **The shape of the second run is yours to choose.** `--workers`, `--batch` and even the
-  machine can all differ from the first run. Progress is recorded per data file, not per
-  worker, so nothing about how the first run was spread out is baked into it.
+- **The shape of the second run is yours to choose.** `--readers`, `--workers`, `--batch`
+  and even the machine can all differ from the first run. Progress is recorded per data
+  file, not per worker, so nothing about how the first run was spread out is baked into it.
 
 ### Where progress is recorded
 
@@ -181,6 +185,50 @@ what you need to go and look at them in the export.
 It does not make a restore safe to run twice against a table something else is writing
 to, and it does not order anything. See [Verification](#verification).
 
+## Using the whole table
+
+A restore of a large export is usually limited by the target table, and the limit is
+rarely the table's total capacity. DynamoDB divides a table into partitions and gives
+each its own share; an export is written one file per source partition, so everything in
+one file belongs to one narrow slice of the key space. A restore that writes a file at a
+time is a restore aimed at one partition at a time, and it throttles there while the
+rest of the table sits idle.
+
+So the restore reads many files at once and builds each write from all of them. Writing
+throughput then follows the size of the table rather than the number of files in flight,
+and adding capacity to the table speeds the restore up. `--readers` is the setting that
+decides how wide the spread is; `--workers` decides how many writes are in flight.
+
+Reading a file costs memory while it is open, so `--readers` is bounded by the machine
+rather than by the table. Around 7 MB per file is a safe estimate.
+
+Two consequences worth knowing. Items are written in no particular order, which is
+already true of any export: an export holds one record per key, so nothing within it
+depends on order. And a restore now holds decoded items in memory between reading and
+writing, bounded by `--workers` and `--batch`; an interruption abandons them and a
+resume rewrites them, which is safe for the reasons in
+[What a resume guarantees](#what-a-resume-guarantees).
+
+## Keeping pace with the table
+
+Until the table refuses something, the restore writes as fast as it can. When the table
+does refuse, the restore learns the rate it will accept and sizes its writes to fit,
+rather than resending a batch the table has already said is too big.
+
+This matters most on a table with little provisioned capacity, where a write of
+twenty-five items can never be accepted whole. Restoring into one of those used to mean
+finding a `--batch` and `--workers` small enough by hand, and a restore that spent its
+time collecting refusals until you did. It now runs at the table's capacity as it
+stands.
+
+The rate is not treated as fixed. A restore climbs back up when capacity returns, so
+autoscaling or a partition split during a long restore is picked up within seconds
+rather than needing the restore to be started again. The progress line reports the rate
+the restore has settled on, and reports `pace -` while nothing is limiting it.
+
+Sustained throttling is therefore not something to tune away. If a restore is slower
+than you need, raise the table's capacity; the restore will use it.
+
 ## Verification
 
 Before the first write, every data file the export's manifest lists is checked against
@@ -208,10 +256,10 @@ The tool is organized into several packages:
 - `config`: Configuration parsing and validation
 - `manifest`: Loading and verifying manifest files
 - `itemimage`: Decoding JSON into DynamoDB operations
-- `writer`: Writing operations to DynamoDB
+- `writer`: Writing operations to DynamoDB at the rate the table accepts
 - `checkpoint`: Saving and loading progress
 - `metrics`: Collecting counters and histograms
-- `coordinator`: Worker pool orchestration
+- `coordinator`: Reader and writer pools, and the progress between them
 - `aws`: AWS service abstractions
 
 External dependencies:
@@ -265,9 +313,9 @@ request. That is stricter than `run` alone, which quietly ignores configuration 
 does not know.
 
 `gocyclo` is set to its default threshold of 30. The stricter 15 the config used to name
-was never in effect, and four functions sit above it: `Coordinator.Run`,
-`Coordinator.worker`, `DynamoDBWriter.writeRequests` and `generateRandomItem`.
-Tightening it means splitting those first.
+was never in effect, and six functions sit above it: `Coordinator.Run`,
+`Coordinator.readFiles`, `Coordinator.writeItems`, `Config.Validate`,
+`JSONDecoder.Decode` and `generateRandomItem`. Tightening it means splitting those first.
 
 ## Licence
 

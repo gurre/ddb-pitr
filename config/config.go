@@ -27,8 +27,9 @@ type Config struct {
 	ResumeKey       string        // S3 URI of the checkpoint; empty means the one CheckpointURI derives
 	ReportS3URI     string        // S3 URI for the final report
 	ShutdownTimeout time.Duration // How long an interrupted restore has to record where it stopped
-	MaxWorkers      int           // Maximum number of concurrent workers
-	BatchSize       int           // Batch size for DynamoDB writes (≤25)
+	MaxWorkers      int           // Concurrent writes to the target table
+	Readers         int           // Data files read at once, which is how widely writes are spread over the table's partitions
+	BatchSize       int           // Largest batch the restore will send to DynamoDB (≤25)
 	DryRun          bool          // If true, don't actually write to DynamoDB
 	NoResume        bool          // If true, record no progress; an interrupted restore starts over
 }
@@ -155,6 +156,12 @@ func (c *Config) Validate() error {
 
 	if c.MaxWorkers < 1 {
 		return fmt.Errorf("max workers must be at least 1")
+	}
+
+	// One file open is the narrowest a restore can be: every batch then carries items
+	// from one exported partition, which is the shape this setting exists to widen.
+	if c.Readers < 1 {
+		return fmt.Errorf("readers must be at least 1")
 	}
 
 	if c.BatchSize < 1 || c.BatchSize > 25 {

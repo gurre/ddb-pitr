@@ -47,7 +47,7 @@ func TestDiscardReportsWhatARestoreWouldWrite(t *testing.T) {
 	var realItems, realBytes int
 	restore := NewDynamoDBWriter(&scriptedClient{}, "test-table", 25,
 		Callbacks{OnWrite: func(items, bytes int) { realItems, realBytes = items, bytes }},
-		WithBackoff(&instantBackoff{}))
+		WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 	if err := restore.WriteBatch(context.Background(), ops); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
 	}

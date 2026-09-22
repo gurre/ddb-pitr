@@ -120,7 +120,7 @@ func TestNewDynamoDBWriterAcceptsTheBatchSizeLimits(t *testing.T) {
 	for _, size := range []int{1, 25} {
 		t.Run(fmt.Sprintf("size %d", size), func(t *testing.T) {
 			client := &scriptedClient{}
-			w := NewDynamoDBWriter(client, "test-table", size, Callbacks{}, WithBackoff(&instantBackoff{}))
+			w := NewDynamoDBWriter(client, "test-table", size, Callbacks{}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 			if err := w.WriteBatch(context.Background(), putOps(size)); err != nil {
 				t.Fatalf("WriteBatch failed: %v", err)
 			}
@@ -136,7 +136,7 @@ func TestNewDynamoDBWriterAcceptsTheBatchSizeLimits(t *testing.T) {
 // writing to the table with no deadline and no way to stop it.
 func TestWriteBatchSendsTheCallersContext(t *testing.T) {
 	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	ctx := context.WithValue(context.Background(), callerContextKey{}, true)
 	ops := append(putOps(1), updateOp())
@@ -155,7 +155,7 @@ func TestWriteBatchSendsTheCallersContext(t *testing.T) {
 func TestBackoffWaitSendsTheCallersContext(t *testing.T) {
 	client := &scriptedClient{batchErrs: []error{throttle(), nil}}
 	backoff := &contextRecordingBackoff{}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(backoff))
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(backoff), withPaceClock(newTestClock()))
 
 	ctx := context.WithValue(context.Background(), callerContextKey{}, true)
 	if err := w.WriteBatch(ctx, putOps(1)); err != nil {
@@ -173,8 +173,9 @@ func TestBackoffWaitSendsTheCallersContext(t *testing.T) {
 func TestBatchWriteRetriesThrottlingUntilSuccess(t *testing.T) {
 	client := &scriptedClient{batchErrs: []error{throttle(), throttle(), nil}}
 	counts := &callbackCounts{}
-	backoff := &instantBackoff{}
-	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(backoff))
+	clock := newTestClock()
+	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(),
+		WithBackoff(&instantBackoff{}), withPaceClock(clock))
 
 	if err := w.WriteBatch(context.Background(), putOps(1)); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
@@ -189,9 +190,10 @@ func TestBatchWriteRetriesThrottlingUntilSuccess(t *testing.T) {
 	if counts.lost != 0 {
 		t.Errorf("expected no lost items, got %d", counts.lost)
 	}
-	// Each successive throttle must back off further, or a throttled table never recovers.
-	if len(backoff.attempts) != 2 || backoff.attempts[0] != 0 || backoff.attempts[1] != 1 {
-		t.Errorf("expected waits for attempts 0 and 1, got %v", backoff.attempts)
+	// Each throttled attempt waits for the capacity it needs before it goes again, or
+	// a throttled table is simply asked the same question until it answers.
+	if waits := clock.waits(); len(waits) != 2 || waits[0] <= 0 || waits[1] <= 0 {
+		t.Errorf("expected both retries to wait for capacity, got %v", waits)
 	}
 }
 
@@ -202,7 +204,7 @@ func TestBatchWriteRetriesTransientErrorWithoutCountingThrottle(t *testing.T) {
 	client := &scriptedClient{batchErrs: []error{errors.New("connection reset"), nil}}
 	counts := &callbackCounts{}
 	backoff := &instantBackoff{}
-	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(backoff))
+	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(backoff), withPaceClock(newTestClock()))
 
 	if err := w.WriteBatch(context.Background(), putOps(1)); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
@@ -232,8 +234,9 @@ func TestBatchWriteResubmitsOnlyUnprocessedItems(t *testing.T) {
 		{},
 	}}
 	counts := &callbackCounts{}
-	backoff := &instantBackoff{}
-	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(backoff))
+	clock := newTestClock()
+	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(),
+		WithBackoff(&instantBackoff{}), withPaceClock(clock))
 
 	if err := w.WriteBatch(context.Background(), putOps(3)); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
@@ -251,9 +254,10 @@ func TestBatchWriteResubmitsOnlyUnprocessedItems(t *testing.T) {
 	if counts.retries != 1 {
 		t.Errorf("expected the resubmission to be reported as 1 retry, got %d", counts.retries)
 	}
-	// Repeated rejection must back off further each time, as it signals capacity pressure.
-	if len(backoff.attempts) != 2 || backoff.attempts[0] != 0 || backoff.attempts[1] != 1 {
-		t.Errorf("expected waits for attempts 0 and 1, got %v", backoff.attempts)
+	// Each rejection waits for the capacity the resubmission needs; resending it at
+	// once would just collect the same rejection.
+	if waits := clock.waits(); len(waits) != 2 || waits[0] <= 0 || waits[1] <= 0 {
+		t.Errorf("expected both resubmissions to wait for capacity, got %v", waits)
 	}
 }
 
@@ -263,7 +267,7 @@ func TestBatchWriteResubmitsOnlyUnprocessedItems(t *testing.T) {
 func TestBatchWriteSurrendersBatchAfterMaxRetries(t *testing.T) {
 	client := &scriptedClient{batchErrs: []error{errors.New("internal server error")}}
 	counts := &callbackCounts{}
-	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	err := w.WriteBatch(context.Background(), putOps(4))
 	if err == nil {
@@ -287,7 +291,7 @@ func TestBatchWriteSurrendersBatchAfterMaxRetries(t *testing.T) {
 // is the only thing that stops them during shutdown.
 func TestBatchWriteStopsRetryingWhenContextEnds(t *testing.T) {
 	client := &scriptedClient{batchErrs: []error{throttle()}}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -305,11 +309,26 @@ func TestBatchWriteStopsRetryingWhenContextEnds(t *testing.T) {
 // checkpoint past them, so an interrupted restore would resume having silently skipped a
 // batch.
 func TestWriteSurrendersBatchWhenBackoffStops(t *testing.T) {
-	client := &scriptedClient{batchErrs: []error{throttle()}}
+	client := &scriptedClient{batchErrs: []error{errors.New("connection reset")}}
 	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&stoppedBackoff{}))
 
 	// The context is live, so a caller reading the context's own error would find
 	// nothing wrong and report the batch as written.
+	if err := w.WriteBatch(context.Background(), putOps(1)); err == nil {
+		t.Error("expected a surrendered batch to be reported as an error")
+	}
+}
+
+// TestWriteSurrendersBatchWhenTheWaitForCapacityIsCutShort verifies the same for the
+// other wait: a throttled batch waits for the table to have capacity, and a restore
+// stopping during that wait must surrender the batch rather than report it written.
+func TestWriteSurrendersBatchWhenTheWaitForCapacityIsCutShort(t *testing.T) {
+	client := &scriptedClient{batchErrs: []error{throttle()}}
+	clock := newTestClock()
+	clock.refuse = true
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{},
+		WithBackoff(&instantBackoff{}), withPaceClock(clock))
+
 	if err := w.WriteBatch(context.Background(), putOps(1)); err == nil {
 		t.Error("expected a surrendered batch to be reported as an error")
 	}
@@ -320,7 +339,7 @@ func TestWriteSurrendersBatchWhenBackoffStops(t *testing.T) {
 func TestBatchWriteReportsNoRetryOnFirstAttempt(t *testing.T) {
 	client := &scriptedClient{}
 	counts := &callbackCounts{}
-	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	if err := w.WriteBatch(context.Background(), putOps(1)); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
@@ -335,7 +354,7 @@ func TestBatchWriteReportsNoRetryOnFirstAttempt(t *testing.T) {
 // split across calls instead of being sent in one oversized request, which DynamoDB rejects.
 func TestBatchWriteSplitsOversizedInput(t *testing.T) {
 	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 2, Callbacks{}, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 2, Callbacks{}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	if err := w.WriteBatch(context.Background(), putOps(5)); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
@@ -354,7 +373,7 @@ func TestBatchWriteSplitsOversizedInput(t *testing.T) {
 // written as one BatchWriteItem, the same as puts, rather than as one call per item.
 func TestUpdateOnlyBatchIsOneBatchWrite(t *testing.T) {
 	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	ops := []itemimage.Operation{updateOp(), updateOp(), updateOp()}
 	if err := w.WriteBatch(context.Background(), ops); err != nil {
@@ -375,7 +394,7 @@ func TestReportedBytesAreTheLineLengthsRead(t *testing.T) {
 	var gotItems, gotBytes int
 	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{
 		OnWrite: func(items, bytes int) { gotItems, gotBytes = items, bytes },
-	}, WithBackoff(&instantBackoff{}))
+	}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	ops := append(putOps(2), itemimage.Operation{
 		Type:  itemimage.OpDelete,
@@ -415,7 +434,7 @@ func TestUnprocessedRoundsDoNotConsumeTheTransientBudget(t *testing.T) {
 		batchErrs:    []error{nil, nil, nil, nil, nil, &types.InternalServerError{Message: ptr("500")}, nil},
 	}
 	counts := &callbackCounts{}
-	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	if err := w.WriteBatch(context.Background(), putOps(3)); err != nil {
 		t.Fatalf("expected the batch written after the fault, got %v", err)
@@ -459,7 +478,7 @@ func TestEveryThrottleKindIsRetriedUntilSuccess(t *testing.T) {
 			errs = append(errs, nil)
 			client := &scriptedClient{batchErrs: errs}
 			counts := &callbackCounts{}
-			w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}))
+			w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 			if err := w.WriteBatch(context.Background(), putOps(1)); err != nil {
 				t.Fatalf("expected the batch written once throttling eased, got %v", err)
@@ -476,7 +495,7 @@ func TestEveryThrottleKindIsRetriedUntilSuccess(t *testing.T) {
 // not know fails the batch at once, rather than being dropped from it silently.
 func TestUnknownOperationTypeIsRefused(t *testing.T) {
 	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	if err := w.WriteBatch(context.Background(), []itemimage.Operation{{Type: itemimage.OperationType(99)}}); err == nil {
 		t.Fatal("expected an unknown operation type refused")
@@ -498,7 +517,7 @@ func TestLostCountIsWhatRemainedUnwritten(t *testing.T) {
 		batchErrs:    []error{nil, errors.New("validation failed")},
 	}
 	counts := &callbackCounts{}
-	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, counts.callbacks(), WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	if err := w.WriteBatch(context.Background(), putOps(3)); err == nil {
 		t.Fatal("expected the batch given up")

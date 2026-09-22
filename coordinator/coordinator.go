@@ -1,5 +1,11 @@
-// Package coordinator drives a restore: it loads and verifies the export, hands its
-// data files to a pool of workers, checkpoints their progress and reports the outcome.
+// Package coordinator drives a restore: it loads and verifies the export, reads its
+// data files into a pool of writers, checkpoints their progress and reports the outcome.
+//
+// Reading and writing are separate pools joined by a channel of decoded items. A data
+// file holds one contiguous slice of the exported table's key space, so a batch built
+// from one file is a batch aimed at one target partition; drawing every batch from all
+// the files open at once is what lets a restore use the whole table rather than a few
+// partitions of it.
 package coordinator
 
 import (
@@ -40,17 +46,18 @@ const streamFromStart int64 = 0
 // Zero cannot mean that, since the first line of every file sits at offset zero.
 const noOffset int64 = -1
 
-// WorkerStatus is what one worker has done and where it is, for the progress line.
+// WorkerStatus is what one goroutine of either pool has done, for the progress line.
+// Readers report activity and errors; only writers ever add items and batches.
 // Fields are ordered largest-to-smallest for optimal memory alignment.
 type WorkerStatus struct {
 	LastErrorTime time.Time // When the last error occurred (24 bytes)
 	StartTime     time.Time // When the worker started (24 bytes)
 	LastActive    time.Time // Last activity timestamp (24 bytes)
 	LastError     error     // Last error encountered (16 bytes - interface)
-	CurrentFile   string    // Currently processing file (16 bytes - string header)
 	ItemsWritten  int64     // Number of items written (8 bytes)
 	BatchesCount  int64     // Number of batches processed (8 bytes)
 	ID            int       // Worker identifier (8 bytes on 64-bit)
+	IsReader      bool      // Whether this is a reader rather than a writer (1 byte)
 }
 
 // ReportUploader uploads reports to S3.
@@ -98,6 +105,23 @@ func WithStreamBackoff(b Backoffer) Option {
 	}
 }
 
+// WithBatchLinger replaces how long a partly filled batch waits for more items before
+// it is written anyway. The default is 50ms. Shorter trades larger requests for lower
+// latency at the tail of a restore; it may not be zero, which would send every item as
+// its own request.
+// Example:
+//
+//	coord := coordinator.NewCoordinator(cfg, loader, streamer, parser, w, store, uploader, m,
+//	    coordinator.WithBatchLinger(10*time.Millisecond))
+func WithBatchLinger(d time.Duration) Option {
+	return func(c *Coordinator) {
+		if d <= 0 {
+			panic(fmt.Sprintf("coordinator: batch linger %s is not positive", d))
+		}
+		c.linger = d
+	}
+}
+
 // Coordinator runs the restore: worker coordination, checkpointing and progress
 // reporting.
 type Coordinator struct {
@@ -110,6 +134,7 @@ type Coordinator struct {
 	metrics        *metrics.Metrics
 	reportUploader ReportUploader
 	backoff        Backoffer
+	linger         time.Duration // How long a partly filled batch waits for more items
 
 	// progress owns what the restore has finished; the store is only ever written
 	// from a snapshot of it, taken under saveMu so the object in S3 advances in the
@@ -117,8 +142,8 @@ type Coordinator struct {
 	progress *progress
 	saveMu   sync.Mutex
 
-	// Per-worker status, for the progress line
-	workerStatus map[int]*WorkerStatus
+	// Per-goroutine status of both pools, for the progress line
+	workerStatus map[statusKey]*WorkerStatus
 	statusMu     sync.RWMutex
 
 	// Progress tracking for percentage and throughput calculation
@@ -252,8 +277,9 @@ func NewCoordinator(
 		metrics:        m,
 		reportUploader: reportUploader,
 		backoff:        writer.NewExponentialBackoff(time.Second, 30*time.Second),
+		linger:         defaultBatchLinger,
 		progress:       newProgress("", checkpoint.State{}),
-		workerStatus:   make(map[int]*WorkerStatus),
+		workerStatus:   make(map[statusKey]*WorkerStatus),
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -360,7 +386,10 @@ func (c *Coordinator) Run(ctx context.Context) error {
 	}
 
 	tasks := make(chan manifest.FileMeta)
-	var wg sync.WaitGroup
+	// Buffered by one full batch per writer, so a reader that is ahead has somewhere to
+	// put its items and the writers always have a batch's worth to choose from.
+	items := make(chan item, c.cfg.MaxWorkers*c.cfg.BatchSize)
+	var readers, writers sync.WaitGroup
 
 	// The reporter is stopped and waited for below rather than left to notice the run
 	// ending, so its last line cannot land in the middle of the final report.
@@ -372,22 +401,40 @@ func (c *Coordinator) Run(ctx context.Context) error {
 		c.reportProgress(reportCtx)
 	}()
 
-	// Start workers
+	// The two pools are started together and stopped in order: the readers drain the
+	// file list, then the item channel is closed, then the writers drain what is left
+	// in it. Closing the item channel any earlier would drop decoded items on the floor.
+	for i := 0; i < c.cfg.Readers; i++ {
+		readers.Add(1)
+		go func(readerID int) {
+			defer readers.Done()
+			c.initWorker(readerID, true)
+			if err := c.readFiles(runCtx, readerID, tasks, items); err != nil {
+				fail(fmt.Errorf("reader %d failed: %w", readerID, err))
+			}
+		}(i)
+	}
 	for i := 0; i < c.cfg.MaxWorkers; i++ {
-		wg.Add(1)
-		go func(workerID int) {
-			defer wg.Done()
-			c.initWorker(workerID)
-			if err := c.worker(runCtx, workerID, tasks); err != nil {
-				fail(fmt.Errorf("worker %d failed: %w", workerID, err))
+		writers.Add(1)
+		go func(writerID int) {
+			defer writers.Done()
+			c.initWorker(writerID, false)
+			if err := c.writeItems(runCtx, writerID, items); err != nil {
+				fail(fmt.Errorf("writer %d failed: %w", writerID, err))
 			}
 		}(i)
 	}
 
-	workersDone := make(chan struct{})
+	readersDone := make(chan struct{})
 	go func() {
-		wg.Wait()
-		close(workersDone)
+		readers.Wait()
+		close(readersDone)
+		close(items)
+	}()
+	writersDone := make(chan struct{})
+	go func() {
+		writers.Wait()
+		close(writersDone)
 	}()
 
 	// Send tasks. Handing one to a pool that has already given up would block forever,
@@ -401,7 +448,7 @@ dispatch:
 
 		select {
 		case tasks <- file:
-		case <-workersDone:
+		case <-readersDone:
 			break dispatch
 		case <-runCtx.Done():
 			break dispatch
@@ -409,11 +456,12 @@ dispatch:
 	}
 	close(tasks)
 
-	<-workersDone
+	<-readersDone
+	<-writersDone
 	stopReporting()
 	<-reporterDone
 
-	// Whatever the workers got through is saved once they have all stopped, however
+	// Whatever the pools got through is saved once they have all stopped, however
 	// the run is ending. An interrupted run's last batches would otherwise be lost
 	// with the interval save they never reached. The caller's context may be the very
 	// thing that ended the run, so the save gets a fresh one bounded by the shutdown
@@ -482,29 +530,49 @@ func shutdownError(cause, saveErr error) error {
 	return cause
 }
 
-// initWorker initializes a worker's status tracking
-func (c *Coordinator) initWorker(id int) {
+// initWorker initializes a pool member's status tracking. Readers and writers are
+// numbered separately, so a status is identified by its role as well as its id.
+func (c *Coordinator) initWorker(id int, isReader bool) {
 	c.statusMu.Lock()
 	defer c.statusMu.Unlock()
-	c.workerStatus[id] = &WorkerStatus{
-		ID:        id,
-		StartTime: time.Now(),
+	now := time.Now()
+	c.workerStatus[statusKey{id: id, reader: isReader}] = &WorkerStatus{
+		ID:         id,
+		IsReader:   isReader,
+		StartTime:  now,
+		LastActive: now,
 	}
 }
 
-// updateWorkerStatus applies fn to a worker's status and stamps it as active
-func (c *Coordinator) updateWorkerStatus(id int, fn func(*WorkerStatus)) {
+// updateWorkerStatus applies fn to a pool member's status and stamps it as active.
+// An id with no status is a wiring mistake: every pool member registers before it runs,
+// and quietly dropping the update would lose an error report with it.
+func (c *Coordinator) updateWorkerStatus(key statusKey, fn func(*WorkerStatus)) {
 	c.statusMu.Lock()
 	defer c.statusMu.Unlock()
-	if status, ok := c.workerStatus[id]; ok {
-		fn(status)
-		status.LastActive = time.Now()
+	status, ok := c.workerStatus[key]
+	if !ok {
+		panic(fmt.Sprintf("coordinator: no status registered for %s %d", key.role(), key.id))
 	}
+	fn(status)
+	status.LastActive = time.Now()
 }
 
-// workerIdleTimeout is how long a worker may go without activity before the progress
-// line stops counting it among the active workers.
+// workerIdleTimeout is how long a pool member may go without activity before the
+// progress line stops counting it among the active ones.
 const workerIdleTimeout = 10 * time.Second
+
+// linesPerStamp is how many lines a reader gets through between stamps of its status.
+// A reader reports nothing per line, so without this one working through a large file
+// would look stopped for as long as the file takes; counting lines rather than
+// consulting the clock keeps the check off the hot path's budget.
+const linesPerStamp = 4096
+
+// markActive stamps a pool member as still working, which is all the progress line
+// needs from a member that has nothing else to report.
+func (c *Coordinator) markActive(key statusKey) {
+	c.updateWorkerStatus(key, func(*WorkerStatus) {})
+}
 
 // bytesPerMB converts the byte counters into the megabytes the progress line reports.
 const bytesPerMB = 1024 * 1024
@@ -512,25 +580,38 @@ const bytesPerMB = 1024 * 1024
 // progressSnapshot is the point-in-time view of the restore that the progress line renders.
 // Fields are ordered largest-to-smallest for memory alignment.
 type progressSnapshot struct {
-	ItemsPerSec   float64 // Items written per second since the previous snapshot
-	MBPerSec      float64 // Megabytes of export read per second since the previous snapshot
-	Percent       float64 // Share of the manifest's item count written so far, capped at 100
-	TotalBatches  int64   // Batches written since the restore started
-	Throttles     int64
-	Retries       int64
-	LostItems     int64
-	Errors        int64
-	ActiveWorkers int // Workers that reported activity within workerIdleTimeout
+	ItemsPerSec  float64 // Items written per second since the previous snapshot
+	MBPerSec     float64 // Megabytes of export read per second since the previous snapshot
+	Percent      float64 // Share of the manifest's item count written so far, capped at 100
+	Pace         float64 // Write capacity units per second the table is currently allowing
+	TotalBatches int64   // Batches written since the restore started
+	Throttles    int64
+	Retries      int64
+	LostItems    int64
+	Errors       int64
+	ActiveReader int  // Readers that reported activity within workerIdleTimeout
+	ActiveWriter int  // Writers that reported activity within workerIdleTimeout
+	Paced        bool // Whether anything is limiting the write rate yet
 }
 
 // String renders the line an operator watches while a restore runs. Every number is
 // labelled where it appears, because the throttle, retry, lost and error counts drive
 // different responses and reading one as another sends the operator the wrong way.
+//
+// The two pool counts are shown apart because they say which end is the bottleneck:
+// idle writers mean the export is not being read fast enough, idle readers mean the
+// table is not accepting writes fast enough. The pace is what the table is currently
+// allowing, and reads as "-" until something has limited the restore at all, since a
+// restore nothing has throttled has no rate to report.
 func (s progressSnapshot) String() string {
+	pace := "-"
+	if s.Paced {
+		pace = fmt.Sprintf("%.0f WCU/s", s.Pace)
+	}
 	return fmt.Sprintf(
-		"Progress: %.1f%% (%.0f/s, %.1f MB/s) | %d batches | %d workers | %d throttles | %d retries | %d lost | %d errors",
-		s.Percent, s.ItemsPerSec, s.MBPerSec, s.TotalBatches, s.ActiveWorkers,
-		s.Throttles, s.Retries, s.LostItems, s.Errors)
+		"Progress: %.1f%% (%.0f/s, %.1f MB/s) | %d batches | %d readers | %d writers | pace %s | %d throttles | %d retries | %d lost | %d errors",
+		s.Percent, s.ItemsPerSec, s.MBPerSec, s.TotalBatches, s.ActiveReader, s.ActiveWriter,
+		pace, s.Throttles, s.Retries, s.LostItems, s.Errors)
 }
 
 // snapshot folds worker status and metrics into the numbers the progress line shows,
@@ -546,10 +627,14 @@ func (s progressSnapshot) String() string {
 func (c *Coordinator) snapshot(now time.Time) progressSnapshot {
 	c.statusMu.RLock()
 	var totalItems, totalBatches int64
-	activeWorkers := 0
+	activeReaders, activeWriters := 0, 0
 	for _, status := range c.workerStatus {
 		if now.Sub(status.LastActive) < workerIdleTimeout {
-			activeWorkers++
+			if status.IsReader {
+				activeReaders++
+			} else {
+				activeWriters++
+			}
 		}
 		totalItems += status.ItemsWritten
 		totalBatches += status.BatchesCount
@@ -557,14 +642,18 @@ func (c *Coordinator) snapshot(now time.Time) progressSnapshot {
 	c.statusMu.RUnlock()
 
 	bytesRead := c.metrics.BytesRead()
+	pace, paced := c.metrics.Pace()
 
 	snap := progressSnapshot{
-		TotalBatches:  totalBatches,
-		Throttles:     c.metrics.Throttles(),
-		Retries:       c.metrics.Retries(),
-		LostItems:     c.metrics.LostItems(),
-		Errors:        c.metrics.Errors(),
-		ActiveWorkers: activeWorkers,
+		TotalBatches: totalBatches,
+		Throttles:    c.metrics.Throttles(),
+		Retries:      c.metrics.Retries(),
+		LostItems:    c.metrics.LostItems(),
+		Errors:       c.metrics.Errors(),
+		ActiveReader: activeReaders,
+		ActiveWriter: activeWriters,
+		Pace:         pace,
+		Paced:        paced,
 	}
 
 	if elapsed := now.Sub(c.lastReportTime).Seconds(); elapsed > 0 {
@@ -627,21 +716,157 @@ func (c *Coordinator) saveProgress(ctx context.Context) error {
 	return c.store.Save(ctx, c.progress.snapshot())
 }
 
-// worker takes files from the task channel and restores each: streaming, decoding,
-// batching, writing and checkpointing, with the stream retried on failure.
+// dispatched is one line handed to a writer and not yet acknowledged. prev is the
+// furthest line the reader had examined before this one, which is what the file's
+// watermark falls back to while this line is still in flight.
+type dispatched struct {
+	offset int64
+	prev   int64
+	acked  bool
+}
+
+// fileLedger tracks, for one data file, which lines are in flight and how far the file
+// can be committed. Writers take items from many files at once and finish them out of
+// order, so the offset a resume restarts past cannot be the last line written: it has
+// to be the low watermark, the highest offset with nothing unfinished below it.
 //
-// HOT PATH: Core processing loop that orchestrates the data pipeline.
-// Each worker runs: Stream S3 -> Decode JSON -> Batch -> Write DynamoDB
+// One reader owns the dispatching end of a ledger; any writer may acknowledge into it.
+// Fields are ordered largest-to-smallest for memory alignment.
+type fileLedger struct {
+	pending  []dispatched  // Lines handed to writers, ascending by offset
+	key      string        // The data file this ledger belongs to
+	drained  chan struct{} // Closed once the file is read to the end and nothing is in flight
+	examined int64         // Furthest line dispatched or skipped; where a retry resumes from
+	mu       sync.Mutex
+	eof      bool // The reader has read the file to the end
+	closed   bool // drained has been closed
+}
+
+// newFileLedger opens a ledger for a file, starting from the offset a previous run
+// recorded, or noOffset when none did.
+func newFileLedger(key string, resumed int64) *fileLedger {
+	return &fileLedger{
+		key:      key,
+		drained:  make(chan struct{}),
+		examined: resumed,
+	}
+}
+
+// reached reports the furthest line the reader has dispatched or skipped. A stream
+// retry starts the file again from the beginning and passes over everything up to
+// this, so no line is handed to a writer twice within a run.
+func (l *fileLedger) reached() int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.examined
+}
+
+// dispatch records a line about to be handed to a writer. It is called before the item
+// is sent, never after: an acknowledgement arriving for a line the ledger has not
+// dispatched would leave the watermark past a line still in flight.
 //
-// The main performance bottlenecks in order are:
-//  1. JSON decoding in parser.Decode (~27% CPU, ~99% memory)
-//  2. Network I/O to S3 and DynamoDB
-//  3. Checkpoint saves (mitigated by batching every checkpointInterval batches)
+// Offsets only ever increase, since a retry passes over everything already reached.
+// A lower one would put pending out of order and silently corrupt the watermark, which
+// costs a resume the records between the two, so it fails here instead.
+func (l *fileLedger) dispatch(offset int64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if offset <= l.examined {
+		panic(fmt.Sprintf("coordinator: file %s dispatched offset %d after reaching %d",
+			l.key, offset, l.examined))
+	}
+	l.pending = append(l.pending, dispatched{offset: offset, prev: l.examined})
+	l.examined = offset
+}
+
+// skip notes a line that will never be written, which is one that could not be decoded.
+// It returns the file's watermark, which steps over the line once everything below it
+// has been acknowledged.
+func (l *fileLedger) skip(offset int64) int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if offset > l.examined {
+		l.examined = offset
+	}
+	return l.watermarkLocked()
+}
+
+// ack marks a dispatched line written and returns the file's watermark: the highest
+// offset with every line at or below it written or skipped. That is what a resume
+// restarts past, so it never passes a line another writer still holds.
+func (l *fileLedger) ack(offset int64) int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	// pending is ascending, appended by the single reader that owns the file, so the
+	// line is found by bisection rather than by scanning what is in flight.
+	i := sort.Search(len(l.pending), func(i int) bool { return l.pending[i].offset >= offset })
+	if i < len(l.pending) && l.pending[i].offset == offset {
+		l.pending[i].acked = true
+	}
+
+	// The acknowledged head is what the watermark may now pass. Reslicing rather than
+	// copying keeps this amortised: the abandoned prefix holds no pointers and goes
+	// when the slice next grows.
+	popped := 0
+	for popped < len(l.pending) && l.pending[popped].acked {
+		popped++
+	}
+	l.pending = l.pending[popped:]
+
+	l.closeIfDrainedLocked()
+	return l.watermarkLocked()
+}
+
+// finish records that the reader has read the file to the end. The file is done once
+// the writers holding its last lines have acknowledged them.
+func (l *fileLedger) finish() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.eof = true
+	l.closeIfDrainedLocked()
+}
+
+// closeIfDrainedLocked releases anything waiting on the file once it has been read to
+// the end and nothing is in flight.
+func (l *fileLedger) closeIfDrainedLocked() {
+	if l.eof && len(l.pending) == 0 && !l.closed {
+		l.closed = true
+		close(l.drained)
+	}
+}
+
+// watermarkLocked is the offset the file can be committed to. Nothing in flight means
+// everything examined is done; otherwise it stops short of the oldest line still out.
+func (l *fileLedger) watermarkLocked() int64 {
+	if len(l.pending) == 0 {
+		return l.examined
+	}
+	return l.pending[0].prev
+}
+
+// item is one decoded operation on its way from the reader that decoded it to whichever
+// writer picks it up, carrying what that writer needs to acknowledge it.
+// Fields are ordered largest-to-smallest for memory alignment.
+type item struct {
+	op     itemimage.Operation
+	ledger *fileLedger
+	offset int64
+}
+
+// readFiles takes data files from the task channel and turns each into a stream of
+// items for the writer pool, with the stream retried on failure.
 //
-// Concurrency is controlled by c.cfg.MaxWorkers.
-func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.FileMeta) error {
-	batch := make([]itemimage.Operation, 0, c.cfg.BatchSize)
+// HOT PATH: Stream S3 -> Decode JSON -> hand to a writer.
+// The dominant cost is JSON decoding in parser.Decode (~27% CPU, ~99% memory).
+//
+// How many of these run at once is what decides how widely the restore's writes are
+// spread over the target table: each file holds one contiguous slice of the exported
+// key space, so items from one file land on one or a very few target partitions.
+// Concurrency is c.cfg.Readers.
+func (c *Coordinator) readFiles(ctx context.Context, id int, tasks <-chan manifest.FileMeta, items chan<- item) error {
 	const maxRetries = 3
+	self := statusKey{id: id, reader: true}
 
 	// Use the bucket from the config
 	bucket := c.cfg.GetExportBucketName()
@@ -652,24 +877,14 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		c.updateWorkerStatus(id, func(s *WorkerStatus) {
-			s.CurrentFile = file.Key
-		})
-
 		// Files a previous run finished never reach here: dispatch drops them, and each
-		// file goes to one worker, so nothing can complete a file between the two.
-
-		// Offset of the last line handed to the writer, and batches since the last save.
-		var currentOffset int64
-		var batchesSinceCheckpoint int
-
-		// Furthest line examined in this file across attempts. A corrupt line sits
-		// above the last written one, so a retry re-reads it; without this it would
-		// be counted and named again on every attempt.
-		examined, _ := c.progress.resume(file.Key)
+		// file goes to one reader, so nothing can complete a file between the two.
+		resumed, _ := c.progress.resume(file.Key)
+		ledger := newFileLedger(file.Key, resumed)
 
 		// Stream and process the file with retries
 		var streamErr error
+		linesSinceStamp := 0
 		for retry := 0; retry < maxRetries; retry++ {
 			// The first attempt is not paced; every one after it waits longer than the
 			// last, so a file failing against a struggling S3 does not hammer it. A wait
@@ -679,38 +894,35 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 				return fmt.Errorf("stopped retrying file %s: %w", file.Key, stopRetrying(ctx))
 			}
 
-			// Every attempt reads the file from its start and skips what is already
-			// written, taken fresh from progress so a retry continues from the furthest
-			// point the failed attempt reached. Whatever the failed attempt left
-			// buffered goes with it: those lines are re-read and re-skipped or
-			// re-written by the next attempt, never carried over and written twice.
+			// Every attempt reads the file from its start and passes over everything the
+			// ledger has already reached, so a retry continues from the furthest point
+			// the failed attempt got to. Nothing is buffered in the reader, so a failed
+			// attempt leaves nothing behind to be written twice.
 			//
 			// The file is read from the start because the streamer's offset is a
 			// position in the stored object, while the offsets the callback reports and
-			// progress records are positions in the decompressed stream. The two only
+			// the ledger records are positions in the decompressed stream. The two only
 			// agree for an uncompressed file, and exports are gzipped.
-			startOffset, _ := c.progress.resume(file.Key)
-			batch = batch[:0]
-			batchesSinceCheckpoint = 0
-			currentOffset = startOffset
-
-			// HOT PATH: Inner loop - callback invoked for every JSON line from S3
 			streamErr = c.streamer.Stream(ctx, bucket, file.Key, streamFromStart, func(line []byte, byteOffset int64) error {
-				// Lines up to and including the recorded one are already written. The
-				// check precedes decoding, which is where the CPU and memory go.
-				if byteOffset <= startOffset {
-					return nil
+				linesSinceStamp++
+				if linesSinceStamp >= linesPerStamp {
+					linesSinceStamp = 0
+					c.markActive(self)
 				}
-				seen := byteOffset <= examined
-				if !seen {
-					examined = byteOffset
+
+				// Lines already dispatched are in flight or written, and lines already
+				// skipped have been counted. The check precedes decoding, which is where
+				// the CPU and memory go.
+				if byteOffset <= ledger.reached() {
+					return nil
 				}
 
 				// Decode is the main CPU/memory bottleneck (~27% CPU, ~99% memory)
 				op, err := c.parser.Decode(line)
 				if errors.Is(err, itemimage.ErrCorrupt) {
-					if !seen {
-						c.skipCorrupt(file.Key, byteOffset, err)
+					c.skipCorrupt(file.Key, byteOffset, err)
+					if mark := ledger.skip(byteOffset); mark != noOffset {
+						c.progress.record(file.Key, mark)
 					}
 					return nil
 				}
@@ -719,29 +931,20 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 					return err
 				}
 
-				currentOffset = byteOffset
-				batch = append(batch, op)
-
-				if len(batch) >= c.cfg.BatchSize {
-					batchesSinceCheckpoint++
-					shouldCheckpoint := batchesSinceCheckpoint >= checkpointInterval
-					if err := c.writeBatch(ctx, id, batch, file, currentOffset, shouldCheckpoint); err != nil {
-						return err
-					}
-					if shouldCheckpoint {
-						batchesSinceCheckpoint = 0
-					}
-					batch = batch[:0]
+				ledger.dispatch(byteOffset)
+				select {
+				case items <- item{op: op, ledger: ledger, offset: byteOffset}:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
 				}
-
-				return nil
 			})
 
 			if streamErr == nil {
 				break
 			}
 
-			c.recordError(id, streamErr)
+			c.recordError(self, streamErr)
 		}
 
 		if streamErr != nil {
@@ -749,19 +952,21 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 				file.Key, maxRetries, streamErr)
 		}
 
-		// Write any remaining items with checkpoint
-		if len(batch) > 0 {
-			if err := c.writeBatch(ctx, id, batch, file, currentOffset, true); err != nil {
-				return err
-			}
-			batch = batch[:0]
+		// The file is read, but its last lines are still spread across the writers. It
+		// is only complete once they have all been written; recording it before that
+		// would let a resume skip a file with records still unwritten.
+		ledger.finish()
+		select {
+		case <-ledger.drained:
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 
 		// Record the file as done. This is what a resume reads to skip it, so it is
 		// saved unconditionally rather than at the batch interval.
 		c.progress.complete(file.Key)
 		if err := c.saveProgress(ctx); err != nil {
-			c.recordError(id, err)
+			c.recordError(self, err)
 			return fmt.Errorf("failed to save completion checkpoint for file %s: %w", file.Key, err)
 		}
 	}
@@ -769,43 +974,147 @@ func (c *Coordinator) worker(ctx context.Context, id int, tasks <-chan manifest.
 	return nil
 }
 
-// writeBatch writes a batch of operations with metrics.
-// If shouldCheckpoint is true, saves progress to checkpoint store.
-func (c *Coordinator) writeBatch(ctx context.Context, id int, batch []itemimage.Operation,
-	file manifest.FileMeta, offset int64, shouldCheckpoint bool) error {
-	start := time.Now()
-	if err := c.writer.WriteBatch(ctx, batch); err != nil {
-		c.recordError(id, err)
-		return err
-	}
-	c.metrics.RecordProcessingTime(time.Since(start))
-	c.metrics.RecordBatchWritten()
-	c.metrics.RecordProcessed(int64(len(batch)))
+// defaultBatchLinger is how long a partly filled batch waits for more items before it
+// is written anyway.
+const defaultBatchLinger = 50 * time.Millisecond
 
-	c.updateWorkerStatus(id, func(s *WorkerStatus) {
-		s.ItemsWritten += int64(len(batch))
-		s.BatchesCount++
-	})
+// writeItems fills batches from whatever the readers produce and writes them.
+//
+// A batch is deliberately drawn from every file being read at once, which is the whole
+// point of the split: consecutive lines of one export file share a partition, so a
+// batch built from one file is a batch aimed at one partition. Ordering within a file
+// is given up in exchange, which costs nothing here because an export holds one record
+// per key: a full export by construction, an incremental one because it records each
+// item's latest state once.
+//
+// HOT PATH: every item the restore writes passes through here. Concurrency is
+// c.cfg.MaxWorkers, and the cost is dominated by the BatchWriteItem call itself.
+func (c *Coordinator) writeItems(ctx context.Context, id int, items <-chan item) error {
+	self := statusKey{id: id}
+	batch := make([]item, 0, c.cfg.BatchSize)
+	ops := make([]itemimage.Operation, 0, c.cfg.BatchSize)
+	batchesSinceCheckpoint := 0
 
-	// The offset of the batch's last line is recorded on every batch so any checkpoint,
-	// whichever worker takes it, carries the furthest point every file has reached.
-	// Writing it out is what costs an S3 call, so that still happens only at intervals.
-	c.progress.record(file.Key, offset)
-	if shouldCheckpoint {
-		if err := c.saveProgress(ctx); err != nil {
-			c.recordError(id, err)
+	// A partly filled batch has to go out on its own eventually. Readers waiting for
+	// their last lines to be acknowledged produce nothing more to top it up, so without
+	// this the tail of a restore would wait on items that are never coming.
+	linger := time.NewTimer(c.linger)
+	stopTimer(linger)
+	defer linger.Stop()
+
+	flush := func() error {
+		if len(batch) == 0 {
+			return nil
+		}
+
+		ops = ops[:0]
+		for i := range batch {
+			ops = append(ops, batch[i].op)
+		}
+
+		start := time.Now()
+		if err := c.writer.WriteBatch(ctx, ops); err != nil {
+			c.recordError(self, err)
 			return err
 		}
+		c.metrics.RecordProcessingTime(time.Since(start))
+		c.metrics.RecordBatchWritten()
+		c.metrics.RecordProcessed(int64(len(ops)))
+
+		c.updateWorkerStatus(self, func(s *WorkerStatus) {
+			s.ItemsWritten += int64(len(ops))
+			s.BatchesCount++
+		})
+
+		// Acknowledged only once the write has returned, so a checkpoint taken now
+		// cannot describe a line as done that DynamoDB has not accepted. Each file's
+		// watermark is recorded on every batch, so any checkpoint, whichever writer
+		// takes it, carries the furthest safe point of every file in flight. Writing it
+		// out is what costs an S3 call, so that still happens only at intervals.
+		for i := range batch {
+			if mark := batch[i].ledger.ack(batch[i].offset); mark != noOffset {
+				c.progress.record(batch[i].ledger.key, mark)
+			}
+		}
+		batch = batch[:0]
+
+		batchesSinceCheckpoint++
+		if batchesSinceCheckpoint >= checkpointInterval {
+			batchesSinceCheckpoint = 0
+			if err := c.saveProgress(ctx); err != nil {
+				c.recordError(self, err)
+				return err
+			}
+		}
+		return nil
 	}
 
-	return nil
+	for {
+		select {
+		case next, ok := <-items:
+			if !ok {
+				// The readers are done, so nothing will top this batch up.
+				return flush()
+			}
+			batch = append(batch, next)
+			if len(batch) == 1 {
+				resetTimer(linger, c.linger)
+			}
+			if len(batch) >= c.cfg.BatchSize {
+				stopTimer(linger)
+				if err := flush(); err != nil {
+					return err
+				}
+			}
+
+		case <-linger.C:
+			if err := flush(); err != nil {
+				return err
+			}
+
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
-// recordError records a worker error
-func (c *Coordinator) recordError(id int, err error) {
+// stopTimer stops a timer and clears any tick it had already delivered, so the next
+// wait on it cannot see a stale one. Only the goroutine that owns the timer calls this.
+func stopTimer(t *time.Timer) {
+	if !t.Stop() {
+		select {
+		case <-t.C:
+		default:
+		}
+	}
+}
+
+// resetTimer restarts a timer from now, whatever state it was in.
+func resetTimer(t *time.Timer, d time.Duration) {
+	stopTimer(t)
+	t.Reset(d)
+}
+
+// recordError records a failure against the pool member that hit it.
+func (c *Coordinator) recordError(key statusKey, err error) {
 	c.metrics.RecordError()
-	c.updateWorkerStatus(id, func(s *WorkerStatus) {
+	c.updateWorkerStatus(key, func(s *WorkerStatus) {
 		s.LastError = err
 		s.LastErrorTime = time.Now()
 	})
+}
+
+// statusKey identifies one member of one pool. Readers and writers number themselves
+// from zero independently, so the id alone does not name a goroutine.
+type statusKey struct {
+	id     int
+	reader bool
+}
+
+// role names the pool a key belongs to, for a message an operator reads.
+func (k statusKey) role() string {
+	if k.reader {
+		return "reader"
+	}
+	return "writer"
 }

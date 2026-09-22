@@ -453,8 +453,8 @@ fi
 #
 # The FULL export is restored again into its own table, interrupted part-way, and then
 # resumed from the checkpoint the interrupted run left behind. The restart deliberately
-# uses different worker and batch settings, because a resume is only worth having if it
-# does not depend on how the run before it was configured.
+# uses different reader, worker and batch settings, because a resume is only worth
+# having if it does not depend on how the run before it was configured.
 echo ""
 echo "=== Phase 10: Interrupted restore resumes and completes ==="
 
@@ -464,14 +464,15 @@ CHECKPOINT_URI="s3://${S3_BUCKET}/${CHECKPOINT_KEY}"
 echo "Creating resume table ${RESUME_TABLE}..."
 create_table_like "${SOURCE_TABLE}" "${RESUME_TABLE}"
 
-# One worker writing a single item per request, so the restore is slow enough to have
-# a window to interrupt in.
+# One file read at a time and one item per request, so the restore is slow enough to
+# have a window to interrupt in.
 echo "Starting a restore to interrupt..."
 "${BIN_DIR}/ddb-pitr" \
     -table "${RESUME_TABLE}" \
     -export "${FULL_MANIFEST_URI}" \
     -region "${REGION}" \
     -resume "${CHECKPOINT_URI}" \
+    -readers 1 \
     -workers 1 \
     -batch 1 &
 PITR_PID=$!
@@ -520,7 +521,9 @@ else
     fi
 fi
 
-# Resume at the default worker count and batch size, which the interrupted run did not use.
+# Resume at the default reader count, worker count and batch size, none of which the
+# interrupted run used: a resume is only worth having if it does not depend on how the
+# run before it was shaped.
 echo "Resuming from ${CHECKPOINT_URI}..."
 RESUME_LOG=$(mktemp)
 "${BIN_DIR}/ddb-pitr" \

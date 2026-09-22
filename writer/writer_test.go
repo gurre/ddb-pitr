@@ -15,7 +15,7 @@ import (
 // cost a round trip per changed item and bypass the batch's retry handling.
 func TestWriteBatchSendsPutsDeletesAndUpdatesAsOneBatch(t *testing.T) {
 	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 3, Callbacks{}, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 3, Callbacks{}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	ops := []itemimage.Operation{
 		putOps(1)[0],
@@ -54,7 +54,7 @@ func TestWriteBatchSendsPutsDeletesAndUpdatesAsOneBatch(t *testing.T) {
 // as one containing a dot.
 func TestUpdateIsWrittenAsAPutOfTheNewImage(t *testing.T) {
 	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 1, Callbacks{}, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 1, Callbacks{}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	newImage := map[string]types.AttributeValue{
 		"PK":             &types.AttributeValueMemberS{Value: "PRODUCT#123"},
@@ -103,7 +103,7 @@ func TestCallbacksOnWrite(t *testing.T) {
 		},
 	}
 
-	w := NewDynamoDBWriter(client, "test-table", 25, callbacks, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, callbacks, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	if err := w.WriteBatch(context.Background(), putOps(2)); err != nil {
 		t.Fatalf("WriteBatch failed: %v", err)
@@ -123,7 +123,7 @@ func TestCallbacksOnWrite(t *testing.T) {
 // TestWriteBatchEmpty verifies empty batch returns immediately without errors.
 func TestWriteBatchEmpty(t *testing.T) {
 	client := &scriptedClient{}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}))
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
 	if err := w.WriteBatch(context.Background(), nil); err != nil {
 		t.Errorf("WriteBatch(nil) returned error: %v", err)

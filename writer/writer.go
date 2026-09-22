@@ -25,10 +25,11 @@ type Writer interface {
 // Callbacks allows the writer to report metrics without coupling to a specific metrics implementation.
 // All callbacks are optional - nil callbacks are safely ignored.
 type Callbacks struct {
-	OnThrottle func()                 // Called on throttle event
-	OnRetry    func()                 // Called on successful retry after transient failure
-	OnLost     func(count int)        // Called with the items still unwritten when a batch is given up
-	OnWrite    func(items, bytes int) // Called on successful write with item count and the export bytes behind them
+	OnThrottle func()                     // Called on throttle event
+	OnRetry    func()                     // Called on successful retry after transient failure
+	OnLost     func(count int)            // Called with the items still unwritten when a batch is given up
+	OnWrite    func(items, bytes int)     // Called on successful write with item count and the export bytes behind them
+	OnPace     func(wcuPerSecond float64) // Called when the rate the table is being held to changes
 }
 
 // Backoffer paces the wait between retry attempts.
@@ -54,7 +55,18 @@ func stopRetrying(ctx context.Context) error {
 // Option adjusts optional DynamoDBWriter behaviour.
 type Option func(*DynamoDBWriter)
 
-// WithBackoff replaces the retry pacing. The default doubles from 100ms up to 30s.
+// withPaceClock replaces where the pacer reads the time and does its waiting, so a
+// test can drive the rate the table is being held to without spending the time it
+// describes.
+func withPaceClock(c paceClock) Option {
+	return func(w *DynamoDBWriter) {
+		w.pacer.clock = c
+	}
+}
+
+// WithBackoff replaces the pacing of retries after a failure that is not the table
+// refusing work. A throttled request instead waits for the capacity it needs, which is
+// what the pacer decides. The default doubles from 100ms up to 30s.
 // Example:
 //
 //	w := writer.NewDynamoDBWriter(client, "my-table", 25, cb,
@@ -73,7 +85,8 @@ type DynamoDBWriter struct {
 	client    aws.DynamoDBClient
 	backoff   Backoffer
 	tableName string
-	batchSize int // Maximum number of operations per batch (≤25)
+	pacer     *pacer
+	batchSize int // Largest number of operations the writer will put in one request (≤25)
 }
 
 // maxBatchSize is DynamoDB's hard limit on the number of requests BatchWriteItem accepts.
@@ -103,6 +116,7 @@ func NewDynamoDBWriter(client aws.DynamoDBClient, tableName string, batchSize in
 		batchSize: batchSize,
 		callbacks: callbacks,
 		backoff:   NewExponentialBackoff(100*time.Millisecond, 30*time.Second),
+		pacer:     newPacer(callbacks.OnPace),
 	}
 	for _, opt := range opts {
 		opt(w)
@@ -199,16 +213,16 @@ func shiftLimit(base, max time.Duration) int {
 	return limit
 }
 
-// WriteBatch splits the operations into batches of at most batchSize and writes each
-// with BatchWriteItem. Puts and updates both replace the whole item with its new
-// image: an export's new image is the item's complete state, so replacing is exactly
-// what applying the change means, and it needs no per-attribute expression that an
-// attribute name could break. Deletes remove the item by key.
+// WriteBatch splits the operations into requests and writes each with BatchWriteItem.
+// Puts and updates both replace the whole item with its new image: an export's new
+// image is the item's complete state, so replacing is exactly what applying the change
+// means, and it needs no per-attribute expression that an attribute name could break.
+// Deletes remove the item by key.
 //
 // HOT PATH: Called for every batch of decoded items.
 // Profiling shows ~13% CPU time with most overhead in:
 //   - BatchWriteItem API calls (network latency)
-//   - Retry backoff sleeps for throttling
+//   - Waiting for write capacity when the table is the limit
 func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operation) error {
 	if len(ops) == 0 {
 		return nil
@@ -223,6 +237,7 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 
 		requests := make([]types.WriteRequest, 0, len(batch))
 		batchBytes := 0
+		units := 0.0
 		for _, op := range batch {
 			switch op.Type {
 			case itemimage.OpPut, itemimage.OpUpdate:
@@ -239,9 +254,10 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 				return fmt.Errorf("writer: operation type %d is not one the writer knows", op.Type)
 			}
 			batchBytes += int(op.Bytes)
+			units += writeCost(op)
 		}
 
-		if err := w.writeRequests(ctx, requests, batchBytes); err != nil {
+		if err := w.writeRequests(ctx, requests, batchBytes, units); err != nil {
 			return err
 		}
 	}
@@ -249,31 +265,52 @@ func (w *DynamoDBWriter) WriteBatch(ctx context.Context, ops []itemimage.Operati
 	return nil
 }
 
-// writeRequests sends one batch and keeps resending whatever DynamoDB did not accept.
+// writeRequests writes the given requests, sending as many at a time as the target
+// table is accepting and resending whatever it does not take.
 //
-// Two things can send it round again, and they are budgeted apart. Throttling, whether
-// as an error or as items handed back unprocessed, is retried for as long as the
-// context lives: capacity refills, and giving up would lose items to a condition that
-// waiting cures. Any other failure is retried maxTransientAttempts times and then the
-// batch is given up, so a poisoned batch cannot stall the restore. Counting both
-// against one budget would let a hot partition's partial acceptances spend the
-// transient budget, and a single passing fault would then lose the batch.
-func (w *DynamoDBWriter) writeRequests(ctx context.Context, requests []types.WriteRequest, batchBytes int) error {
+// How many go in one call is the batch size at most, and fewer once the table has shown
+// it cannot take that many. A table provisioned at a few units a second can never accept
+// twenty-five items at once: it hands most of them straight back, and a writer that
+// resends the same twenty-five spends the restore collecting the same refusal. Sizing
+// each call to the rate the table is accepting is what makes such a table restore at its
+// capacity rather than below it, without anyone having to find the right --batch.
+//
+// Two things send a call round again, and they are budgeted apart. Throttling, whether
+// as an error or as items handed back unprocessed, is retried for as long as the context
+// lives: capacity refills, and giving up would lose items to a condition that waiting
+// cures. Any other failure is retried maxTransientAttempts times and then what is left
+// is given up, so a poisoned batch cannot stall the restore. Counting both against one
+// budget would let a hot partition's partial acceptances spend the transient budget, and
+// a single passing fault would then lose the batch.
+//
+// The two also wait differently. A throttled call waits for the capacity it needs, which
+// arrives as soon as the table has it; an exponential sleep would keep waiting long
+// after that. Anything else still backs off exponentially, since nothing about it says
+// when it will clear.
+func (w *DynamoDBWriter) writeRequests(ctx context.Context, requests []types.WriteRequest, batchBytes int, units float64) error {
 	items := len(requests)
-	input := &dynamodb.BatchWriteItemInput{
-		RequestItems: map[string][]types.WriteRequest{w.tableName: requests},
-	}
+	// Items are charged their share of the batch: the response does not say which of
+	// them came back, and the capacity the table reports corrects the estimate anyway.
+	unitCost := units / float64(items)
 
+	pending := requests
 	throttleRounds := 0
 	transientAttempts := 0
-	for {
+	for len(pending) > 0 {
+		n, ok := w.pacer.admit(ctx, unitCost, len(pending))
+		if !ok {
+			return stopRetrying(ctx)
+		}
+		input := &dynamodb.BatchWriteItemInput{
+			RequestItems:           map[string][]types.WriteRequest{w.tableName: pending[:n]},
+			ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
+		}
+
 		output, err := w.client.BatchWriteItem(ctx, input)
 		if err != nil {
 			if isThrottlingError(err) {
 				w.reportThrottle()
-				if !w.backoff.Wait(ctx, throttleRounds+transientAttempts) {
-					return stopRetrying(ctx)
-				}
+				w.pacer.throttled()
 				throttleRounds++
 				continue
 			}
@@ -286,30 +323,48 @@ func (w *DynamoDBWriter) writeRequests(ctx context.Context, requests []types.Wri
 			}
 			// Whatever has not been accepted by now is what the restore loses.
 			if w.callbacks.OnLost != nil {
-				w.callbacks.OnLost(len(input.RequestItems[w.tableName]))
+				w.callbacks.OnLost(len(pending))
 			}
 			return fmt.Errorf("failed to write batch after %d retries: %w", maxTransientAttempts, err)
 		}
 
-		// Items handed back unprocessed are DynamoDB throttling part of the batch.
-		if len(output.UnprocessedItems) > 0 {
-			w.reportThrottle()
-			input.RequestItems = output.UnprocessedItems
-			if !w.backoff.Wait(ctx, throttleRounds+transientAttempts) {
-				return stopRetrying(ctx)
-			}
-			throttleRounds++
-			continue
-		}
+		w.pacer.settle(unitCost*float64(n), consumedUnits(output.ConsumedCapacity))
 
-		if throttleRounds+transientAttempts > 0 && w.callbacks.OnRetry != nil {
-			w.callbacks.OnRetry()
+		// Items handed back unprocessed are DynamoDB throttling part of the call.
+		unprocessed := output.UnprocessedItems[w.tableName]
+		if len(unprocessed) > 0 {
+			w.reportThrottle()
+			w.pacer.throttled()
+			throttleRounds++
 		}
-		if w.callbacks.OnWrite != nil {
-			w.callbacks.OnWrite(items, batchBytes)
-		}
-		return nil
+		// What is left is whatever came back plus whatever capacity did not stretch to.
+		// The rejected items are written over the tail of the part just sent, which is
+		// at least as long, so the remainder is reassembled without another allocation.
+		// Their order among themselves does not matter: a batch write is unordered.
+		copy(pending[n-len(unprocessed):n], unprocessed)
+		pending = pending[n-len(unprocessed):]
 	}
+
+	if throttleRounds+transientAttempts > 0 && w.callbacks.OnRetry != nil {
+		w.callbacks.OnRetry()
+	}
+	if w.callbacks.OnWrite != nil {
+		w.callbacks.OnWrite(items, batchBytes)
+	}
+	return nil
+}
+
+// consumedUnits totals the capacity DynamoDB reported for a request. A response that
+// reports none leaves the pacer on its own estimate, which is what happens against a
+// client that does not fill the field in.
+func consumedUnits(capacity []types.ConsumedCapacity) float64 {
+	total := 0.0
+	for _, c := range capacity {
+		if c.CapacityUnits != nil {
+			total += *c.CapacityUnits
+		}
+	}
+	return total
 }
 
 func (w *DynamoDBWriter) reportThrottle() {

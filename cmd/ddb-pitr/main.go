@@ -8,11 +8,13 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -78,8 +80,9 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 	region := fs.String("region", "", "AWS region; resolved from your AWS environment when omitted")
 	resumeKey := fs.String("resume", "", "S3 URI to record progress in; defaults to a key in the export's own bucket")
 	noResume := fs.Bool("no-resume", false, "Record no progress, so an interrupted restore starts over")
-	maxWorkers := fs.Int("workers", 10, "Maximum number of concurrent workers")
-	batchSize := fs.Int("batch", 25, "Batch size for DynamoDB writes (max 25)")
+	maxWorkers := fs.Int("workers", 10, "Concurrent writes to the target table")
+	readers := fs.Int("readers", 50, "Data files read at once, which is how widely writes are spread over the table's partitions")
+	batchSize := fs.Int("batch", 25, "Largest number of items in one DynamoDB write (max 25)")
 	reportS3URI := fs.String("report", "", "S3 URI for the final report")
 	dryRun := fs.Bool("dry-run", false, "Read and measure the whole export without writing to the table")
 	shutdownTimeout := fs.Duration("shutdown-timeout", 5*time.Minute, "How long an interrupted restore has to record where it stopped")
@@ -109,6 +112,7 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 		Region:          *region,
 		ResumeKey:       *resumeKey,
 		MaxWorkers:      *maxWorkers,
+		Readers:         *readers,
 		BatchSize:       *batchSize,
 		ReportS3URI:     *reportS3URI,
 		DryRun:          *dryRun,
@@ -166,14 +170,30 @@ func run() error {
 	if awsCfg.Region == "" {
 		return fmt.Errorf("no AWS region: pass --region or set one in your AWS environment")
 	}
-	// The writer owns the retry policy for DynamoDB: it paces throttling for as long
-	// as the run lives and bounds everything else. Left at the SDK's default of three
-	// attempts, every one of the writer's attempts would be up to three requests, and
-	// the throttle count the operator watches would be a third of the truth.
+	// Each pool gets as many pooled connections as it has members. The SDK keeps ten
+	// idle connections per host by default, so beyond that every request would open a
+	// fresh one and pay for a TLS handshake it then throws away, which caps a restore
+	// well below what its worker count asked for.
+	dynamoHTTP := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.MaxIdleConnsPerHost = cfg.MaxWorkers
+		t.MaxIdleConns = cfg.MaxWorkers
+	})
+	s3HTTP := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
+		t.MaxIdleConnsPerHost = cfg.Readers
+		t.MaxIdleConns = cfg.Readers
+	})
+
+	// The writer owns the retry policy for DynamoDB: it holds throttled work until the
+	// table has capacity for it and bounds everything else. Left at the SDK's default of
+	// three attempts, every one of the writer's attempts would be up to three requests,
+	// and the throttle count the operator watches would be a third of the truth.
 	dynamoClient := aws.NewDynamoDBClient(dynamodb.NewFromConfig(awsCfg, func(o *dynamodb.Options) {
 		o.RetryMaxAttempts = 1
+		o.HTTPClient = dynamoHTTP
 	}))
-	rawS3Client := s3.NewFromConfig(awsCfg)
+	rawS3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.HTTPClient = s3HTTP
+	})
 	s3Client := aws.NewS3Client(rawS3Client)
 
 	// Ctrl-C or a container runtime's SIGTERM asks the restore to stop: writes in flight
@@ -197,6 +217,7 @@ func run() error {
 		OnRetry:    m.RecordRetry,
 		OnLost:     func(count int) { m.RecordLost(int64(count)) },
 		OnWrite:    func(items, bytes int) { m.RecordBytes(int64(bytes)) },
+		OnPace:     m.RecordPace,
 	}
 
 	// Create and initialize required components for the coordinator

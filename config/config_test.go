@@ -12,6 +12,7 @@ func validConfig() *Config {
 		ExportS3URI:     "s3://test-bucket/prefix",
 		Region:          "us-west-2",
 		MaxWorkers:      10,
+		Readers:         10,
 		BatchSize:       25,
 		ShutdownTimeout: time.Minute,
 	}
@@ -181,6 +182,7 @@ func TestValidateReportsTheFirstProblem(t *testing.T) {
 		{"table name", func(c *Config) { c.TableName = "" }, "table name"},
 		{"export URI", func(c *Config) { c.ExportS3URI = "" }, "export S3 URI"},
 		{"max workers", func(c *Config) { c.MaxWorkers = 0 }, "max workers"},
+		{"readers", func(c *Config) { c.Readers = 0 }, "readers"},
 		{"batch size", func(c *Config) { c.BatchSize = 26 }, "batch size"},
 		{"resume URI", func(c *Config) { c.ResumeKey = "/tmp/checkpoint.json" }, "resume S3 URI"},
 		{"report URI", func(c *Config) { c.ReportS3URI = "http://bucket/report" }, "report S3 URI"},

@@ -3,6 +3,7 @@ package metrics
 
 import (
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,10 @@ type Metrics struct {
 	retries          int64 // Number of successful retries after transient failures
 	lostItems        int64 // Number of items that failed permanently
 	bytesRead        int64 // Export bytes read behind the items written
+	// pace is the write rate the table is currently allowing, in write capacity units
+	// per second, held as the bits of a float64. Zero means nothing is pacing the
+	// writes yet, which is where every restore starts.
+	pace uint64
 }
 
 // NewMetrics creates a new Metrics instance with initialized counters
@@ -70,6 +75,25 @@ func (m *Metrics) RecordLost(n int64) {
 // RecordBytes adds to the export bytes read behind items written
 func (m *Metrics) RecordBytes(n int64) {
 	atomic.AddInt64(&m.bytesRead, n)
+}
+
+// RecordPace records the write rate the table is currently allowing, in write capacity
+// units per second. It is a gauge rather than a counter: the last value written is the
+// one that describes the restore now, and an operator watching a slow restore reads it
+// as the table's limit rather than a mystery.
+func (m *Metrics) RecordPace(wcuPerSecond float64) {
+	atomic.StoreUint64(&m.pace, math.Float64bits(wcuPerSecond))
+}
+
+// Pace returns the write rate the table is currently allowing, and whether anything is
+// pacing the writes at all. A restore that has never been throttled is not paced, and
+// reporting zero for that would read as a stalled restore.
+func (m *Metrics) Pace() (float64, bool) {
+	bits := atomic.LoadUint64(&m.pace)
+	if bits == 0 {
+		return 0, false
+	}
+	return math.Float64frombits(bits), true
 }
 
 // Throttles returns the current throttle count

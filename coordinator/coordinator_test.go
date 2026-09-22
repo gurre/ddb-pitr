@@ -162,8 +162,11 @@ func TestCoordinatorCheckpointsAtInterval(t *testing.T) {
 		t.Fatalf("coordinator failed: %v", err)
 	}
 
+	// The trailing batch is not checkpointed on its own: the file's completion follows
+	// it immediately and says strictly more, so forcing a save first would be an S3
+	// write that the very next one makes redundant.
 	offsets := lineOffsets(lines)
-	want := []int64{offsets[199], offsets[399], offsets[400]}
+	want := []int64{offsets[199], offsets[399]}
 	got := store.savedOffsets(testFileKey)
 	if len(got) != len(want) {
 		t.Fatalf("checkpoint offsets = %v, want %v then a completion", got, want)
@@ -244,12 +247,15 @@ func TestCoordinatorTracksWorkerTotals(t *testing.T) {
 	for i := range lines {
 		lines[i] = []byte(`{"id":"1"}`)
 	}
+	w := &mockWriter{}
 	coord, _ := newTestCoordinator(t, testDeps{
-		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: 6}},
-		lines: lines,
+		files:  []manifest.FileMeta{{Key: testFileKey, ItemCount: 6}},
+		lines:  lines,
+		writer: w,
 		configure: func(cfg *config.Config) {
 			cfg.BatchSize = 2
 			cfg.MaxWorkers = 3
+			cfg.Readers = 2
 		},
 	})
 
@@ -257,16 +263,20 @@ func TestCoordinatorTracksWorkerTotals(t *testing.T) {
 		t.Fatalf("coordinator failed: %v", err)
 	}
 
+	// Both pools are represented: three writers and two readers, each filed separately.
 	coord.statusMu.RLock()
 	pool := len(coord.workerStatus)
 	coord.statusMu.RUnlock()
-	if pool != 3 {
-		t.Errorf("expected a pool of 3 workers, got %d", pool)
+	if pool != 5 {
+		t.Errorf("expected 3 writers and 2 readers tracked, got %d entries", pool)
 	}
 
+	// How the six items fall into batches depends on which writer picks each one up, so
+	// what is asserted is that the progress line totals the whole pool rather than one
+	// member of it: every batch any writer sent is counted exactly once.
 	snap := coord.snapshot(time.Now())
-	if snap.TotalBatches != 3 {
-		t.Errorf("expected 3 batches counted, got %d", snap.TotalBatches)
+	if want := int64(w.batchCount()); snap.TotalBatches != want {
+		t.Errorf("expected %d batches counted across the pool, got %d", want, snap.TotalBatches)
 	}
 	// Six items against the six the manifest promised.
 	if snap.Percent != 100 {
@@ -1017,8 +1027,8 @@ func TestSnapshotMeasuresRatesOverTheInterval(t *testing.T) {
 	start := time.Now()
 	coord.lastReportTime = start
 
-	coord.initWorker(0)
-	coord.updateWorkerStatus(0, func(s *WorkerStatus) { s.ItemsWritten = 400 })
+	coord.initWorker(0, false)
+	coord.updateWorkerStatus(writerKey(0), func(s *WorkerStatus) { s.ItemsWritten = 400 })
 	m.RecordBytes(4 * 1024 * 1024)
 
 	snap := coord.snapshot(start.Add(2 * time.Second))
@@ -1039,8 +1049,8 @@ func TestSnapshotReportsZeroRatesWithoutElapsedTime(t *testing.T) {
 	now := time.Now()
 	coord.lastReportTime = now
 
-	coord.initWorker(0)
-	coord.updateWorkerStatus(0, func(s *WorkerStatus) { s.ItemsWritten = 400 })
+	coord.initWorker(0, false)
+	coord.updateWorkerStatus(writerKey(0), func(s *WorkerStatus) { s.ItemsWritten = 400 })
 	m.RecordBytes(4 * 1024 * 1024)
 
 	snap := coord.snapshot(now)
@@ -1060,12 +1070,12 @@ func TestSnapshotReportsRatesRelativeToPreviousSnapshot(t *testing.T) {
 	start := time.Now()
 	coord.lastReportTime = start
 
-	coord.initWorker(0)
-	coord.updateWorkerStatus(0, func(s *WorkerStatus) { s.ItemsWritten = 100 })
+	coord.initWorker(0, false)
+	coord.updateWorkerStatus(writerKey(0), func(s *WorkerStatus) { s.ItemsWritten = 100 })
 	m.RecordBytes(1024 * 1024)
 	coord.snapshot(start.Add(time.Second))
 
-	coord.updateWorkerStatus(0, func(s *WorkerStatus) { s.ItemsWritten = 150 })
+	coord.updateWorkerStatus(writerKey(0), func(s *WorkerStatus) { s.ItemsWritten = 150 })
 	m.RecordBytes(3 * 1024 * 1024)
 	snap := coord.snapshot(start.Add(2 * time.Second))
 
@@ -1099,8 +1109,8 @@ func TestSnapshotReportsPercentOfExpectedItems(t *testing.T) {
 			coord, _ := newTestCoordinator(t, testDeps{})
 			coord.totalExpectedItems = tt.expected
 			coord.lastReportTime = time.Now()
-			coord.initWorker(0)
-			coord.updateWorkerStatus(0, func(s *WorkerStatus) { s.ItemsWritten = tt.written })
+			coord.initWorker(0, false)
+			coord.updateWorkerStatus(writerKey(0), func(s *WorkerStatus) { s.ItemsWritten = tt.written })
 
 			if got := coord.snapshot(time.Now()).Percent; got != tt.want {
 				t.Errorf("percent = %f, want %f", got, tt.want)
@@ -1109,23 +1119,43 @@ func TestSnapshotReportsPercentOfExpectedItems(t *testing.T) {
 	}
 }
 
-// TestSnapshotCountsOnlyRecentlyActiveWorkers verifies a worker that has been quiet for
-// the idle timeout or longer drops out of the active count, which is how a stalled
-// restore becomes visible on the progress line.
+// TestSnapshotCountsOnlyRecentlyActiveWorkers verifies a pool member that has been
+// quiet for the idle timeout or longer drops out of the active count, which is how a
+// stalled restore becomes visible on the progress line.
 func TestSnapshotCountsOnlyRecentlyActiveWorkers(t *testing.T) {
 	coord, _ := newTestCoordinator(t, testDeps{})
 	now := time.Now()
 	coord.lastReportTime = now
 
-	// One worker just acted, one has been quiet for exactly the timeout, one for twice it.
+	// One writer just acted, one has been quiet for exactly the timeout, one for twice it.
 	idle := []time.Duration{time.Second, 10 * time.Second, 20 * time.Second}
 	for id, quiet := range idle {
-		coord.initWorker(id)
-		coord.workerStatus[id].LastActive = now.Add(-quiet)
+		coord.initWorker(id, false)
+		coord.workerStatus[writerKey(id)].LastActive = now.Add(-quiet)
 	}
 
-	if got := coord.snapshot(now).ActiveWorkers; got != 1 {
-		t.Errorf("expected 1 active worker, got %d", got)
+	if got := coord.snapshot(now).ActiveWriter; got != 1 {
+		t.Errorf("expected 1 active writer, got %d", got)
+	}
+}
+
+// TestSnapshotCountsReadersAndWritersApart verifies the two pools are counted
+// separately. Which pool has gone quiet is what tells an operator whether the restore
+// is waiting on S3 or on the table, so folding them into one number loses the answer.
+func TestSnapshotCountsReadersAndWritersApart(t *testing.T) {
+	coord, _ := newTestCoordinator(t, testDeps{})
+	now := time.Now()
+	coord.lastReportTime = now
+
+	coord.initWorker(0, true)
+	coord.initWorker(1, true)
+	coord.initWorker(0, false)
+	coord.workerStatus[writerKey(0)].LastActive = now.Add(-20 * time.Second)
+
+	snap := coord.snapshot(now)
+	if snap.ActiveReader != 2 || snap.ActiveWriter != 0 {
+		t.Errorf("expected 2 active readers and 0 active writers, got %d and %d",
+			snap.ActiveReader, snap.ActiveWriter)
 	}
 }
 
@@ -1135,10 +1165,10 @@ func TestSnapshotSumsWorkerBatches(t *testing.T) {
 	coord, _ := newTestCoordinator(t, testDeps{})
 	coord.lastReportTime = time.Now()
 
-	coord.initWorker(0)
-	coord.initWorker(1)
-	coord.updateWorkerStatus(0, func(s *WorkerStatus) { s.BatchesCount = 3 })
-	coord.updateWorkerStatus(1, func(s *WorkerStatus) { s.BatchesCount = 4 })
+	coord.initWorker(0, false)
+	coord.initWorker(1, false)
+	coord.updateWorkerStatus(writerKey(0), func(s *WorkerStatus) { s.BatchesCount = 3 })
+	coord.updateWorkerStatus(writerKey(1), func(s *WorkerStatus) { s.BatchesCount = 4 })
 
 	if got := coord.snapshot(time.Now()).TotalBatches; got != 7 {
 		t.Errorf("expected 7 batches, got %d", got)
@@ -1244,21 +1274,34 @@ func TestCoordinatorFailsWhenExportDoesNotVerify(t *testing.T) {
 func TestProgressLineLabelsEveryCount(t *testing.T) {
 	// Every value is distinct so a transposed pair cannot look correct.
 	snap := progressSnapshot{
-		Percent:       12.5,
-		ItemsPerSec:   345,
-		MBPerSec:      6.75,
-		TotalBatches:  81,
-		ActiveWorkers: 9,
-		Throttles:     11,
-		Retries:       22,
-		LostItems:     33,
-		Errors:        44,
+		Percent:      12.5,
+		ItemsPerSec:  345,
+		MBPerSec:     6.75,
+		TotalBatches: 81,
+		ActiveReader: 9,
+		ActiveWriter: 7,
+		Pace:         55,
+		Paced:        true,
+		Throttles:    11,
+		Retries:      22,
+		LostItems:    33,
+		Errors:       44,
 	}
 
-	const want = "Progress: 12.5% (345/s, 6.8 MB/s) | 81 batches | 9 workers | " +
-		"11 throttles | 22 retries | 33 lost | 44 errors"
+	const want = "Progress: 12.5% (345/s, 6.8 MB/s) | 81 batches | 9 readers | 7 writers | " +
+		"pace 55 WCU/s | 11 throttles | 22 retries | 33 lost | 44 errors"
 	if got := snap.String(); got != want {
 		t.Errorf("progress line = %q, want %q", got, want)
+	}
+}
+
+// TestProgressLineReportsNoPaceUntilTheTableSetsOne verifies a restore nothing has
+// held back shows a dash rather than a rate. A zero there would read as a stalled
+// restore, which is the opposite of what an unlimited one is doing.
+func TestProgressLineReportsNoPaceUntilTheTableSetsOne(t *testing.T) {
+	line := progressSnapshot{}.String()
+	if !strings.Contains(line, "pace - |") {
+		t.Errorf("expected an unpaced restore to report no rate, got %q", line)
 	}
 }
 
@@ -1289,10 +1332,11 @@ func TestWorkerStatusIsSafeUnderConcurrentUpdates(t *testing.T) {
 
 	for id := 0; id < 4; id++ {
 		wg.Add(2)
-		go func(id int) { defer wg.Done(); coord.initWorker(id) }(id)
+		coord.initWorker(id, false)
+		go func(id int) { defer wg.Done(); coord.initWorker(id, false) }(id)
 		go func(id int) {
 			defer wg.Done()
-			coord.updateWorkerStatus(id, func(s *WorkerStatus) { s.ItemsWritten++ })
+			coord.updateWorkerStatus(writerKey(id), func(s *WorkerStatus) { s.ItemsWritten++ })
 		}(id)
 	}
 
@@ -1514,26 +1558,35 @@ func TestCoordinatorAttributesErrorsToTheWorker(t *testing.T) {
 	}
 }
 
-// TestInitWorkerRecordsTheWorkersOwnID verifies each worker's status is filed under, and
-// carries, its own identifier. The progress line and error reports name workers by it,
-// so a status that lost its ID would attribute a stall to the wrong worker.
-func TestInitWorkerRecordsTheWorkersOwnID(t *testing.T) {
+// TestInitWorkerRecordsItsOwnIdentity verifies each pool member's status is filed
+// under, and carries, its own identifier and pool. Readers and writers number
+// themselves from zero independently, so a status keyed on the id alone would have one
+// pool overwrite the other's, and the progress line would report half the restore.
+func TestInitWorkerRecordsItsOwnIdentity(t *testing.T) {
 	coord, _ := newTestCoordinator(t, testDeps{})
 
-	coord.initWorker(0)
-	coord.initWorker(7)
+	coord.initWorker(0, true)
+	coord.initWorker(0, false)
+	coord.initWorker(7, false)
 
 	coord.statusMu.RLock()
 	defer coord.statusMu.RUnlock()
-	for id, status := range coord.workerStatus {
-		if status.ID != id {
-			t.Errorf("worker filed under %d reports ID %d", id, status.ID)
+	if got := len(coord.workerStatus); got != 3 {
+		t.Fatalf("expected 3 statuses, got %d", got)
+	}
+	for key, status := range coord.workerStatus {
+		if status.ID != key.id || status.IsReader != key.reader {
+			t.Errorf("%s filed under %d reports ID %d, reader %t",
+				key.role(), key.id, status.ID, status.IsReader)
 		}
 		if status.StartTime.IsZero() {
-			t.Errorf("worker %d has no start time", id)
+			t.Errorf("%s %d has no start time", key.role(), key.id)
 		}
 	}
 }
+
+// writerKey names a writer's status, which is what most of these tests act on.
+func writerKey(id int) statusKey { return statusKey{id: id} }
 
 // testDeps describes the dependencies a test wants; anything left unset gets a
 // permissive default so each test only states what it is about.
@@ -1617,6 +1670,7 @@ func newTestCoordinator(t *testing.T, deps testDeps) (*Coordinator, *metrics.Met
 		ExportS3URI:     "s3://test-bucket/test-prefix",
 		Region:          "us-west-2",
 		MaxWorkers:      1,
+		Readers:         1,
 		BatchSize:       25,
 		ShutdownTimeout: time.Second,
 	}
@@ -1722,10 +1776,13 @@ type mockStreamer struct {
 	lines      [][]byte
 	linesByKey map[string][][]byte      // Lines for particular files; others get lines
 	waitFor    map[string]chan struct{} // Files held back until the channel closes
+	opened     chan struct{}            // Signalled once per stream opened, if set
 	errs       []error
 	requests   []streamRequest
 	onAttempt  func() // Runs at the start of every attempt; lets a test interrupt one
 	failAfter  int    // Lines the first attempt delivers before failing; 0 disables
+	open       int    // Streams open right now
+	maxOpen    int    // Most streams open at any one time
 	mu         sync.Mutex
 }
 
@@ -1738,10 +1795,22 @@ func (m *mockStreamer) Stream(ctx context.Context, bucket, key string, offset in
 	attempt := len(m.requests)
 	m.requests = append(m.requests, streamRequest{key: key, offset: offset})
 	onAttempt := m.onAttempt
+	m.open++
+	if m.open > m.maxOpen {
+		m.maxOpen = m.open
+	}
 	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.open--
+		m.mu.Unlock()
+	}()
 
 	if onAttempt != nil {
 		onAttempt()
+	}
+	if m.opened != nil {
+		m.opened <- struct{}{}
 	}
 	if gate, ok := m.waitFor[key]; ok {
 		<-gate
@@ -1778,6 +1847,13 @@ func (m *mockStreamer) Stream(ctx context.Context, bucket, key string, offset in
 		return errors.New("connection reset")
 	}
 	return nil
+}
+
+// concurrentStreams reports the most streams the coordinator had open at once.
+func (m *mockStreamer) concurrentStreams() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.maxOpen
 }
 
 // streamedKeys reports the files streamed, in the order they were asked for.
@@ -1828,6 +1904,13 @@ func (m *mockDecoder) Decode(line []byte) (itemimage.Operation, error) {
 	}, nil
 }
 
+// batchCount reports how many batches the writer was handed.
+func (m *mockWriter) batchCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.batches)
+}
+
 // writtenLines reports, in order, the lines behind every operation the writer received.
 func (m *mockWriter) writtenLines() []string {
 	m.mu.Lock()
@@ -1849,10 +1932,13 @@ func (m *mockWriter) writtenLines() []string {
 type mockWriter struct {
 	err          error
 	failOn       string
+	holdOn       string        // Line whose batch blocks until the run is stopped
+	held         chan struct{} // Closed once a held batch has been reached
 	afterFailure func()
 	afterWrite   func()
 	batches      [][]itemimage.Operation
 	failed       sync.Once
+	reached      sync.Once
 	mu           sync.Mutex
 }
 
@@ -1865,6 +1951,21 @@ func (m *mockWriter) WriteBatch(ctx context.Context, ops []itemimage.Operation) 
 	}
 	if err := requireCallerContext(ctx); err != nil {
 		return err
+	}
+	if m.holdOn != "" {
+		for _, op := range ops {
+			if line, ok := op.NewImage["line"].(*types.AttributeValueMemberS); ok && line.Value == m.holdOn {
+				m.reached.Do(func() {
+					if m.held != nil {
+						close(m.held)
+					}
+				})
+				// Held until the run stops, the way a batch waiting on a slow partition
+				// is: the item is neither written nor acknowledged.
+				<-ctx.Done()
+				return ctx.Err()
+			}
+		}
 	}
 	if m.failOn != "" {
 		for _, op := range ops {
@@ -1892,7 +1993,9 @@ type mockStore struct {
 	loadErr       error
 	saveErr       error
 	failSaveAfter int   // Saves beyond this many fail; 0 disables
+	failSaveAt    int   // The save with this 1-based number fails and later ones do not; 0 disables
 	lastSaveCtx   error // What the context reported on the most recent save
+	refused       int   // Saves refused by failSaveAt so far
 	state         checkpoint.State
 	saved         []checkpoint.State
 	mu            sync.Mutex
@@ -1920,6 +2023,12 @@ func (m *mockStore) Save(ctx context.Context, s checkpoint.State) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.failSaveAfter > 0 && len(m.saved) >= m.failSaveAfter {
+		return errors.New("checkpoint store unavailable")
+	}
+	// Failing exactly one save is what tells the save under test from the ones that
+	// follow it: every later save succeeding means only the one path can end the run.
+	if m.failSaveAt > 0 && len(m.saved)+m.refused == m.failSaveAt-1 {
+		m.refused++
 		return errors.New("checkpoint store unavailable")
 	}
 	m.state = s
@@ -1984,4 +2093,297 @@ func (m *mockUploader) lastReport() metrics.Report {
 		return metrics.Report{}
 	}
 	return m.reports[len(m.reports)-1]
+}
+
+// TestCoordinatorDrawsOneBatchFromSeveralFiles verifies a single write carries items
+// from more than one data file.
+//
+// This is the property the reader and writer pools exist for. A DynamoDB export writes
+// one file per source partition, so consecutive lines of one file share a partition and
+// a batch built from one file is a batch aimed at one partition of the target table.
+// However many workers such a restore runs, it uses as many partitions as it has files
+// open, and throttles there while the rest of the table sits idle.
+func TestCoordinatorDrawsOneBatchFromSeveralFiles(t *testing.T) {
+	// Four lines across two files, filling exactly one batch. The writer cannot flush
+	// before it has all four, so what it sends is what the pools put together.
+	w := &mockWriter{}
+	streamer := &mockStreamer{linesByKey: map[string][][]byte{
+		testFileKey:  {[]byte(`{"a":1}`), []byte(`{"a":2}`)},
+		testFileKey2: {[]byte(`{"b":1}`), []byte(`{"b":2}`)},
+	}}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{
+			{Key: testFileKey, ItemCount: 2},
+			{Key: testFileKey2, ItemCount: 2},
+		},
+		streamer: streamer,
+		writer:   w,
+		configure: func(cfg *config.Config) {
+			cfg.BatchSize = 4
+			cfg.Readers = 2
+			cfg.MaxWorkers = 1
+		},
+	})
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.batches) != 1 {
+		t.Fatalf("expected the four items in one batch, got %d batches", len(w.batches))
+	}
+	files := map[byte]bool{}
+	for _, op := range w.batches[0] {
+		line := op.NewImage["line"].(*types.AttributeValueMemberS).Value
+		files[line[2]] = true
+	}
+	if len(files) != 2 {
+		t.Errorf("expected the batch to carry items from both files, got %d", len(files))
+	}
+}
+
+// TestCoordinatorNeverCheckpointsPastAnUnwrittenLine verifies the offset a resume
+// restarts from stops short of a line still in flight, even when later lines of the
+// same file have been written.
+//
+// Writers take items from every file at once and finish them out of order, so the last
+// line written is not the last line done. Recording that one would have a resume start
+// past a line nothing ever wrote, and the item would be missing from the table with
+// nothing saying so.
+func TestCoordinatorNeverCheckpointsPastAnUnwrittenLine(t *testing.T) {
+	lines := [][]byte{[]byte(`{"n":1}`), []byte(`{"n":2}`), []byte(`{"n":3}`)}
+	store := &mockStore{}
+	w := &mockWriter{holdOn: string(lines[1]), held: make(chan struct{})}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:  []manifest.FileMeta{{Key: testFileKey, ItemCount: 3}},
+		lines:  lines,
+		store:  store,
+		writer: w,
+		configure: func(cfg *config.Config) {
+			cfg.BatchSize = 1
+			cfg.MaxWorkers = 2
+			cfg.Readers = 1
+		},
+	})
+
+	// The run is stopped once the second line's batch is being held, by which point the
+	// first and third have been written around it.
+	ctx, cancel := context.WithTimeout(callerContext(), 30*time.Second)
+	defer cancel()
+	go func() {
+		<-w.held
+		// The third line is written by the other writer while the second is held; give
+		// it the chance to be, since recording its offset is the mistake under test.
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	if err := coord.Run(ctx); err == nil {
+		t.Fatal("expected the interrupted run to report an error")
+	}
+
+	offsets := lineOffsets(lines)
+	if got := store.lastSaved().Offsets[testFileKey]; got != offsets[0] {
+		t.Errorf("checkpoint recorded offset %d, want %d: the second line was never written",
+			got, offsets[0])
+	}
+}
+
+// TestCoordinatorWritesAPartialBatchWhileOtherFilesAreStillBeingRead verifies a batch
+// that is not full goes out on its own rather than waiting for items that are not
+// coming.
+//
+// A reader that has read its file to the end produces nothing more until the lines it
+// already handed over are written, and every other reader may be in the same position.
+// Without a partial batch going out on a timer, the restore stops with items decoded
+// and never written.
+func TestCoordinatorWritesAPartialBatchWhileOtherFilesAreStillBeingRead(t *testing.T) {
+	gate := make(chan struct{})
+	streamer := &mockStreamer{
+		linesByKey: map[string][][]byte{
+			testFileKey:  {[]byte(`{"a":1}`)},
+			testFileKey2: {[]byte(`{"b":1}`)},
+		},
+		waitFor: map[string]chan struct{}{testFileKey2: gate},
+	}
+	var once sync.Once
+	w := &mockWriter{afterWrite: func() { once.Do(func() { close(gate) }) }}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{
+			{Key: testFileKey, ItemCount: 1},
+			{Key: testFileKey2, ItemCount: 1},
+		},
+		streamer: streamer,
+		writer:   w,
+		configure: func(cfg *config.Config) {
+			cfg.BatchSize = 25
+			cfg.Readers = 2
+			cfg.MaxWorkers = 1
+		},
+	})
+
+	// The second file is not released until the first file's single item has been
+	// written, which can only happen if a batch of one goes out without being filled.
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+	if got := len(w.writtenLines()); got != 2 {
+		t.Errorf("expected both items written, got %d", got)
+	}
+}
+
+// TestCoordinatorReadsNoMoreFilesAtOnceThanAsked verifies the number of files open is
+// the number configured. Each open file costs a download buffer and a decompression
+// window, so a restore that ignored the setting would use memory in proportion to the
+// export rather than to what it was given.
+func TestCoordinatorReadsNoMoreFilesAtOnceThanAsked(t *testing.T) {
+	const readers = 2
+	files := make([]manifest.FileMeta, 5)
+	for i := range files {
+		files[i] = manifest.FileMeta{Key: fmt.Sprintf("file%d", i), ItemCount: 1}
+	}
+	gate := make(chan struct{})
+	waitFor := make(map[string]chan struct{}, len(files))
+	for _, f := range files {
+		waitFor[f.Key] = gate
+	}
+	streamer := &mockStreamer{
+		lines:   [][]byte{[]byte(`{"a":1}`)},
+		waitFor: waitFor,
+		opened:  make(chan struct{}, len(files)),
+	}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:    files,
+		streamer: streamer,
+		configure: func(cfg *config.Config) {
+			cfg.Readers = readers
+		},
+	})
+
+	// Every file is held open until as many as were asked for have been started. If
+	// fewer are ever open at once this never returns and the test's deadline reports it.
+	go func() {
+		for i := 0; i < readers; i++ {
+			<-streamer.opened
+		}
+		close(gate)
+		for range streamer.opened {
+		}
+	}()
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+	if got := streamer.concurrentStreams(); got != readers {
+		t.Errorf("expected at most %d files open at once, got %d", readers, got)
+	}
+}
+
+// TestCoordinatorCommitsPastALineItCouldNotDecode verifies the offset a resume restarts
+// from moves over a skipped line once everything before it has been written.
+//
+// A corrupt line is never written, so nothing ever acknowledges it. Left in the way it
+// would pin the file's progress to the line before it, and every resume would read the
+// rest of that file again and count the same loss a second time.
+func TestCoordinatorCommitsPastALineItCouldNotDecode(t *testing.T) {
+	lines := [][]byte{
+		[]byte(`{"n":1}`),
+		[]byte(`{"n":2}`),
+		[]byte(`{"n":3}`),
+		[]byte(`{"n":4}`),
+	}
+	store := &mockStore{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:   []manifest.FileMeta{{Key: testFileKey, ItemCount: 4}},
+		lines:   lines,
+		store:   store,
+		decoder: &mockDecoder{corruptLines: map[string]bool{string(lines[1]): true}},
+		// The last line's write fails, which stops the run with the file unfinished and
+		// its progress on show.
+		writer: &mockWriter{failOn: string(lines[3])},
+		configure: func(cfg *config.Config) {
+			cfg.BatchSize = 1
+			cfg.MaxWorkers = 1
+			cfg.Readers = 1
+		},
+	})
+
+	if err := runCoordinator(t, coord); err == nil {
+		t.Fatal("expected the failed write to end the run")
+	}
+
+	offsets := lineOffsets(lines)
+	if got := store.lastSaved().Offsets[testFileKey]; got != offsets[2] {
+		t.Errorf("checkpoint recorded offset %d, want %d: the skipped line should not hold the file back",
+			got, offsets[2])
+	}
+	if got := store.lastSaved().Skipped; got != 1 {
+		t.Errorf("expected 1 skipped line recorded, got %d", got)
+	}
+}
+
+// BenchmarkLedgerAck measures the per-item acknowledgement every written item pays for:
+// finding the line among those in flight and advancing the file's watermark past the
+// ones that are done. It is the only new work the split pools put on the hot path.
+func BenchmarkLedgerAck(b *testing.B) {
+	// A steady state of one file with a full pool's worth of its lines out at once.
+	const inFlight = 256
+	l := newFileLedger(testFileKey, noOffset)
+	for i := 1; i <= inFlight; i++ {
+		l.dispatch(int64(i))
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		l.dispatch(int64(inFlight + i + 1))
+		l.ack(int64(i + 1))
+	}
+}
+
+// TestCoordinatorFailsWhenAnIntervalCheckpointCannotBeSaved verifies a checkpoint that
+// cannot be written part-way through a file stops the restore.
+//
+// Carrying on would leave the stored progress behind what has been written, without
+// anything saying so, and an interruption hours later would resume from the last save
+// that worked and redo everything since.
+func TestCoordinatorFailsWhenAnIntervalCheckpointCannotBeSaved(t *testing.T) {
+	// Two lines per batch over enough lines to reach the checkpoint interval.
+	lines := make([][]byte, 2*checkpointInterval+1)
+	for i := range lines {
+		lines[i] = []byte(`{"id":"1"}`)
+	}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: int64(len(lines))}},
+		lines: lines,
+		// Only the interval save fails: the one before the first read and the file's
+		// completion both succeed, so nothing but this path can end the run.
+		store: &mockStore{failSaveAt: 2},
+		configure: func(cfg *config.Config) {
+			cfg.BatchSize = 2
+		},
+	})
+
+	if err := runCoordinator(t, coord); err == nil {
+		t.Fatal("expected the failed interval checkpoint to end the run")
+	}
+}
+
+// TestCoordinatorFailsWhenAFinishedFileCannotBeCheckpointed verifies a file that has
+// been read and written to the end but whose completion cannot be recorded stops the
+// restore. Reporting success there would tell an operator the export was restored while
+// the record of it was never written.
+func TestCoordinatorFailsWhenAFinishedFileCannotBeCheckpointed(t *testing.T) {
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		lines: [][]byte{[]byte(`{"id":"1"}`)},
+		// Only the completion save fails: the one before the first read and the final
+		// one both succeed, so nothing but this path can end the run.
+		store: &mockStore{failSaveAt: 2},
+	})
+
+	if err := runCoordinator(t, coord); err == nil {
+		t.Fatal("expected the failed completion checkpoint to end the run")
+	}
 }

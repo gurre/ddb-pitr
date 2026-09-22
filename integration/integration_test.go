@@ -35,6 +35,7 @@ func TestFullIntegrationFlow(t *testing.T) {
 		ExportS3URI:     "s3://test-bucket/AWSDynamoDB/01768385930622-efd1a093/manifest-summary.json",
 		Region:          "us-west-2",
 		MaxWorkers:      1,
+		Readers:         1,
 		BatchSize:       25,
 		ShutdownTimeout: 5 * time.Second,
 	}
@@ -119,6 +120,7 @@ func TestEndToEndWithCoordinator(t *testing.T) {
 		ExportS3URI:     "s3://test-bucket/AWSDynamoDB/01768385930622-efd1a093/manifest-summary.json",
 		Region:          "us-west-2",
 		MaxWorkers:      1,
+		Readers:         1,
 		BatchSize:       25,
 		ShutdownTimeout: 1 * time.Second,
 		DryRun:          true,
@@ -544,6 +546,7 @@ func restoreConfig(t *testing.T, exportURI string) *config.Config {
 		ExportS3URI:     exportURI,
 		Region:          "us-west-2",
 		MaxWorkers:      1,
+		Readers:         1,
 		BatchSize:       1,
 		ShutdownTimeout: time.Second,
 	}
@@ -705,5 +708,68 @@ func TestInterruptedRestoreResumesWithoutRewritingItems(t *testing.T) {
 	}
 	if got := len(mockDynamoDB.GetBatchWrites()); got != 3 {
 		t.Errorf("expected 3 batch writes across both runs, one per item, got %d", got)
+	}
+}
+
+// TestRestoreSpreadAcrossManyReadersWritesEveryItemOnce verifies an export restored
+// with its files read many at a time lands the same table contents as one read a file
+// at a time, and writes each item exactly once.
+//
+// Reading widely is what lets a restore use the whole target table rather than the few
+// partitions the files in flight happen to hash to. It also means items from different
+// files share a request and a file's lines are acknowledged out of order, so this is
+// where a watermark that ran ahead of what was written, or a batch that lost its tail,
+// would show up as a table that does not match.
+func TestRestoreSpreadAcrossManyReadersWritesEveryItemOnce(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	contents := func(readers, workers, batch int) map[string]map[string]types.AttributeValue {
+		t.Helper()
+		mockS3 := loadFixtures(t)
+		cfg := restoreConfig(t, fullExportURI)
+		cfg.Readers = readers
+		cfg.MaxWorkers = workers
+		cfg.BatchSize = batch
+
+		mockDynamoDB := mock.NewDynamoDBClient()
+		w := writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, cfg.BatchSize, writer.Callbacks{},
+			writer.WithBackoff(writer.NewExponentialBackoff(time.Millisecond, time.Millisecond)))
+		err := coordinator.NewCoordinator(cfg, manifest.NewS3Loader(mockS3), s3streamer.NewS3Streamer(mockS3),
+			itemimage.NewJSONDecoder(), w, checkpoint.NewMemoryStore(), nil, metrics.NewMetrics(),
+			coordinator.WithStreamBackoff(writer.NewExponentialBackoff(time.Millisecond, time.Millisecond)),
+		).Run(ctx)
+		if err != nil {
+			t.Fatalf("restore with %d readers failed: %v", readers, err)
+		}
+
+		// Every item the export holds reaches the table exactly once, whichever writer
+		// picked it up: a batch write is idempotent, so a duplicate would not show in
+		// the contents, but it would show as a surplus write.
+		items := 0
+		for _, call := range mockDynamoDB.GetBatchWrites() {
+			for _, requests := range call.RequestItems {
+				items += len(requests)
+			}
+		}
+		table := mockDynamoDB.GetTableContents(cfg.TableName)
+		if items != len(table) {
+			t.Errorf("with %d readers, %d items were written for %d in the table",
+				readers, items, len(table))
+		}
+		return table
+	}
+
+	serial := contents(1, 1, 1)
+	spread := contents(8, 4, 25)
+
+	if len(spread) != len(serial) {
+		t.Fatalf("reading 8 files at once left %d items, reading one at a time left %d",
+			len(spread), len(serial))
+	}
+	for key := range serial {
+		if _, ok := spread[key]; !ok {
+			t.Errorf("item %q is missing when the export is read 8 files at a time", key)
+		}
 	}
 }

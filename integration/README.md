@@ -1,51 +1,29 @@
 # Integration Tests
 
-This directory contains integration tests for the DynamoDB PITR application. These tests use mock AWS clients to verify that all components of the application work together correctly.
+These tests drive the real streamer, decoder, writer and coordinator over the export
+fixtures under `../s3exportdata`, against in-memory stand-ins for S3 and DynamoDB. They
+are where behaviour that only appears when the real components meet is checked: gzip
+offsets a checkpoint can be resumed from, an interrupted restore finishing on a second
+run, and an export read many files at a time landing the same table as one read a file
+at a time.
 
-## Test Structure
-
-The integration tests cover the following workflows:
-
-1. **Full Integration Flow** (`TestFullIntegrationFlow`): Tests the complete process of:
-   - Loading a manifest from S3
-   - Streaming data files 
-   - Parsing JSON records
-   - Writing records to DynamoDB
-
-2. **Error Handling Tests**:
-   - `TestS3ErrorHandling`: Tests error handling for S3 operations
-   - `TestDynamoDBErrorHandling`: Tests error handling for DynamoDB operations
-
-## Mock Clients
-
-The tests use mock implementations of the AWS clients:
-
-- `mock.S3Client`: Simulates S3 operations using files from the testdata directory
-- `mock.DynamoDBClient`: Simulates DynamoDB operations with in-memory storage
-
-## Running the Tests
-
-To run the integration tests:
+## Running
 
 ```bash
-go test -v ./integration
+go test -race ./integration/
 ```
 
-For running with test coverage:
+## Stand-ins
 
-```bash
-go test -v -coverprofile=integration-coverage.out ./integration
-go tool cover -html=integration-coverage.out
-```
+- `mock.S3Client` serves the export fixtures from disk, including the gzipped data files.
+- `mock.DynamoDBClient` applies batch writes to an in-memory table and records every call.
 
-## Test Data
+Neither simulates throttling or capacity. Those belong to the writer's own tests, which
+can drive a clock; see `../writer`.
 
-The tests use the sample data in the `testdata` directory, which contains real DynamoDB PITR export files. 
+## Adding tests
 
-## Adding New Tests
-
-When adding new tests:
-
-1. Use the existing mock clients or extend them as needed
-2. Consider testing failure scenarios as well as success paths
-3. Verify all assertions after operations complete 
+A test belongs here when it needs two or more real components together. One that needs
+only the coordinator's own logic belongs in `../coordinator`, where the doubles make the
+scenario explicit. State the behaviour in the test name and say in a comment what would
+break without it.
