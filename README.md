@@ -316,11 +316,13 @@ real AWS account and costs real money and time; read its header first.
 
 Test strength is measured with [mutest](https://github.com/gurre/mutest), which introduces one
 small defect at a time and reports the ones no test notices. Measured at the commit that
-introduced the figure, the tests reached 97% of the code and noticed 89% of the defects
-introduced into what they reach. The survivors that remain are mostly defects no test can
-observe: preallocation hints, equivalent boundary rewrites, and buffering a channel
-nothing depends on the synchronisation of. The `cmd` packages are only lightly covered:
-they wire the others together.
+introduced the figure, the library packages cover 97% of statements, a defect can be placed
+somewhere a test reaches 98% of the time, and the tests notice 83% of the defects placed
+there. The survivors are mostly defects no test can observe: a lock released by the
+function returning rather than by the deferred call that was removed, preallocation hints,
+buffering a channel nothing depends on the synchronisation of, tuning constants such as how
+often progress is saved, and the wording of messages. The `cmd` packages are only lightly
+covered: they wire the others together.
 
 ```bash
 mutest -packages writer            # one package

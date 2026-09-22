@@ -1708,11 +1708,29 @@ func newTestCoordinator(t *testing.T, deps testDeps) (*Coordinator, *metrics.Met
 }
 
 // testConsole captures what a restore printed: the progress line and the permanent
-// output beside it, and the messages it sent to the writer errors go to. Every write
-// the console makes is serialised, so reading these once a run has ended is safe.
+// output beside it, and the messages it sent to the writer errors go to. Reads are
+// guarded as well as writes, so a test may watch the output while the restore runs.
 type testConsole struct {
-	line    bytes.Buffer
-	notices bytes.Buffer
+	line    syncBuffer
+	notices syncBuffer
+}
+
+// syncBuffer is a buffer a test can read while the restore is still writing to it.
+type syncBuffer struct {
+	buf bytes.Buffer
+	mu  sync.Mutex
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // printed reports everything the restore sent to the writer errors go to.
@@ -1740,10 +1758,11 @@ func callerContext() context.Context {
 }
 
 type mockLoader struct {
-	err       error
-	verifyErr error
-	summary   manifest.Summary
-	verified  []string // Keys handed to VerifyChecksums
+	err        error
+	verifyErr  error
+	summary    manifest.Summary
+	verified   []string // Keys handed to VerifyChecksums
+	unverified []string // Keys reported as carrying nothing comparable
 }
 
 func (m *mockLoader) verifiedKeys() []string {
@@ -1770,7 +1789,10 @@ func (m *mockLoader) VerifyChecksums(ctx context.Context, bucket string, summary
 	for _, file := range summary.DataFiles {
 		m.verified = append(m.verified, file.Key)
 	}
-	return manifest.Verification{Verified: len(summary.DataFiles)}, nil
+	return manifest.Verification{
+		Verified:   len(summary.DataFiles) - len(m.unverified),
+		Unverified: m.unverified,
+	}, nil
 }
 
 // callerContextKey marks the context a test passed into Run, so a dependency can tell
@@ -2596,5 +2618,237 @@ func TestCoordinatorPrintsTheOutcomeWhereTheProgressWent(t *testing.T) {
 	}
 	if printed := out.printed(); printed != "" {
 		t.Errorf("expected nothing reported as a failure, got %q", printed)
+	}
+}
+
+// TestConsoleFinishesTheLineOnlyWhenOneWasDrawn verifies the progress line is closed
+// with a newline when there is one on screen and not otherwise. A restore short enough
+// that the line was never drawn would otherwise print a blank line before its report.
+func TestConsoleFinishesTheLineOnlyWhenOneWasDrawn(t *testing.T) {
+	var drawn, nothing bytes.Buffer
+
+	c := newConsole(&drawn, nil)
+	c.update("working")
+	c.done()
+	if got := drawn.String(); !strings.HasSuffix(got, "\n") {
+		t.Errorf("expected the drawn line closed with a newline, got %q", got)
+	}
+
+	c = newConsole(&nothing, nil)
+	c.done()
+	if got := nothing.String(); got != "" {
+		t.Errorf("expected nothing printed when no line was drawn, got %q", got)
+	}
+}
+
+// TestCoordinatorDrawsTheProgressLineWhileItRuns verifies the line an operator watches
+// is actually drawn during a restore, not only assembled. A restore that reports
+// nothing until it ends gives no way to tell a slow one from a stuck one.
+func TestCoordinatorDrawsTheProgressLineWhileItRuns(t *testing.T) {
+	gate := make(chan struct{})
+	out := &testConsole{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		streamer: &mockStreamer{
+			lines:   [][]byte{[]byte(`{"id":"1"}`)},
+			waitFor: map[string]chan struct{}{testFileKey: gate},
+		},
+		console: out,
+	})
+
+	// The file is held until a progress line appears, so a restore that never draws one
+	// fails on the test's deadline rather than passing quietly.
+	go func() {
+		for !strings.Contains(out.shown(), "Progress:") {
+			time.Sleep(10 * time.Millisecond)
+		}
+		close(gate)
+	}()
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+}
+
+// TestCoordinatorKeepsReportingWhileReadingOneLargeFile verifies a reader working
+// through a single large file goes on reporting that it is working. The progress line
+// counts a pool member idle after a timeout, and a reader that reported only when it
+// finished a file would look stopped for as long as a large file takes to read.
+func TestCoordinatorKeepsReportingWhileReadingOneLargeFile(t *testing.T) {
+	lines := make([][]byte, linesPerStamp+1)
+	for i := range lines {
+		lines[i] = []byte(`{"id":"1"}`)
+	}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: int64(len(lines))}},
+		lines: lines,
+	})
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+
+	// A reader reports nothing else, so its activity can only have been stamped from
+	// within the file.
+	coord.statusMu.RLock()
+	defer coord.statusMu.RUnlock()
+	status := coord.workerStatus[statusKey{id: 0, reader: true}]
+	if !status.LastActive.After(status.StartTime) {
+		t.Error("expected the reader to report activity from within the file")
+	}
+}
+
+// TestCoordinatorDoesNotWaitOnTheLingerForAFullBatch verifies a batch that is already
+// full is written at once. The linger exists for batches nothing will top up; applying
+// it to a full one would put a delay between every write.
+func TestCoordinatorDoesNotWaitOnTheLingerForAFullBatch(t *testing.T) {
+	lines := [][]byte{[]byte(`{"id":"1"}`), []byte(`{"id":"2"}`)}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: 2}},
+		lines: lines,
+		configure: func(cfg *config.Config) {
+			cfg.BatchSize = 2
+		},
+	})
+	// Long enough that a restore waiting on it would not finish within the deadline.
+	WithBatchLinger(time.Hour)(coord)
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+}
+
+// TestBatchLingerMustBePositive verifies a linger of nothing is refused. It would send
+// every item as its own write, which is the slowest a restore can go, and it is a
+// wiring mistake worth failing on rather than discovering from the throughput.
+func TestBatchLingerMustBePositive(t *testing.T) {
+	for _, d := range []time.Duration{0, -time.Second} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("expected a linger of %s to be refused", d)
+				}
+			}()
+			WithBatchLinger(d)(&Coordinator{})
+		}()
+	}
+}
+
+// TestLedgerRefusesALineItHasAlreadyPassed verifies a file's ledger refuses an offset
+// that would put its record of what is in flight out of order.
+//
+// The watermark is found by bisection over that record, so an out-of-order entry would
+// return a watermark past a line nothing has written, and a resume would start beyond
+// records that were never applied. Losing records quietly is worse than stopping.
+func TestLedgerRefusesALineItHasAlreadyPassed(t *testing.T) {
+	l := newFileLedger(testFileKey, noOffset)
+	l.dispatch(100)
+
+	defer func() {
+		if recover() == nil {
+			t.Error("expected a line the ledger has already passed to be refused")
+		}
+	}()
+	l.dispatch(50)
+}
+
+// TestUpdatingAnUnregisteredWorkerIsRefused verifies a status update for a pool member
+// that never registered is refused rather than dropped. Every member registers before
+// it runs, so this can only be a wiring mistake, and dropping it silently would lose
+// the failure report that came with it.
+func TestUpdatingAnUnregisteredWorkerIsRefused(t *testing.T) {
+	coord, _ := newTestCoordinator(t, testDeps{})
+
+	defer func() {
+		if recover() == nil {
+			t.Error("expected an update for an unregistered member to be refused")
+		}
+	}()
+	coord.updateWorkerStatus(writerKey(9), func(*WorkerStatus) {})
+}
+
+// TestCoordinatorFailsOnADecodeErrorThatIsNotCorruption verifies a line the decoder
+// rejects for a reason other than corruption ends the run. A corrupt line is skipped
+// because the loss is confined to it; anything else means the decoder and the export
+// disagree, and carrying on would apply an export nobody has understood.
+func TestCoordinatorFailsOnADecodeErrorThatIsNotCorruption(t *testing.T) {
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:   []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		lines:   [][]byte{[]byte(`{"id":"1"}`)},
+		decoder: &failingDecoder{err: errors.New("unknown export format")},
+	})
+
+	err := runCoordinator(t, coord)
+	if err == nil || errors.Is(err, ErrRecordsSkipped) {
+		t.Fatalf("expected the decode failure to end the run, got %v", err)
+	}
+}
+
+// failingDecoder rejects every line for a reason that is not corruption.
+type failingDecoder struct{ err error }
+
+func (d *failingDecoder) Decode([]byte) (itemimage.Operation, error) {
+	return itemimage.Operation{}, d.err
+}
+
+// TestCoordinatorRefusesAnUnvalidatedConfiguration verifies a configuration that was
+// never validated is refused at the start. A zero shutdown timeout is what one looks
+// like, and it would make the save an interrupted restore depends on fail on every run,
+// so it is caught before the table is touched rather than at the moment it matters.
+func TestCoordinatorRefusesAnUnvalidatedConfiguration(t *testing.T) {
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		lines: [][]byte{[]byte(`{"id":"1"}`)},
+	})
+	coord.cfg.ShutdownTimeout = 0
+
+	if err := runCoordinator(t, coord); err == nil {
+		t.Fatal("expected an unvalidated configuration to be refused")
+	}
+}
+
+// TestCoordinatorReportsFilesItCouldNotVerify verifies files the manifest recorded
+// nothing comparable for are reported rather than passed over. They are restored
+// anyway, since there is nothing to say they are wrong, but an operator who is
+// restoring a copied export needs to know how much of it went unchecked.
+func TestCoordinatorReportsFilesItCouldNotVerify(t *testing.T) {
+	out := &testConsole{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		loader: &mockLoader{
+			summary: manifest.Summary{
+				ExportARN: testExportARN,
+				ItemCount: 1,
+				DataFiles: []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+			},
+			unverified: []string{testFileKey},
+		},
+		lines:   [][]byte{[]byte(`{"id":"1"}`)},
+		console: out,
+	})
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+	if shown := out.shown(); !strings.Contains(shown, "carry no checksum") {
+		t.Errorf("expected the unverifiable file reported, got %q", shown)
+	}
+}
+
+// TestCoordinatorReportsAFinalCheckpointItCouldNotSave verifies a restore that did all
+// its work but could not record that it had done so is reported as a failure. Calling
+// it a success would leave a checkpoint describing less than the table holds, and the
+// next run would redo whatever the last save did not cover.
+func TestCoordinatorReportsAFinalCheckpointItCouldNotSave(t *testing.T) {
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		lines: [][]byte{[]byte(`{"id":"1"}`)},
+		// The save before the first read and the file's completion both succeed; only
+		// the one taken once the pools have stopped fails.
+		store: &mockStore{failSaveAt: 3},
+	})
+
+	err := runCoordinator(t, coord)
+	if err == nil || !strings.Contains(err.Error(), "final checkpoint") {
+		t.Fatalf("expected the failed final checkpoint reported, got %v", err)
 	}
 }

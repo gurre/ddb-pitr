@@ -80,6 +80,7 @@ func TestWriteCostChargesAKilobyteAUnit(t *testing.T) {
 		want float64
 	}{
 		{"a small item costs one unit", itemimage.Operation{Type: itemimage.OpPut, Bytes: 40}, 1},
+		{"an item of no measured size still costs one", itemimage.Operation{Type: itemimage.OpPut}, 1},
 		{"a three kilobyte item costs three", itemimage.Operation{Type: itemimage.OpPut, Bytes: 2049}, 3},
 		{"a delete is charged by its key", itemimage.Operation{Type: itemimage.OpDelete, Bytes: 4096}, 1},
 	}
@@ -257,9 +258,10 @@ func BenchmarkPacerAdmit(b *testing.B) {
 // fixed number of items per call and hands the rest straight back unprocessed, which is
 // exactly how DynamoDB refuses part of a batch.
 type capacityClient struct {
-	sizes    []int // Items in each call, in order
-	limit    int   // Items one call may write
-	reported int   // Calls that asked what they consumed
+	sizes    []int   // Items in each call, in order
+	charge   float64 // Capacity to report per accepted item; 0 reports none
+	limit    int     // Items one call may write
+	reported int     // Calls that asked what they consumed
 	mu       sync.Mutex
 }
 
@@ -273,11 +275,21 @@ func (c *capacityClient) BatchWriteItem(ctx context.Context, params *dynamodb.Ba
 	out := &dynamodb.BatchWriteItemOutput{}
 	for table, requests := range params.RequestItems {
 		c.sizes = append(c.sizes, len(requests))
-		if len(requests) > c.limit {
+		accepted := len(requests)
+		if accepted > c.limit {
+			accepted = c.limit
 			out.UnprocessedItems = map[string][]types.WriteRequest{
 				table: append([]types.WriteRequest(nil), requests[c.limit:]...),
 			}
 		}
+		// A table that reports nothing is reported as an entry with no units, which is
+		// what the field looks like when the caller did not ask for it.
+		units := c.charge * float64(accepted)
+		entry := types.ConsumedCapacity{TableName: &table}
+		if units > 0 {
+			entry.CapacityUnits = &units
+		}
+		out.ConsumedCapacity = append(out.ConsumedCapacity, entry)
 	}
 	return out, nil
 }
@@ -564,5 +576,129 @@ func TestWriteBatchClimbsBackWhileTheTableKeepsUp(t *testing.T) {
 	rate, _ := w.pacer.current()
 	if rate <= 10 {
 		t.Errorf("expected the rate to rise above 10, got %v", rate)
+	}
+}
+
+// TestWallClockSleepWaitsAndHonoursCancellation verifies the clock a restore actually
+// runs on waits for the delay it is given and gives up when the context ends. Every
+// other test replaces it, so without this the one implementation that ships is the one
+// nothing exercises.
+func TestWallClockSleepWaitsAndHonoursCancellation(t *testing.T) {
+	var c wallClock
+
+	start := time.Now()
+	if !c.Sleep(context.Background(), 2*time.Millisecond) {
+		t.Error("expected a completed wait to report success")
+	}
+	if elapsed := time.Since(start); elapsed < time.Millisecond {
+		t.Errorf("expected the wait to take at least a millisecond, took %s", elapsed)
+	}
+
+	// A delay of nothing is not a wait at all, and must not report the restore stopping.
+	if !c.Sleep(context.Background(), 0) {
+		t.Error("expected no wait to report success")
+	}
+
+	stopped, cancel := context.WithCancel(context.Background())
+	cancel()
+	if c.Sleep(stopped, time.Hour) {
+		t.Error("expected a wait cut short by the context to report failure")
+	}
+	if c.Sleep(stopped, 0) {
+		t.Error("expected no wait under a stopped context to report failure")
+	}
+}
+
+// TestWriteBatchChargesTheCapacityTheTableReported verifies the capacity a response
+// reports is what the restore is charged, not what it guessed.
+//
+// The export line an item was decoded from is only a guide to what DynamoDB will
+// measure. A restore that kept spending against its own guess would drift away from the
+// rate the table actually granted and sit in a permanent refusal.
+func TestWriteBatchChargesTheCapacityTheTableReported(t *testing.T) {
+	clock := newTestClock()
+	// Each item is estimated at one unit but costs four.
+	client := &capacityClient{limit: 25, charge: 4}
+	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{},
+		WithBackoff(&instantBackoff{}), withPaceClock(clock))
+	w.pacer.setRateLocked(clock.Now(), 10)
+	clock.advance(time.Second)
+
+	if err := w.WriteBatch(context.Background(), putOps(10)); err != nil {
+		t.Fatalf("WriteBatch failed: %v", err)
+	}
+
+	// Ten units were banked and forty were charged, so the next request waits for the
+	// thirty the restore is now behind.
+	_, wait := w.pacer.take(1, 1)
+	if wait < 3*time.Second {
+		t.Errorf("expected the overcharge to delay the next request, waited %s", wait)
+	}
+}
+
+// TestPacerDropsBankedCapacityWhenTheRateFalls verifies capacity banked at a high rate
+// is not spent at a low one. A refusal means the table stopped taking what it was
+// taking, so a bucket left full would send one more request of the old size straight
+// back into it.
+func TestPacerDropsBankedCapacityWhenTheRateFalls(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 100)
+	p.achieved = 100
+	clock.advance(time.Second) // A hundred units accrue.
+
+	// One small request, so most of the hundred stays banked.
+	if n, _ := p.take(1, 10); n != 10 {
+		t.Fatalf("expected the request granted from the banked capacity, got %d", n)
+	}
+
+	p.throttled() // Which halves the rate to fifty.
+
+	n, _ := p.take(1, 100)
+	if n > 50 {
+		t.Errorf("expected the next request held to the new rate of 50, got %d", n)
+	}
+}
+
+// TestPacerSizesTheRequestByWhatEachItemCosts verifies the capacity on hand is divided
+// by what an item costs, not applied per item.
+//
+// A table's limit is in capacity units, and items are not a unit each: a four-kilobyte
+// item is four. A restore that counted items would send four times the work it was
+// allowed whenever the export held large items, which is the case where getting the
+// rate right matters most.
+func TestPacerSizesTheRequestByWhatEachItemCosts(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 30)
+	clock.advance(time.Second) // Thirty units accrue.
+
+	// Items of three units each, so thirty units pay for ten of them.
+	n, _ := p.take(3, 20)
+	if n != 10 {
+		t.Errorf("expected thirty units to pay for ten three-unit items, got %d", n)
+	}
+}
+
+// TestPacerMeasuresTheRateOverTheWindowsLength verifies what the table was taking is
+// measured as capacity per second, not as capacity. Every window happening to be a
+// second long would hide the difference, and a longer one would then be read as a far
+// higher rate than the table ever granted.
+func TestPacerMeasuresTheRateOverTheWindowsLength(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 10)
+	clock.advance(time.Second)
+
+	p.take(1, 1)    // Opens a window.
+	p.settle(1, 20) // Twenty units go through it...
+	clock.advance(4 * time.Second)
+	p.take(1, 1) // ...over four seconds, so five a second.
+
+	p.throttled()
+
+	rate, _ := p.current()
+	if rate != 2.5 {
+		t.Errorf("expected the rate cut to half of the 5/s observed, got %v", rate)
 	}
 }

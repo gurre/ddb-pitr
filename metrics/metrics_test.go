@@ -376,3 +376,29 @@ func TestMetricsHappyPath(t *testing.T) {
 		t.Error("expected non-empty string representation")
 	}
 }
+
+// TestPaceIsReportedOnlyOnceSomethingLimitsTheRestore verifies the write rate reads as
+// unset until a rate has been recorded, and as that rate afterwards.
+//
+// A restore nothing has throttled has no rate to report, and reporting zero for it
+// would read as a restore that has stopped writing, which is the opposite of one
+// running at full speed.
+func TestPaceIsReportedOnlyOnceSomethingLimitsTheRestore(t *testing.T) {
+	m := NewMetrics()
+
+	if _, limited := m.Pace(); limited {
+		t.Error("expected no rate reported before anything limits the restore")
+	}
+
+	m.RecordPace(1234.5)
+	rate, limited := m.Pace()
+	if !limited || rate != 1234.5 {
+		t.Errorf("expected the recorded rate of 1234.5 reported, got %v (limited %t)", rate, limited)
+	}
+
+	// A gauge, not a counter: the latest rate is the one that describes the restore now.
+	m.RecordPace(7.5)
+	if rate, _ := m.Pace(); rate != 7.5 {
+		t.Errorf("expected the latest rate reported, got %v", rate)
+	}
+}

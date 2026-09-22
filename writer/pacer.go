@@ -166,14 +166,12 @@ func (p *pacer) take(unitCost float64, max int) (int, time.Duration) {
 }
 
 // refillLocked adds the capacity that has accrued since the last refill and rolls the
-// measurement window. The bucket holds a second's worth, or one request's worth when
+// measurement window. It runs only once a rate has been set, which is also what starts
+// the bucket filling, so there is never a first refill with nowhere to measure from. The bucket holds a second's worth, or one request's worth when
 // that is larger, so a rate below the cost of a single item still lets that item
 // through rather than deadlocking on an allowance it can never reach.
 func (p *pacer) refillLocked(need float64) {
 	now := p.clock.Now()
-	if p.filled.IsZero() {
-		p.filled = now
-	}
 	if elapsed := now.Sub(p.filled).Seconds(); elapsed > 0 {
 		p.tokens += elapsed * p.rate
 		p.filled = now
@@ -224,7 +222,7 @@ func (p *pacer) throttled() {
 	if p.lastCut.IsZero() || now.Sub(p.lastCut) >= paceWindow {
 		p.lastCut = now
 		p.cut = true
-		p.setRateLocked(now, math.Max(minPaceRate, p.stepDownFromLocked(now)/2))
+		p.setRateLocked(now, p.stepDownFromLocked(now)/2)
 	}
 	p.mu.Unlock()
 
@@ -305,8 +303,9 @@ func (p *pacer) rollLocked(now time.Time) {
 	p.window = now
 }
 
-// setRateLocked moves the allowed rate, keeping the bucket within the new ceiling and
-// noting that the change is worth reporting.
+// setRateLocked moves the allowed rate, keeping it above the floor and the bucket
+// within the new ceiling, and notes that the change is worth reporting. The floor is
+// applied here and nowhere else, so there is one place for it to be got right.
 func (p *pacer) setRateLocked(now time.Time, rate float64) {
 	if rate < minPaceRate {
 		rate = minPaceRate

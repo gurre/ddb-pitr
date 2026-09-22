@@ -48,3 +48,6 @@ logs/
 
 # GoReleaser build output
 dist/
+
+# Coverage and mutation results
+tmp/
