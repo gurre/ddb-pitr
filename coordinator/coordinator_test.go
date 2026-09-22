@@ -1132,6 +1132,7 @@ func TestSnapshotCountsOnlyRecentlyActiveWorkers(t *testing.T) {
 	idle := []time.Duration{time.Second, 10 * time.Second, 20 * time.Second}
 	for id, quiet := range idle {
 		coord.initWorker(id, false)
+		coord.workerStatus[writerKey(id)].Busy = true
 		coord.workerStatus[writerKey(id)].LastActive = now.Add(-quiet)
 	}
 
@@ -1151,6 +1152,9 @@ func TestSnapshotCountsReadersAndWritersApart(t *testing.T) {
 	coord.initWorker(0, true)
 	coord.initWorker(1, true)
 	coord.initWorker(0, false)
+	for key := range coord.workerStatus {
+		coord.workerStatus[key].Busy = true
+	}
 	coord.workerStatus[writerKey(0)].LastActive = now.Add(-20 * time.Second)
 
 	snap := coord.snapshot(now)
@@ -2670,31 +2674,48 @@ func TestCoordinatorDrawsTheProgressLineWhileItRuns(t *testing.T) {
 	}
 }
 
-// TestCoordinatorKeepsReportingWhileReadingOneLargeFile verifies a reader working
-// through a single large file goes on reporting that it is working. The progress line
-// counts a pool member idle after a timeout, and a reader that reported only when it
-// finished a file would look stopped for as long as a large file takes to read.
-func TestCoordinatorKeepsReportingWhileReadingOneLargeFile(t *testing.T) {
-	lines := make([][]byte, linesPerStamp+1)
-	for i := range lines {
-		lines[i] = []byte(`{"id":"1"}`)
+// TestProgressLineCountsOnlyReadersHoldingAFile verifies the reader count is the
+// readers with a file in hand, not every reader the restore started.
+//
+// An export has as many data files as the exported table had partitions, which is
+// usually fewer than the readers asked for. Counting the idle ones would report a
+// restore as reading far more widely than it is, and the count is there precisely to
+// say whether reading or writing is the limit.
+func TestProgressLineCountsOnlyReadersHoldingAFile(t *testing.T) {
+	gate := make(chan struct{})
+	held := make(chan struct{})
+	var once sync.Once
+	streamer := &mockStreamer{
+		lines:     [][]byte{[]byte(`{"id":"1"}`)},
+		waitFor:   map[string]chan struct{}{testFileKey: gate},
+		onAttempt: func() { once.Do(func() { close(held) }) },
 	}
 	coord, _ := newTestCoordinator(t, testDeps{
-		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: int64(len(lines))}},
-		lines: lines,
+		files:    []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		streamer: streamer,
+		configure: func(cfg *config.Config) {
+			cfg.Readers = 3
+		},
 	})
 
-	if err := runCoordinator(t, coord); err != nil {
+	// The one file is held open while the snapshot is taken, so the other two readers
+	// are started and waiting with nothing to do.
+	done := make(chan error, 1)
+	go func() { done <- runCoordinator(t, coord) }()
+	<-held
+
+	if got := coord.snapshot(time.Now()).ActiveReader; got != 1 {
+		t.Errorf("expected only the reader holding the file counted, got %d of 3", got)
+	}
+
+	close(gate)
+	if err := <-done; err != nil {
 		t.Fatalf("coordinator failed: %v", err)
 	}
 
-	// A reader reports nothing else, so its activity can only have been stamped from
-	// within the file.
-	coord.statusMu.RLock()
-	defer coord.statusMu.RUnlock()
-	status := coord.workerStatus[statusKey{id: 0, reader: true}]
-	if !status.LastActive.After(status.StartTime) {
-		t.Error("expected the reader to report activity from within the file")
+	// And once the export is read, no reader is holding anything.
+	if got := coord.snapshot(time.Now()).ActiveReader; got != 0 {
+		t.Errorf("expected no readers counted once the export is read, got %d", got)
 	}
 }
 
@@ -2888,4 +2909,125 @@ func TestCoordinatorReportsAnInterruptionAsOne(t *testing.T) {
 	if shown := out.shown(); !strings.Contains(shown, "run the same command again") {
 		t.Errorf("expected the operator told the restore can be carried on, got %q", shown)
 	}
+}
+
+// TestProgressLineDropsAReaderThatStopsMakingProgress verifies a reader that holds a
+// file but has stopped getting through it is not counted among the working ones.
+// Holding a file is not the same as making progress, and a restore stuck on one hung
+// read should show as stuck rather than as busy.
+func TestProgressLineDropsAReaderThatStopsMakingProgress(t *testing.T) {
+	coord, _ := newTestCoordinator(t, testDeps{})
+	now := time.Now()
+	coord.lastReportTime = now
+
+	coord.initWorker(0, true)
+	status := coord.workerStatus[statusKey{id: 0, reader: true}]
+	status.Busy = true
+	status.LastActive = now.Add(-2 * workerIdleTimeout)
+
+	if got := coord.snapshot(now).ActiveReader; got != 0 {
+		t.Errorf("expected a reader that has stopped getting anywhere not counted, got %d", got)
+	}
+}
+
+// TestProgressLineCountsOnlyWritersHoldingABatch verifies the writer count is the
+// writers with a batch in hand. A writer waiting for items is the signal that reading
+// is the limit, so counting it as working hides exactly what the line is for.
+func TestProgressLineCountsOnlyWritersHoldingABatch(t *testing.T) {
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		lines: [][]byte{[]byte(`{"id":"1"}`)},
+		configure: func(cfg *config.Config) {
+			cfg.MaxWorkers = 3
+		},
+	})
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+
+	if got := coord.snapshot(time.Now()).ActiveWriter; got != 0 {
+		t.Errorf("expected no writers counted once every batch is written, got %d", got)
+	}
+}
+
+// TestCoordinatorReportsAReaderStillWorkingThroughAFile verifies a reader says it is
+// still working while it is part-way through one file.
+//
+// The progress line stops counting a member that has gone quiet, which is how a stalled
+// restore becomes visible. A reader reports nothing per line, so one working through a
+// file larger than the timeout takes to read would be counted stalled while it was
+// getting on with it, and an operator would go looking for a fault that is not there.
+func TestCoordinatorReportsAReaderStillWorkingThroughAFile(t *testing.T) {
+	lines := make([][]byte, 4*linesPerStampCheck)
+	for i := range lines {
+		lines[i] = []byte(`{"id":"1"}`)
+	}
+	// The reader is held part-way through the file, so what it last reported can only
+	// have come from within it: picking the file up and finishing it both happen
+	// outside the window this looks at.
+	decoder := &pausingDecoder{
+		after:   3 * linesPerStampCheck,
+		reached: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:   []manifest.FileMeta{{Key: testFileKey, ItemCount: int64(len(lines))}},
+		lines:   lines,
+		decoder: decoder,
+	})
+	// Every check is due, so the reader reports as often as it looks.
+	withStampInterval(time.Nanosecond)(coord)
+
+	done := make(chan error, 1)
+	go func() { done <- runCoordinator(t, coord) }()
+	<-decoder.reached
+
+	coord.statusMu.RLock()
+	reported := coord.workerStatus[statusKey{id: 0, reader: true}].LastActive
+	coord.statusMu.RUnlock()
+
+	close(decoder.release)
+	if err := <-done; err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+
+	if !reported.After(decoder.startedReading()) {
+		t.Error("expected the reader to have reported from within the file")
+	}
+}
+
+// pausingDecoder notes when the reader began the file and holds it part-way through,
+// so a test can look at what the reader has reported while it is still working.
+type pausingDecoder struct {
+	first   time.Time
+	reached chan struct{} // Closed once the reader is held
+	release chan struct{} // Closed by the test to let it carry on
+	inner   mockDecoder
+	after   int // Lines decoded before the reader is held
+	calls   int
+	mu      sync.Mutex
+}
+
+func (d *pausingDecoder) Decode(line []byte) (itemimage.Operation, error) {
+	d.mu.Lock()
+	d.calls++
+	if d.calls == 1 {
+		d.first = time.Now()
+	}
+	n := d.calls
+	d.mu.Unlock()
+
+	if n == d.after {
+		close(d.reached)
+		<-d.release
+	}
+	return d.inner.Decode(line)
+}
+
+// startedReading reports when the reader decoded the file's first line.
+func (d *pausingDecoder) startedReading() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.first
 }

@@ -223,9 +223,12 @@ restore is working, and both are absolute rather than a share of an estimate, so
 can be checked against the table and against the export. The file count covers the whole
 restore, so a resumed run reports the files an earlier run finished as done.
 
-The two pool counts say which end is the limit. Idle writers mean the export is not
-being read fast enough; raise `--readers`. Idle readers mean the table is not accepting
-writes fast enough; raise the table's capacity.
+The two pool counts are the readers holding a data file and the writers holding a batch,
+which is what says which end is the limit. Writers idle means the export is not being
+read fast enough; raise `--readers`. Readers idle means the table is not accepting writes
+fast enough; raise the table's capacity. The reader count cannot exceed the number of
+data files the export holds, so a small export reads narrowly however many readers it
+was given.
 
 Anything that goes wrong is printed as it happens, above the progress line, naming the
 reader or writer that hit it. A restore that retries past a failure therefore still says

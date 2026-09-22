@@ -59,6 +59,10 @@ type WorkerStatus struct {
 	BatchesCount  int64     // Number of batches processed (8 bytes)
 	ID            int       // Worker identifier (8 bytes on 64-bit)
 	IsReader      bool      // Whether this is a reader rather than a writer (1 byte)
+	// Busy is whether this member has work in hand: a file for a reader, a batch for a
+	// writer. A member with nothing to do is not counted among the active ones, because
+	// having nothing to do is the very thing the count is there to show.
+	Busy bool
 }
 
 // ReportUploader uploads reports to S3.
@@ -121,6 +125,14 @@ func WithStreamBackoff(b Backoffer) Option {
 //	coord := coordinator.NewCoordinator(cfg, loader, streamer, parser, w, store, uploader, m,
 //	    coordinator.WithBatchLinger(10*time.Millisecond))
 //
+// withStampInterval replaces how often a reader reports that it is still working, so a
+// test can drive that without a file slow enough to need it.
+func withStampInterval(d time.Duration) Option {
+	return func(c *Coordinator) {
+		c.stamp = d
+	}
+}
+
 // withConsole replaces where the progress line and the messages beside it are written,
 // so a test can read what a restore reported.
 func withConsole(progress, messages io.Writer) Option {
@@ -152,6 +164,7 @@ type Coordinator struct {
 	backoff        Backoffer
 	console        *console      // Owns the progress line and anything printed beside it
 	linger         time.Duration // How long a partly filled batch waits for more items
+	stamp          time.Duration // How often a reader reports that it is still working
 
 	// progress owns what the restore has finished; the store is only ever written
 	// from a snapshot of it, taken under saveMu so the object in S3 advances in the
@@ -305,6 +318,7 @@ func NewCoordinator(
 		backoff:        writer.NewExponentialBackoff(time.Second, 30*time.Second),
 		console:        newConsole(os.Stdout, os.Stderr),
 		linger:         defaultBatchLinger,
+		stamp:          defaultStampInterval,
 		progress:       newProgress("", checkpoint.State{}),
 		workerStatus:   make(map[statusKey]*WorkerStatus),
 	}
@@ -594,16 +608,29 @@ func (c *Coordinator) updateWorkerStatus(key statusKey, fn func(*WorkerStatus)) 
 // progress line stops counting it among the active ones.
 const workerIdleTimeout = 10 * time.Second
 
-// linesPerStamp is how many lines a reader gets through between stamps of its status.
-// A reader reports nothing per line, so without this one working through a large file
-// would look stopped for as long as the file takes; counting lines rather than
-// consulting the clock keeps the check off the hot path's budget.
-const linesPerStamp = 4096
+// linesPerStampCheck is how many lines a reader gets through between consulting the
+// clock about whether it is due to report that it is still working. Reading the clock
+// per line is a cost the hot path does not need, and reading it per sixty-odd is free.
+//
+// A file holding fewer lines than this reports only when it is picked up, which covers
+// it for workerIdleTimeout. That leaves a file of very large items, few enough in number
+// and slow enough to read, showing its reader as stalled towards the end; the count is
+// wrong there and nothing else is.
+const linesPerStampCheck = 64
+
+// defaultStampInterval is how often a reader that is making progress says so. It is
+// well inside workerIdleTimeout, so a reader is never counted idle while it is working.
+const defaultStampInterval = workerIdleTimeout / 4
 
 // markActive stamps a pool member as still working, which is all the progress line
 // needs from a member that has nothing else to report.
 func (c *Coordinator) markActive(key statusKey) {
 	c.updateWorkerStatus(key, func(*WorkerStatus) {})
+}
+
+// markBusy records whether a pool member has work in hand.
+func (c *Coordinator) markBusy(key statusKey, busy bool) {
+	c.updateWorkerStatus(key, func(s *WorkerStatus) { s.Busy = busy })
 }
 
 // bytesPerMB converts the byte counters into the megabytes the progress line reports.
@@ -674,7 +701,9 @@ func (c *Coordinator) snapshot(now time.Time) progressSnapshot {
 	var totalItems, totalBatches int64
 	activeReaders, activeWriters := 0, 0
 	for _, status := range c.workerStatus {
-		if now.Sub(status.LastActive) < workerIdleTimeout {
+		// Work in hand is what makes a member active, and a stale stamp is what tells
+		// a member that is stuck from one that is getting on with it.
+		if status.Busy && now.Sub(status.LastActive) < workerIdleTimeout {
 			if status.IsReader {
 				activeReaders++
 			} else {
@@ -911,6 +940,8 @@ type item struct {
 func (c *Coordinator) readFiles(ctx context.Context, id int, tasks <-chan manifest.FileMeta, items chan<- item) error {
 	const maxRetries = 3
 	self := statusKey{id: id, reader: true}
+	// However this reader leaves, it is no longer holding a file.
+	defer c.markBusy(self, false)
 
 	// Use the bucket from the config
 	bucket := c.cfg.GetExportBucketName()
@@ -925,10 +956,12 @@ func (c *Coordinator) readFiles(ctx context.Context, id int, tasks <-chan manife
 		// file goes to one reader, so nothing can complete a file between the two.
 		resumed, _ := c.progress.resume(file.Key)
 		ledger := newFileLedger(file.Key, resumed)
+		c.markBusy(self, true)
 
 		// Stream and process the file with retries
 		var streamErr error
-		linesSinceStamp := 0
+		linesSinceCheck := 0
+		lastStamp := time.Now()
 		for retry := 0; retry < maxRetries; retry++ {
 			// The first attempt is not paced; every one after it waits longer than the
 			// last, so a file failing against a struggling S3 does not hammer it. A wait
@@ -948,10 +981,13 @@ func (c *Coordinator) readFiles(ctx context.Context, id int, tasks <-chan manife
 			// the ledger records are positions in the decompressed stream. The two only
 			// agree for an uncompressed file, and exports are gzipped.
 			streamErr = c.streamer.Stream(ctx, bucket, file.Key, streamFromStart, func(line []byte, byteOffset int64) error {
-				linesSinceStamp++
-				if linesSinceStamp >= linesPerStamp {
-					linesSinceStamp = 0
-					c.markActive(self)
+				linesSinceCheck++
+				if linesSinceCheck >= linesPerStampCheck {
+					linesSinceCheck = 0
+					if now := time.Now(); now.Sub(lastStamp) >= c.stamp {
+						lastStamp = now
+						c.markActive(self)
+					}
 				}
 
 				// Lines already dispatched are in flight or written, and lines already
@@ -1013,6 +1049,7 @@ func (c *Coordinator) readFiles(ctx context.Context, id int, tasks <-chan manife
 			c.recordError(self, err)
 			return fmt.Errorf("failed to save completion checkpoint for file %s: %w", file.Key, err)
 		}
+		c.markBusy(self, false)
 	}
 
 	return nil
@@ -1035,6 +1072,9 @@ const defaultBatchLinger = 50 * time.Millisecond
 // c.cfg.MaxWorkers, and the cost is dominated by the BatchWriteItem call itself.
 func (c *Coordinator) writeItems(ctx context.Context, id int, items <-chan item) error {
 	self := statusKey{id: id}
+	// However this writer leaves, it is no longer holding a batch.
+	defer c.markBusy(self, false)
+
 	batch := make([]item, 0, c.cfg.BatchSize)
 	ops := make([]itemimage.Operation, 0, c.cfg.BatchSize)
 	batchesSinceCheckpoint := 0
@@ -1068,6 +1108,7 @@ func (c *Coordinator) writeItems(ctx context.Context, id int, items <-chan item)
 		c.updateWorkerStatus(self, func(s *WorkerStatus) {
 			s.ItemsWritten += int64(len(ops))
 			s.BatchesCount++
+			s.Busy = false
 		})
 
 		// Acknowledged only once the write has returned, so a checkpoint taken now
@@ -1102,6 +1143,7 @@ func (c *Coordinator) writeItems(ctx context.Context, id int, items <-chan item)
 			}
 			batch = append(batch, next)
 			if len(batch) == 1 {
+				c.markBusy(self, true)
 				resetTimer(linger, c.linger)
 			}
 			if len(batch) >= c.cfg.BatchSize {
