@@ -233,7 +233,8 @@ what it survived, rather than finishing with a count and nothing to explain it. 
 that could not be decoded are named the same way, with the file and offset needed to go
 and look at them; the first twenty are named and the rest are counted. An interruption
 is not printed as a failure, since every reader and writer reports it at once and the
-reason for the stop is reported on its own.
+reason for the stop is reported on its own. An interrupted restore says how many data
+files it finished and that running the same command again carries on from there.
 
 ## Keeping pace with the table
 

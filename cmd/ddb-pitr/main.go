@@ -272,9 +272,10 @@ func run() error {
 		fmt.Printf("Starting restore of table %s from %s\n", cfg.TableName, cfg.ExportS3URI)
 	}
 	if err := coord.Run(ctx); err != nil {
-		// A run that skipped records did finish; wrapping it as a failure would
-		// contradict the exit status that says so.
-		if errors.Is(err, coordinator.ErrRecordsSkipped) {
+		// A run that skipped records did finish, and one that was interrupted was
+		// stopped rather than broken. Wrapping either as a failure would contradict
+		// what the message and the exit status say about what to do next.
+		if errors.Is(err, coordinator.ErrRecordsSkipped) || errors.Is(err, coordinator.ErrInterrupted) {
 			return err
 		}
 		return fmt.Errorf("restore operation failed: %w", err)

@@ -78,6 +78,12 @@ type Backoffer interface {
 // record an unfinished file as complete, which a resume would then skip.
 var errBackoffStopped = errors.New("coordinator: backoff stopped before the file was finished")
 
+// ErrInterrupted is returned when the run stopped because the caller's context ended
+// rather than because the export was finished. Progress has been recorded, so running
+// the same command again carries on from where it stopped. It wraps the context's own
+// error, so a caller can still tell a signal from a deadline.
+var ErrInterrupted = errors.New("restore interrupted before it finished")
+
 // ErrRecordsSkipped is returned when the restore ran to the end but skipped lines it
 // could not decode. The table holds everything else the export contained, so this is
 // told apart from a restore that did not finish; the two call for different responses.
@@ -495,7 +501,11 @@ dispatch:
 	// An interruption or a failure is reported ahead of a failed final save: the save
 	// failing is a consequence the operator needs to know about, not the cause.
 	if err := ctx.Err(); err != nil {
-		return shutdownError(err, saveErr)
+		// What an operator needs on being interrupted is how far the restore got and
+		// that it need not start again, neither of which "context canceled" conveys.
+		c.console.line("Interrupted with %d of %d data files finished; run the same command again to carry on",
+			c.progress.completedCount(), c.totalFiles)
+		return shutdownError(fmt.Errorf("%w (%w)", ErrInterrupted, err), saveErr)
 	}
 	if firstFailure != nil {
 		return shutdownError(firstFailure, saveErr)

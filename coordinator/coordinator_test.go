@@ -2852,3 +2852,40 @@ func TestCoordinatorReportsAFinalCheckpointItCouldNotSave(t *testing.T) {
 		t.Fatalf("expected the failed final checkpoint reported, got %v", err)
 	}
 }
+
+// TestCoordinatorReportsAnInterruptionAsOne verifies a run stopped by its caller is
+// reported as an interruption rather than as a failure, while still carrying the
+// context's own error so a signal can be told from a deadline.
+//
+// What an operator needs on being interrupted is that the restore was stopped rather
+// than broken, and that running the same command again carries on. Reporting only
+// "context canceled" says neither.
+func TestCoordinatorReportsAnInterruptionAsOne(t *testing.T) {
+	out := &testConsole{}
+	w := &mockWriter{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:   []manifest.FileMeta{{Key: testFileKey, ItemCount: 2}},
+		lines:   [][]byte{[]byte(`{"id":"1"}`), []byte(`{"id":"2"}`)},
+		writer:  w,
+		console: out,
+		configure: func(cfg *config.Config) {
+			cfg.BatchSize = 1
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(callerContext(), 30*time.Second)
+	defer cancel()
+	w.afterWrite = cancel
+
+	err := coord.Run(ctx)
+	if !errors.Is(err, ErrInterrupted) {
+		t.Fatalf("expected the run reported as interrupted, got %v", err)
+	}
+	// The cause is kept, so a deadline and a signal stay distinguishable.
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected the context's own error kept, got %v", err)
+	}
+	if shown := out.shown(); !strings.Contains(shown, "run the same command again") {
+		t.Errorf("expected the operator told the restore can be carried on, got %q", shown)
+	}
+}

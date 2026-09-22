@@ -477,11 +477,15 @@ echo "Starting a restore to interrupt..."
     -batch 1 &
 PITR_PID=$!
 
-# Interrupt once progress has been recorded, so the checkpoint under test describes a
-# run that was genuinely part-way through rather than one that had done nothing.
+# Interrupt once the checkpoint describes work that was actually done, not merely once
+# it exists. A restore writes its checkpoint before it reads a single data file, so that
+# it finds out at the start whether it can record progress at all; waiting only for the
+# object to appear interrupts the restore while it is still verifying the export, and
+# leaves nothing for the resume to skip.
 CHECKPOINT_SEEN=0
 for _ in $(seq 1 600); do
-    if aws s3api head-object --bucket "${S3_BUCKET}" --key "${CHECKPOINT_KEY}" --region "${REGION}" > /dev/null 2>&1; then
+    if aws s3 cp "s3://${S3_BUCKET}/${CHECKPOINT_KEY}" - --region "${REGION}" 2>/dev/null \
+        | jq -e '((.completed // []) | length) > 0 or ((.offsets // {}) | length) > 0' > /dev/null 2>&1; then
         CHECKPOINT_SEEN=1
         break
     fi
@@ -494,7 +498,7 @@ done
 # a container runtime sends, and the restore treats the two the same way.
 INTERRUPT_RC=0
 if kill -0 "${PITR_PID}" 2>/dev/null; then
-    echo "Progress recorded; interrupting the restore"
+    echo "Progress recorded for work already done; interrupting the restore"
     kill -TERM "${PITR_PID}" 2>/dev/null || true
 fi
 wait "${PITR_PID}" || INTERRUPT_RC=$?
