@@ -203,6 +203,15 @@ decides how wide the spread is; `--workers` decides how many writes are in fligh
 Reading a file costs memory while it is open, so `--readers` is bounded by the machine
 rather than by the table. Around 7 MB per file is a safe estimate.
 
+> **Upgrading.** `--workers` used to set how many files were read *and* written at once;
+> it now sets writes alone, and `--readers` sets reading. A restore therefore holds more
+> memory than it used to: roughly 350 MB at the default of 50 readers, against about
+> 70 MB before. Lower `--readers` where that matters, such as a container with a small
+> memory limit. An invocation that passed `--workers 50` for throughput no longer needs
+> to: the default spread is what makes a restore fast, and `--workers` is now only how
+> many writes are in flight. The progress line has also changed shape, so anything
+> reading it needs updating.
+
 Two consequences worth knowing. Items are written in no particular order, which is
 already true of any export: an export holds one record per key, so nothing within it
 depends on order. And a restore now holds decoded items in memory between reading and
