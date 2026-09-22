@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"sort"
@@ -113,6 +114,15 @@ func WithStreamBackoff(b Backoffer) Option {
 //
 //	coord := coordinator.NewCoordinator(cfg, loader, streamer, parser, w, store, uploader, m,
 //	    coordinator.WithBatchLinger(10*time.Millisecond))
+//
+// withConsole replaces where the progress line and the messages beside it are written,
+// so a test can read what a restore reported.
+func withConsole(progress, messages io.Writer) Option {
+	return func(c *Coordinator) {
+		c.console = newConsole(progress, messages)
+	}
+}
+
 func WithBatchLinger(d time.Duration) Option {
 	return func(c *Coordinator) {
 		if d <= 0 {
@@ -134,6 +144,7 @@ type Coordinator struct {
 	metrics        *metrics.Metrics
 	reportUploader ReportUploader
 	backoff        Backoffer
+	console        *console      // Owns the progress line and anything printed beside it
 	linger         time.Duration // How long a partly filled batch waits for more items
 
 	// progress owns what the restore has finished; the store is only ever written
@@ -149,6 +160,7 @@ type Coordinator struct {
 	// Progress tracking for percentage and throughput calculation
 	corruptNamed       atomic.Int64 // Skipped lines named on stderr so far
 	totalExpectedItems int64        // Total items expected from manifest
+	totalFiles         int          // Data files the export contains
 	lastReportTime     time.Time    // Last progress report timestamp
 	lastReportItems    int64        // Items count at last report
 	lastReportBytes    int64        // Bytes count at last report
@@ -228,6 +240,14 @@ func (p *progress) skip() {
 	p.skipped++
 }
 
+// completedCount reports how many data files the restore has finished, over every run
+// so far: a resumed run inherits what an earlier one completed.
+func (p *progress) completedCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.completed)
+}
+
 // skipped reports how many lines this restore could not decode, over every run so far.
 func (p *progress) skippedCount() int64 {
 	p.mu.Lock()
@@ -277,6 +297,7 @@ func NewCoordinator(
 		metrics:        m,
 		reportUploader: reportUploader,
 		backoff:        writer.NewExponentialBackoff(time.Second, 30*time.Second),
+		console:        newConsole(os.Stdout, os.Stderr),
 		linger:         defaultBatchLinger,
 		progress:       newProgress("", checkpoint.State{}),
 		workerStatus:   make(map[statusKey]*WorkerStatus),
@@ -357,19 +378,20 @@ func (c *Coordinator) Run(ctx context.Context) error {
 			remaining.DataFiles = append(remaining.DataFiles, file)
 		}
 	}
-	fmt.Printf("Verifying %d data files against the manifest\n", len(remaining.DataFiles))
+	c.console.line("Verifying %d data files against the manifest", len(remaining.DataFiles))
 	verification, err := c.manifest.VerifyChecksums(ctx, c.cfg.GetExportBucketName(), remaining)
 	if err != nil {
 		return fmt.Errorf("export failed verification: %w", err)
 	}
-	fmt.Printf("Verified %d of %d data files against the manifest\n",
+	c.console.line("Verified %d of %d data files against the manifest",
 		verification.Verified, len(remaining.DataFiles))
 	if len(verification.Unverified) > 0 {
-		fmt.Printf("%d data files carry no checksum that can be compared\n", len(verification.Unverified))
+		c.console.line("%d data files carry no checksum that can be compared", len(verification.Unverified))
 	}
 
-	// Store total expected items for progress percentage calculation
+	// Store what the export promised, for the progress line
 	c.totalExpectedItems = summary.ItemCount
+	c.totalFiles = len(summary.DataFiles)
 	c.lastReportTime = time.Now()
 
 	// The pool runs under its own cancellation so one worker's failure stops the rest.
@@ -484,14 +506,14 @@ dispatch:
 
 	// Generate and print report
 	report := c.metrics.GenerateReport(c.progress.skippedCount())
-	fmt.Println(report)
+	c.console.line("%s", report)
 
 	// Upload report to S3 if configured
 	if c.cfg.ReportS3URI != "" && c.reportUploader != nil {
 		if err := c.reportUploader.UploadReport(ctx, c.cfg.ReportS3URI, report); err != nil {
 			return fmt.Errorf("failed to upload report: %w", err)
 		}
-		fmt.Printf("Report uploaded to %s\n", c.cfg.ReportS3URI)
+		c.console.line("Report uploaded to %s", c.cfg.ReportS3URI)
 	}
 
 	// Judged after the report is out, so the record of what was skipped survives the
@@ -517,7 +539,7 @@ const corruptLinesNamed = 20
 func (c *Coordinator) skipCorrupt(key string, offset int64, err error) {
 	c.progress.skip()
 	if c.corruptNamed.Add(1) <= corruptLinesNamed {
-		fmt.Fprintf(os.Stderr, "skipping %s at offset %d: %v\n", key, offset, err)
+		c.console.notice("skipping %s at offset %d: %v", key, offset, err)
 	}
 }
 
@@ -584,11 +606,17 @@ type progressSnapshot struct {
 	MBPerSec     float64 // Megabytes of export read per second since the previous snapshot
 	Percent      float64 // Share of the manifest's item count written so far, capped at 100
 	Pace         float64 // Write capacity units per second the table is currently allowing
+	ItemsWritten int64   // Items this run has written to the table
 	TotalBatches int64   // Batches written since the restore started
 	Throttles    int64
 	Retries      int64
 	LostItems    int64
 	Errors       int64
+	// FilesDone counts every data file the restore has finished, including ones an
+	// earlier run finished, because that is what is left to do rather than what this
+	// process has got through.
+	FilesDone    int
+	FilesTotal   int  // Data files the export contains
 	ActiveReader int  // Readers that reported activity within workerIdleTimeout
 	ActiveWriter int  // Writers that reported activity within workerIdleTimeout
 	Paced        bool // Whether anything is limiting the write rate yet
@@ -597,6 +625,11 @@ type progressSnapshot struct {
 // String renders the line an operator watches while a restore runs. Every number is
 // labelled where it appears, because the throttle, retry, lost and error counts drive
 // different responses and reading one as another sends the operator the wrong way.
+//
+// What has gone right leads and what has gone wrong follows, because a restore is
+// mostly the former: the items written and the files finished are what say the restore
+// is working, while a percentage alone says nothing an operator can act on and the
+// failure counts on their own read as a restore in trouble.
 //
 // The two pool counts are shown apart because they say which end is the bottleneck:
 // idle writers mean the export is not being read fast enough, idle readers mean the
@@ -609,8 +642,10 @@ func (s progressSnapshot) String() string {
 		pace = fmt.Sprintf("%.0f WCU/s", s.Pace)
 	}
 	return fmt.Sprintf(
-		"Progress: %.1f%% (%.0f/s, %.1f MB/s) | %d batches | %d readers | %d writers | pace %s | %d throttles | %d retries | %d lost | %d errors",
-		s.Percent, s.ItemsPerSec, s.MBPerSec, s.TotalBatches, s.ActiveReader, s.ActiveWriter,
+		"Progress: %.1f%% | %d items in %d batches | %d/%d files | %.0f/s, %.1f MB/s | "+
+			"%d readers | %d writers | pace %s | %d throttles | %d retries | %d lost | %d errors",
+		s.Percent, s.ItemsWritten, s.TotalBatches, s.FilesDone, s.FilesTotal,
+		s.ItemsPerSec, s.MBPerSec, s.ActiveReader, s.ActiveWriter,
 		pace, s.Throttles, s.Retries, s.LostItems, s.Errors)
 }
 
@@ -645,7 +680,10 @@ func (c *Coordinator) snapshot(now time.Time) progressSnapshot {
 	pace, paced := c.metrics.Pace()
 
 	snap := progressSnapshot{
+		ItemsWritten: totalItems,
 		TotalBatches: totalBatches,
+		FilesDone:    c.progress.completedCount(),
+		FilesTotal:   c.totalFiles,
 		Throttles:    c.metrics.Throttles(),
 		Retries:      c.metrics.Retries(),
 		LostItems:    c.metrics.LostItems(),
@@ -679,23 +717,19 @@ func (c *Coordinator) snapshot(now time.Time) progressSnapshot {
 	return snap
 }
 
-// reportProgress prints the progress line once a second, overwriting the previous
-// one. A line shorter than its predecessor is padded so nothing of the old line shows.
+// reportProgress prints the progress line once a second, overwriting the previous one.
 func (c *Coordinator) reportProgress(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	width := 0
 	for {
 		select {
 		case <-ticker.C:
-			line := c.snapshot(time.Now()).String()
-			fmt.Printf("\r%-*s", width, line)
-			width = len(line)
+			c.console.update(c.snapshot(time.Now()).String())
 
 		case <-ctx.Done():
-			// Print newline before exit so final output appears on new line
-			fmt.Println()
+			// Finish the line so the report that follows starts on its own.
+			c.console.done()
 			return
 		}
 	}
@@ -1095,9 +1129,19 @@ func resetTimer(t *time.Timer, d time.Duration) {
 	t.Reset(d)
 }
 
-// recordError records a failure against the pool member that hit it.
+// recordError counts a failure, records it against the pool member that hit it, and
+// prints it. A counter on the progress line says a restore is in trouble but never what
+// the trouble is, and a restore that survives its failures would otherwise finish
+// without ever having said what it survived.
+//
+// A context ending is left unprinted. That is the restore being stopped, which the
+// caller asked for and every member of both pools reports at once, so printing it would
+// bury whatever actually caused the stop under a line from each of them.
 func (c *Coordinator) recordError(key statusKey, err error) {
 	c.metrics.RecordError()
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		c.console.notice("%s %d: %v", key.role(), key.id, err)
+	}
 	c.updateWorkerStatus(key, func(s *WorkerStatus) {
 		s.LastError = err
 		s.LastErrorTime = time.Now()

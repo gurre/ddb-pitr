@@ -14,6 +14,7 @@ AWS DynamoDB Point-in-Time Recovery can export table data to S3, but provides no
 - Resumable by default: an interrupted restore picks up where it stopped, at any worker count, without having been asked to
 - Every data file checked against the manifest before the first write, including exports that were copied to another bucket
 - Automatic throttling handling
+- Live progress reporting what has been restored, with failures printed as they happen
 - Dry-run mode that reads and measures the whole export without writing
 
 ## Supported Operations
@@ -208,6 +209,31 @@ depends on order. And a restore now holds decoded items in memory between readin
 writing, bounded by `--workers` and `--batch`; an interruption abandons them and a
 resume rewrites them, which is safe for the reasons in
 [What a resume guarantees](#what-a-resume-guarantees).
+
+## What a restore reports
+
+While it runs, a restore rewrites one line in place:
+
+```
+Progress: 12.5% | 1234 items in 81 batches | 5/12 files | 345/s, 6.8 MB/s | 9 readers | 7 writers | pace 55 WCU/s | 11 throttles | 22 retries | 33 lost | 44 errors
+```
+
+What has gone right comes first. Items written and files finished are what say the
+restore is working, and both are absolute rather than a share of an estimate, so they
+can be checked against the table and against the export. The file count covers the whole
+restore, so a resumed run reports the files an earlier run finished as done.
+
+The two pool counts say which end is the limit. Idle writers mean the export is not
+being read fast enough; raise `--readers`. Idle readers mean the table is not accepting
+writes fast enough; raise the table's capacity.
+
+Anything that goes wrong is printed as it happens, above the progress line, naming the
+reader or writer that hit it. A restore that retries past a failure therefore still says
+what it survived, rather than finishing with a count and nothing to explain it. Lines
+that could not be decoded are named the same way, with the file and offset needed to go
+and look at them; the first twenty are named and the rest are counted. An interruption
+is not printed as a failure, since every reader and writer reports it at once and the
+reason for the stop is reported on its own.
 
 ## Keeping pace with the table
 

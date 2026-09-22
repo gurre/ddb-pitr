@@ -1,6 +1,7 @@
 package coordinator
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -1277,7 +1278,10 @@ func TestProgressLineLabelsEveryCount(t *testing.T) {
 		Percent:      12.5,
 		ItemsPerSec:  345,
 		MBPerSec:     6.75,
+		ItemsWritten: 1234,
 		TotalBatches: 81,
+		FilesDone:    5,
+		FilesTotal:   12,
 		ActiveReader: 9,
 		ActiveWriter: 7,
 		Pace:         55,
@@ -1288,8 +1292,8 @@ func TestProgressLineLabelsEveryCount(t *testing.T) {
 		Errors:       44,
 	}
 
-	const want = "Progress: 12.5% (345/s, 6.8 MB/s) | 81 batches | 9 readers | 7 writers | " +
-		"pace 55 WCU/s | 11 throttles | 22 retries | 33 lost | 44 errors"
+	const want = "Progress: 12.5% | 1234 items in 81 batches | 5/12 files | 345/s, 6.8 MB/s | " +
+		"9 readers | 7 writers | pace 55 WCU/s | 11 throttles | 22 retries | 33 lost | 44 errors"
 	if got := snap.String(); got != want {
 		t.Errorf("progress line = %q, want %q", got, want)
 	}
@@ -1598,6 +1602,7 @@ type testDeps struct {
 	store     *mockStore
 	uploader  *mockUploader
 	backoff   Backoffer
+	console   *testConsole
 	configure func(*config.Config)
 	files     []manifest.FileMeta
 	lines     [][]byte
@@ -1691,10 +1696,30 @@ func newTestCoordinator(t *testing.T, deps testDeps) (*Coordinator, *metrics.Met
 	if backoff == nil {
 		backoff = &instantBackoff{}
 	}
+	// Output is captured rather than printed, so a test can assert on what a restore
+	// reported and a passing run says nothing.
+	out := deps.console
+	if out == nil {
+		out = &testConsole{}
+	}
 
 	return NewCoordinator(cfg, loader, streamer, decoder, w, store, uploader, m,
-		WithStreamBackoff(backoff)), m
+		WithStreamBackoff(backoff), withConsole(&out.line, &out.notices)), m
 }
+
+// testConsole captures what a restore printed: the progress line and the permanent
+// output beside it, and the messages it sent to the writer errors go to. Every write
+// the console makes is serialised, so reading these once a run has ended is safe.
+type testConsole struct {
+	line    bytes.Buffer
+	notices bytes.Buffer
+}
+
+// printed reports everything the restore sent to the writer errors go to.
+func (c *testConsole) printed() string { return c.notices.String() }
+
+// shown reports the progress line and whatever was printed beside it.
+func (c *testConsole) shown() string { return c.line.String() }
 
 // runCoordinator runs the coordinator under a deadline so a stuck run fails the test
 // instead of hanging the package. The context carries a marker every dependency checks
@@ -2385,5 +2410,191 @@ func TestCoordinatorFailsWhenAFinishedFileCannotBeCheckpointed(t *testing.T) {
 
 	if err := runCoordinator(t, coord); err == nil {
 		t.Fatal("expected the failed completion checkpoint to end the run")
+	}
+}
+
+// TestCoordinatorPrintsEveryFailureAsItHappens verifies a failure reaches the console
+// when it happens rather than only as a number on the progress line.
+//
+// A restore that retries past a failure used to finish without ever saying what it
+// survived, and one that failed reported only the last error. Either way the operator
+// had a count and no way to find out what it counted.
+func TestCoordinatorPrintsEveryFailureAsItHappens(t *testing.T) {
+	out := &testConsole{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		lines: [][]byte{[]byte(`{"id":"1"}`)},
+		// The first attempt at the file fails, the second succeeds, so the restore
+		// finishes and the failure would otherwise leave no trace.
+		streamer: &mockStreamer{
+			lines: [][]byte{[]byte(`{"id":"1"}`)},
+			errs:  []error{errors.New("connection reset by peer"), nil},
+		},
+		console: out,
+	})
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+
+	printed := out.printed()
+	if !strings.Contains(printed, "connection reset by peer") {
+		t.Errorf("expected the failure printed, got %q", printed)
+	}
+	if !strings.Contains(printed, "reader 0") {
+		t.Errorf("expected the failure to name the reader that hit it, got %q", printed)
+	}
+}
+
+// TestCoordinatorDoesNotPrintTheRunBeingStopped verifies an interruption is not
+// reported as a failure from every member of both pools. They all report it at once, so
+// printing it would bury whatever actually caused the stop under a line each.
+func TestCoordinatorDoesNotPrintTheRunBeingStopped(t *testing.T) {
+	out := &testConsole{}
+	w := &mockWriter{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:   []manifest.FileMeta{{Key: testFileKey, ItemCount: 2}},
+		lines:   [][]byte{[]byte(`{"id":"1"}`), []byte(`{"id":"2"}`)},
+		writer:  w,
+		console: out,
+		configure: func(cfg *config.Config) {
+			cfg.BatchSize = 1
+			cfg.MaxWorkers = 2
+			cfg.Readers = 2
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(callerContext(), 30*time.Second)
+	defer cancel()
+	w.afterWrite = cancel
+	if err := coord.Run(ctx); err == nil {
+		t.Fatal("expected the interrupted run to report an error")
+	}
+
+	if printed := out.printed(); strings.Contains(printed, "context canceled") {
+		t.Errorf("expected the interruption not to be printed as a failure, got %q", printed)
+	}
+}
+
+// TestCoordinatorNamesSkippedLinesOnTheConsole verifies a line that could not be
+// decoded is named where the operator can see it, with the file and offset needed to go
+// and look at it in the export.
+func TestCoordinatorNamesSkippedLinesOnTheConsole(t *testing.T) {
+	lines := [][]byte{[]byte(`{"id":"1"}`), []byte(`bad`)}
+	out := &testConsole{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:   []manifest.FileMeta{{Key: testFileKey, ItemCount: 2}},
+		lines:   lines,
+		decoder: &mockDecoder{corruptLines: map[string]bool{"bad": true}},
+		console: out,
+	})
+
+	if err := runCoordinator(t, coord); !errors.Is(err, ErrRecordsSkipped) {
+		t.Fatalf("expected the run to report skipped records, got %v", err)
+	}
+
+	if printed := out.printed(); !strings.Contains(printed, "skipping "+testFileKey) {
+		t.Errorf("expected the skipped line named on the console, got %q", printed)
+	}
+}
+
+// TestProgressLineReportsWhatHasBeenRestored verifies the progress line carries the
+// items written and the files finished, taken from a real run.
+//
+// A percentage and a rate say how fast a restore is going but not how much of it is
+// done in terms anyone can check against the table or the export, and a line that
+// showed only throttles, retries, losses and errors read as a restore in trouble even
+// when everything was working.
+func TestProgressLineReportsWhatHasBeenRestored(t *testing.T) {
+	lines := [][]byte{[]byte(`{"id":"1"}`), []byte(`{"id":"2"}`), []byte(`{"id":"3"}`)}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{
+			{Key: testFileKey, ItemCount: 3},
+			{Key: testFileKey2, ItemCount: 3},
+		},
+		lines: lines,
+	})
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+
+	snap := coord.snapshot(time.Now())
+	if snap.ItemsWritten != 6 {
+		t.Errorf("expected 6 items reported written, got %d", snap.ItemsWritten)
+	}
+	if snap.FilesDone != 2 || snap.FilesTotal != 2 {
+		t.Errorf("expected 2 of 2 files reported done, got %d of %d", snap.FilesDone, snap.FilesTotal)
+	}
+}
+
+// TestProgressLineCountsFilesAnEarlierRunFinished verifies a resumed restore reports
+// the files already done, not only the ones this process got through. What is left to
+// do is what an operator is watching; a resumed run that started from zero would look
+// like it had lost the work it is deliberately skipping.
+func TestProgressLineCountsFilesAnEarlierRunFinished(t *testing.T) {
+	coord, _ := newTestCoordinator(t, testDeps{
+		files: []manifest.FileMeta{
+			{Key: testFileKey, ItemCount: 1},
+			{Key: testFileKey2, ItemCount: 1},
+		},
+		lines: [][]byte{[]byte(`{"id":"1"}`)},
+		store: &mockStore{state: checkpoint.State{
+			ExportID:  testExportARN,
+			Completed: []string{testFileKey},
+		}},
+	})
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+
+	if got := coord.snapshot(time.Now()).FilesDone; got != 2 {
+		t.Errorf("expected both files counted as done, got %d", got)
+	}
+}
+
+// TestConsoleClearsTheProgressLineBeforeAMessage verifies a message is not printed
+// through the middle of the line the restore rewrites in place. Both pools report
+// failures while the reporter is redrawing, so without clearing first the tail of the
+// old line is left hanging off the end of the message.
+func TestConsoleClearsTheProgressLineBeforeAMessage(t *testing.T) {
+	var line, notices bytes.Buffer
+	c := newConsole(&line, &notices)
+
+	c.update("a long progress line")
+	c.notice("something failed")
+	c.update("short")
+
+	// The blanking run is as wide as the line it replaced, so nothing of it shows.
+	if !strings.Contains(line.String(), "\r"+strings.Repeat(" ", len("a long progress line"))+"\r") {
+		t.Errorf("expected the progress line blanked before the message, got %q", line.String())
+	}
+	if got := notices.String(); got != "something failed\n" {
+		t.Errorf("expected the message printed on its own, got %q", got)
+	}
+}
+
+// TestCoordinatorPrintsTheOutcomeWhereTheProgressWent verifies what a restore did is
+// printed on the same stream as the progress line, not the one failures go to. An
+// operator who separates the two should get the record of what happened on one of them
+// and only the things that went wrong on the other.
+func TestCoordinatorPrintsTheOutcomeWhereTheProgressWent(t *testing.T) {
+	out := &testConsole{}
+	coord, _ := newTestCoordinator(t, testDeps{
+		files:   []manifest.FileMeta{{Key: testFileKey, ItemCount: 1}},
+		lines:   [][]byte{[]byte(`{"id":"1"}`)},
+		console: out,
+	})
+
+	if err := runCoordinator(t, coord); err != nil {
+		t.Fatalf("coordinator failed: %v", err)
+	}
+
+	if shown := out.shown(); !strings.Contains(shown, "Restore completed in") {
+		t.Errorf("expected the outcome printed alongside the progress, got %q", shown)
+	}
+	if printed := out.printed(); printed != "" {
+		t.Errorf("expected nothing reported as a failure, got %q", printed)
 	}
 }

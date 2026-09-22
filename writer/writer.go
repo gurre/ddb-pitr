@@ -293,6 +293,14 @@ func (w *DynamoDBWriter) writeRequests(ctx context.Context, requests []types.Wri
 	// them came back, and the capacity the table reports corrects the estimate anyway.
 	unitCost := units / float64(items)
 
+	// One input carries every round. A table under pressure sends a batch round again
+	// many times, and building the request afresh each time would allocate a map per
+	// refusal for no gain: the only thing that differs between rounds is which items go.
+	input := &dynamodb.BatchWriteItemInput{
+		RequestItems:           map[string][]types.WriteRequest{w.tableName: requests},
+		ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
+	}
+
 	pending := requests
 	throttleRounds := 0
 	transientAttempts := 0
@@ -301,10 +309,7 @@ func (w *DynamoDBWriter) writeRequests(ctx context.Context, requests []types.Wri
 		if !ok {
 			return stopRetrying(ctx)
 		}
-		input := &dynamodb.BatchWriteItemInput{
-			RequestItems:           map[string][]types.WriteRequest{w.tableName: pending[:n]},
-			ReturnConsumedCapacity: types.ReturnConsumedCapacityTotal,
-		}
+		input.RequestItems[w.tableName] = pending[:n]
 
 		output, err := w.client.BatchWriteItem(ctx, input)
 		if err != nil {
