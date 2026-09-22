@@ -11,7 +11,7 @@ AWS DynamoDB Point-in-Time Recovery can export table data to S3, but provides no
   in flight happen to belong to
 - Write rate that follows the table's capacity, so a small table restores at its
   capacity and a large one is not held back
-- Resumable by default: an interrupted restore picks up where it stopped, at any worker count, without having been asked to
+- Resumable by default: an interrupted restore picks up where it stopped, however the second run is shaped, without having been asked to
 - Every data file checked against the manifest before the first write, including exports that were copied to another bucket
 - Automatic throttling handling
 - Live progress reporting what has been restored, with failures printed as they happen
@@ -59,7 +59,8 @@ ddb-pitr --table my-table --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef
 # Record progress somewhere other than the export's bucket, for an export you may only read
 ddb-pitr --table my-table --export s3://source-bucket/AWSDynamoDB/01234567890-abcdef/ --resume s3://my-bucket/checkpoints/restore-001.json
 
-# High-throughput restore for a large export
+# High-throughput restore for a large export. 200 files open at once is around 1.4 GB;
+# see "Using the whole table" for what reading widely costs.
 ddb-pitr --table my-table --export s3://my-bucket/AWSDynamoDB/01234567890-abcdef/ --readers 200 --workers 50
 
 # Cross-region restore, keeping the report
@@ -215,8 +216,8 @@ rather than by the table. Around 7 MB per file is a safe estimate.
 Two consequences worth knowing. Items are written in no particular order, which is
 already true of any export: an export holds one record per key, so nothing within it
 depends on order. And a restore now holds decoded items in memory between reading and
-writing, bounded by `--workers` and `--batch`; an interruption abandons them and a
-resume rewrites them, which is safe for the reasons in
+writing, around twice `--workers` times `--batch` of them; an interruption abandons them
+and a resume rewrites them, which is safe for the reasons in
 [What a resume guarantees](#what-a-resume-guarantees).
 
 ## What a restore reports
@@ -233,11 +234,17 @@ can be checked against the table and against the export. The file count covers t
 restore, so a resumed run reports the files an earlier run finished as done.
 
 The two pool counts are the readers holding a data file and the writers holding a batch,
-which is what says which end is the limit. Writers idle means the export is not being
-read fast enough; raise `--readers`. Readers idle means the table is not accepting writes
-fast enough; raise the table's capacity. The reader count cannot exceed the number of
-data files the export holds, so a small export reads narrowly however many readers it
-was given.
+which is what says which end is the limit.
+
+Fewer writers than `--workers` means they are waiting for items, so reading is the limit.
+Raising `--readers` helps only while the export still has files nobody has started: the
+count can never exceed the number of data files the export holds, so a small export reads
+narrowly however many readers it was given.
+
+Fewer readers than the export has files left to read means they are blocked handing items
+over, so the table is the limit; raise its capacity. A reader blocked that way is counted
+as working for ten seconds before it drops out of the count, so a brief stall does not
+show here at all.
 
 Anything that goes wrong is printed as it happens, above the progress line, naming the
 reader or writer that hit it. A restore that retries past a failure therefore still says
@@ -291,7 +298,8 @@ first. Applying one to a live table, or out of order, can replace newer data wit
 
 The tool is organized into several packages:
 
-- `cmd`: Command-line interface
+- `cmd/ddb-pitr`: Command-line interface. `cmd/ddb-datagen` is not released; it fills
+  tables for the end-to-end check
 - `config`: Configuration parsing and validation
 - `manifest`: Loading and verifying manifest files
 - `itemimage`: Decoding JSON into DynamoDB operations
@@ -354,9 +362,10 @@ request. That is stricter than `run` alone, which quietly ignores configuration 
 does not know.
 
 `gocyclo` is set to its default threshold of 30. The stricter 15 the config used to name
-was never in effect, and six functions sit above it: `Coordinator.Run`,
+was never in effect, and seven functions sit above it: `Coordinator.Run`,
 `Coordinator.readFiles`, `Coordinator.writeItems`, `Config.Validate`,
-`JSONDecoder.Decode` and `generateRandomItem`. Tightening it means splitting those first.
+`JSONDecoder.Decode`, the command's own `run` and `generateRandomItem`. Tightening it
+means splitting those first.
 
 ## Licence
 
