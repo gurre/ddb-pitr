@@ -6,40 +6,26 @@ import (
 	"github.com/gurre/ddb-pitr/itemimage"
 )
 
-// Discard implements Writer by accounting for operations without sending them anywhere.
-// It backs a dry run: the export is read, decoded and measured end to end, and the final
-// report says what a real restore would have written, while the target table is untouched.
-type Discard struct {
-	callbacks Callbacks
-}
+// Discard takes batches the way DynamoDBWriter does and sends them nowhere. It backs a
+// dry run: the export is read, decoded and measured end to end, and the final report
+// says what a real restore would have written, while the target table is untouched.
+type Discard struct{}
 
-// NewDiscard creates a Writer that measures operations instead of writing them.
+// NewDiscard creates a writer that accepts every batch without sending it.
 // Example:
 //
-//	w := writer.NewDiscard(writer.Callbacks{OnWrite: func(items, bytes int) {
-//	    m.RecordBytes(int64(bytes))
-//	}})
-func NewDiscard(callbacks Callbacks) *Discard {
-	return &Discard{callbacks: callbacks}
+//	w := writer.NewDiscard()
+//	err := w.Submit(ctx, ops, done) // done reports every operation written
+func NewDiscard() *Discard {
+	return &Discard{}
 }
 
-// WriteBatch reports the batch to the OnWrite callback and discards it. Cancellation is
-// honoured so a dry run stops as promptly as a real restore does.
-func (d *Discard) WriteBatch(ctx context.Context, ops []itemimage.Operation) error {
+// Submit reports the whole batch written, before returning. Cancellation is honoured
+// so a dry run stops as promptly as a real restore does.
+func (d *Discard) Submit(ctx context.Context, ops []itemimage.Operation, done func(Rejection, error)) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if len(ops) == 0 || d.callbacks.OnWrite == nil {
-		return nil
-	}
-
-	// Measured the same way the real writer measures them, so the reported throughput
-	// of a dry run is the throughput of the restore it is standing in for.
-	bytes := 0
-	for _, op := range ops {
-		bytes += int(op.Bytes)
-	}
-
-	d.callbacks.OnWrite(len(ops), bytes)
+	done(Rejection{}, nil)
 	return nil
 }

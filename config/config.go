@@ -13,6 +13,11 @@ import (
 // manifestSummaryName is the file every export writes its summary to.
 const manifestSummaryName = "manifest-summary.json"
 
+// highestMaxInFlight is the most writes in flight a restore may be allowed. It is the
+// writer's own bound, restated so the flag is refused with a readable error rather than
+// the writer's refusal at startup.
+const highestMaxInFlight = 4096
+
 // checkpointPrefix is where a restore records its progress when it was not told where.
 // It sits outside the export's own directory, so a restore leaves the export exactly as
 // DynamoDB wrote it.
@@ -27,11 +32,10 @@ type Config struct {
 	ResumeKey       string        // S3 URI of the checkpoint; empty means the one CheckpointURI derives
 	ReportS3URI     string        // S3 URI for the final report
 	ShutdownTimeout time.Duration // How long an interrupted restore has to record where it stopped
-	MaxWorkers      int           // Concurrent writes to the target table
 	Readers         int           // Data files read at once, which is how widely writes are spread over the table's partitions
-	BatchSize       int           // Largest batch the restore will send to DynamoDB (≤25)
+	MaxInFlight     int           // Most writes to the table in flight at once
 	DryRun          bool          // If true, don't actually write to DynamoDB
-	NoResume        bool          // If true, record no progress; an interrupted restore starts over
+	NoResume        bool          // If true, record no progress; an interrupted restore starts over. The table is still claimed
 }
 
 // GetExportBucketName returns the bucket the export URI names, or the empty string
@@ -108,6 +112,36 @@ func (c *Config) CheckpointURI() string {
 	return fmt.Sprintf("s3://%s/%s/%s.json", bucket, checkpointPrefix, c.TableName)
 }
 
+// leasePrefix is where the claim on a target table is kept, beside the checkpoints.
+const leasePrefix = "ddb-pitr/leases"
+
+// LeaseURI returns where the restore claims the target table, so no two restores write
+// it at once. The claim sits in the bucket the checkpoint goes to, the --resume bucket
+// or else the export's own, and is taken under --no-resume too: not recording progress
+// does not make two restores writing one table any safer. The key names the table and
+// its region, since table names are unique within a region only; restores into one
+// table from different exports find the same claim. The empty string means no claim is
+// needed, which is only a dry run, since it cannot write the table.
+// Example:
+//
+//	cfg := &config.Config{TableName: "orders", ExportS3URI: "s3://backups/AWSDynamoDB/01234567890-abcdef"}
+//	cfg.LeaseURI("eu-west-1") // "s3://backups/ddb-pitr/leases/eu-west-1.orders.json"
+func (c *Config) LeaseURI(region string) string {
+	if c.DryRun {
+		return ""
+	}
+	bucket := c.GetExportBucketName()
+	if c.ResumeKey != "" {
+		if u, err := url.Parse(c.ResumeKey); err == nil {
+			bucket = u.Host
+		}
+	}
+	if bucket == "" {
+		return ""
+	}
+	return fmt.Sprintf("s3://%s/%s/%s.%s.json", bucket, leasePrefix, region, c.TableName)
+}
+
 // validateObjectURI checks a URI that names one S3 object, the way the checkpoint and
 // the report do. An empty URI is the flag being left out, which is allowed for both.
 func validateObjectURI(flag, uri string) error {
@@ -154,18 +188,17 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("export S3 URI must name a bucket")
 	}
 
-	if c.MaxWorkers < 1 {
-		return fmt.Errorf("max workers must be at least 1")
-	}
-
 	// One file open is the narrowest a restore can be: every batch then carries items
 	// from one exported partition, which is the shape this setting exists to widen.
 	if c.Readers < 1 {
 		return fmt.Errorf("readers must be at least 1")
 	}
 
-	if c.BatchSize < 1 || c.BatchSize > 25 {
-		return fmt.Errorf("batch size must be between 1 and 25")
+	// A ceiling of no writes in flight is a restore that reads the export and never
+	// writes it, which is never what was meant; one above highestMaxInFlight is a restore
+	// allowed to flood the table and the network it shares with everything else.
+	if c.MaxInFlight < 1 || c.MaxInFlight > highestMaxInFlight {
+		return fmt.Errorf("max in flight must be between 1 and %d", highestMaxInFlight)
 	}
 
 	// The checkpoint and the report are single objects, so each URI has to name a key as

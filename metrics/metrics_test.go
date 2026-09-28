@@ -1,11 +1,13 @@
 package metrics
 
 import (
-	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	json "github.com/goccy/go-json"
+	"github.com/gurre/ddb-pitr/itemimage"
 )
 
 // TestNewMetricsCounters verifies all new counters (throttles, retries, lost, bytes)
@@ -29,15 +31,15 @@ func TestNewMetricsCounters(t *testing.T) {
 	}
 
 	// Record lost items
-	m.RecordLost(5)
-	m.RecordLost(10)
+	m.RecordLost(itemimage.OpPut, 5)
+	m.RecordLost(itemimage.OpPut, 10)
 	if got := m.LostItems(); got != 15 {
 		t.Errorf("LostItems() = %d, want 15", got)
 	}
 
 	// Record bytes written
-	m.RecordBytes(1024)
-	m.RecordBytes(2048)
+	m.RecordApplied(itemimage.OpPut, 0, 1024)
+	m.RecordApplied(itemimage.OpPut, 0, 2048)
 	if got := m.BytesRead(); got != 3072 {
 		t.Errorf("BytesRead() = %d, want 3072", got)
 	}
@@ -80,9 +82,9 @@ func TestMetricsCountersConcurrency(t *testing.T) {
 			for j := 0; j < iterations; j++ {
 				m.RecordThrottle()
 				m.RecordRetry()
-				m.RecordLost(1)
-				m.RecordBytes(100)
-				m.RecordProcessed(1)
+				m.RecordLost(itemimage.OpPut, 1)
+				m.RecordApplied(itemimage.OpPut, 0, 100)
+				m.RecordApplied(itemimage.OpPut, 1, 0)
 			}
 		}()
 	}
@@ -107,11 +109,11 @@ func TestMetricsCountersConcurrency(t *testing.T) {
 // with correctly formatted duration field.
 func TestReportMarshalJSON(t *testing.T) {
 	m := NewMetrics()
-	m.RecordProcessed(1)
+	m.RecordApplied(itemimage.OpPut, 1, 0)
 	m.RecordThrottle()
 	m.RecordRetry()
-	m.RecordLost(5)
-	m.RecordBytes(1024)
+	m.RecordLost(itemimage.OpPut, 5)
+	m.RecordApplied(itemimage.OpPut, 0, 1024)
 
 	report := m.GenerateReport(0)
 	data, err := json.Marshal(report)
@@ -193,7 +195,7 @@ func TestReportCarriesTheWholeRun(t *testing.T) {
 	m := NewMetrics()
 	// Every value is distinct so a field taking another's value cannot look correct.
 	for i := 0; i < 7; i++ {
-		m.RecordProcessed(1)
+		m.RecordApplied(itemimage.OpPut, 1, 0)
 	}
 	for i := 0; i < 3; i++ {
 		m.RecordBatchWritten()
@@ -204,8 +206,8 @@ func TestReportCarriesTheWholeRun(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		m.RecordRetry()
 	}
-	m.RecordLost(6)
-	m.RecordBytes(8)
+	m.RecordLost(itemimage.OpPut, 6)
+	m.RecordApplied(itemimage.OpPut, 0, 8)
 	m.RecordProcessingTime(9 * time.Millisecond)
 
 	report := m.GenerateReport(5)
@@ -305,9 +307,9 @@ func TestReportDividesWorkByElapsedTime(t *testing.T) {
 	m.startTime = time.Now().Add(-2 * time.Second)
 
 	for i := 0; i < 100; i++ {
-		m.RecordProcessed(1)
+		m.RecordApplied(itemimage.OpPut, 1, 0)
 	}
-	m.RecordBytes(2048)
+	m.RecordApplied(itemimage.OpPut, 0, 2048)
 
 	report := m.GenerateReport(0)
 
@@ -345,8 +347,8 @@ func TestMetricsHappyPath(t *testing.T) {
 	m := NewMetrics()
 
 	// Record some metrics
-	m.RecordProcessed(1)
-	m.RecordProcessed(1)
+	m.RecordApplied(itemimage.OpPut, 1, 0)
+	m.RecordApplied(itemimage.OpPut, 1, 0)
 	m.RecordBatchWritten()
 	m.RecordError()
 
@@ -400,5 +402,73 @@ func TestPaceIsReportedOnlyOnceSomethingLimitsTheRestore(t *testing.T) {
 	m.RecordPace(7.5)
 	if rate, _ := m.Pace(); rate != 7.5 {
 		t.Errorf("expected the latest rate reported, got %v", rate)
+	}
+}
+
+// TestReportBreaksTheRestoreDownByKind verifies the report says, per kind of change,
+// what the table took, what it pushed back and what was given up, and that the total it
+// leads with is the sum of what was taken. An incremental restore is checked against its
+// export kind by kind; a total alone cannot tell a restore that applied every delete
+// from one that applied none.
+func TestReportBreaksTheRestoreDownByKind(t *testing.T) {
+	m := NewMetrics()
+	m.RecordApplied(itemimage.OpPut, 5, 500)
+	m.RecordApplied(itemimage.OpUpdate, 2, 200)
+	m.RecordApplied(itemimage.OpDelete, 1, 50)
+	m.RecordRejected(itemimage.OpDelete, 3)
+	m.RecordLost(itemimage.OpUpdate, 4)
+
+	report := m.GenerateReport(0)
+	want := Operations{
+		itemimage.OpPut:    {Applied: 5},
+		itemimage.OpUpdate: {Applied: 2, Lost: 4},
+		itemimage.OpDelete: {Applied: 1, Rejected: 3},
+	}
+	if report.Operations != want {
+		t.Errorf("operations = %+v, want %+v", report.Operations, want)
+	}
+	if report.TotalItems != 8 || report.LostItems != 4 {
+		t.Errorf("totals = %d applied and %d lost, want 8 and 4", report.TotalItems, report.LostItems)
+	}
+}
+
+// TestReportNamesEveryKindInJSON verifies the uploaded report names the kinds rather than
+// numbering them, and names all of them even when the export held none of one. A reader
+// comparing a report with its export should not need this build's numbering, nor take a
+// missing kind for a kind this build did not count.
+func TestReportNamesEveryKindInJSON(t *testing.T) {
+	m := NewMetrics()
+	m.RecordApplied(itemimage.OpPut, 1, 10)
+
+	data, err := json.Marshal(m.GenerateReport(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed struct {
+		Operations map[string]KindCount `json:"operations"`
+	}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"put", "update", "delete"} {
+		if _, ok := parsed.Operations[name]; !ok {
+			t.Errorf("report JSON lacks %q: %s", name, data)
+		}
+	}
+	if parsed.Operations["put"].Applied != 1 {
+		t.Errorf("put applied = %d, want 1", parsed.Operations["put"].Applied)
+	}
+}
+
+// TestOperationsReadAsTheKindsThatOccurred verifies the console rendering names only
+// the kinds a restore applied, so a full export's line reads "put N" rather than
+// carrying two zeros an operator has to read past.
+func TestOperationsReadAsTheKindsThatOccurred(t *testing.T) {
+	ops := Operations{itemimage.OpPut: {Applied: 12}, itemimage.OpUpdate: {Applied: 3}, itemimage.OpDelete: {Applied: 1}}
+	if got := ops.String(); got != "put 12 update 3 delete 1" {
+		t.Errorf("String() = %q, want %q", got, "put 12 update 3 delete 1")
+	}
+	if got := (Operations{}).String(); got != "none" {
+		t.Errorf("String() of nothing = %q, want none", got)
 	}
 }

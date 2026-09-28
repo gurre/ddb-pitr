@@ -4,15 +4,17 @@ package metrics
 import (
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	json "github.com/goccy/go-json"
+	"github.com/gurre/ddb-pitr/itemimage"
 )
 
-// Metrics is the set of counters every worker reports into; each is updated
-// atomically so workers never wait on one another.
+// Metrics is the set of counters every reader and batch reports into; each is updated
+// atomically so none waits on another.
 // Fields ordered largest to smallest for memory alignment.
 type Metrics struct {
 	mu sync.RWMutex
@@ -21,18 +23,24 @@ type Metrics struct {
 	processingTime time.Duration // Total time spent processing records
 	startTime      time.Time     // When the restore operation started
 
+	// Per kind of operation: how many the table took, how many it refused or handed
+	// back to be sent again, and how many were given up. Indexed by OperationType.
+	applied  [itemimage.OperationKinds]int64
+	rejected [itemimage.OperationKinds]int64
+	lost     [itemimage.OperationKinds]int64
+
 	// Counters (all use atomic operations)
-	recordsProcessed int64 // Items written to the table
-	batchesWritten   int64 // Number of batches written to DynamoDB
-	errors           int64 // Number of errors encountered
-	throttles        int64 // Number of throttle events (ProvisionedThroughputExceeded)
-	retries          int64 // Number of successful retries after transient failures
-	lostItems        int64 // Number of items that failed permanently
-	bytesRead        int64 // Export bytes read behind the items written
+	batchesWritten int64 // Number of batches written to DynamoDB
+	errors         int64 // Number of errors encountered
+	throttles      int64 // Number of throttle events (ProvisionedThroughputExceeded)
+	retries        int64 // Number of successful retries after transient failures
+	bytesRead      int64 // Export bytes read behind the items written
 	// pace is the write rate the table is currently allowing, in write capacity units
 	// per second, held as the bits of a float64. Zero means nothing is pacing the
 	// writes yet, which is where every restore starts.
 	pace uint64
+	// concurrency is how many writes may be in flight at once, as the writer last set it.
+	concurrency int64
 }
 
 // NewMetrics creates a new Metrics instance with initialized counters
@@ -42,9 +50,17 @@ func NewMetrics() *Metrics {
 	}
 }
 
-// RecordProcessed adds n to the count of items written to the table
-func (m *Metrics) RecordProcessed(n int64) {
-	atomic.AddInt64(&m.recordsProcessed, n)
+// RecordApplied adds items of one kind the table took, and the export bytes behind them.
+func (m *Metrics) RecordApplied(kind itemimage.OperationType, items, bytes int64) {
+	atomic.AddInt64(&m.applied[kind], items)
+	atomic.AddInt64(&m.bytesRead, bytes)
+}
+
+// RecordRejected adds items of one kind the table refused or handed back, which the
+// restore sends again. They are not lost; the count says how hard the table is pushing
+// back, and on which kind of change.
+func (m *Metrics) RecordRejected(kind itemimage.OperationType, n int64) {
+	atomic.AddInt64(&m.rejected[kind], n)
 }
 
 // RecordBatchWritten increments the written batches counter
@@ -67,14 +83,53 @@ func (m *Metrics) RecordRetry() {
 	atomic.AddInt64(&m.retries, 1)
 }
 
-// RecordLost adds to the lost items counter
-func (m *Metrics) RecordLost(n int64) {
-	atomic.AddInt64(&m.lostItems, n)
+// RecordLost adds items of one kind given up with a batch that failed.
+func (m *Metrics) RecordLost(kind itemimage.OperationType, n int64) {
+	atomic.AddInt64(&m.lost[kind], n)
 }
 
-// RecordBytes adds to the export bytes read behind items written
-func (m *Metrics) RecordBytes(n int64) {
-	atomic.AddInt64(&m.bytesRead, n)
+// RecordConcurrency records how many writes may be in flight at once. It is a gauge: the
+// last value is the one that describes the restore now.
+func (m *Metrics) RecordConcurrency(limit int) {
+	atomic.StoreInt64(&m.concurrency, int64(limit))
+}
+
+// Concurrency returns how many writes may be in flight at once, or zero before the
+// writer has said.
+func (m *Metrics) Concurrency() int {
+	return int(atomic.LoadInt64(&m.concurrency))
+}
+
+// Processed returns the items of every kind the table has taken.
+func (m *Metrics) Processed() int64 {
+	return sum(&m.applied)
+}
+
+// BatchesWritten returns the batches written so far.
+func (m *Metrics) BatchesWritten() int64 {
+	return atomic.LoadInt64(&m.batchesWritten)
+}
+
+// Operations returns, per kind of operation, what has happened to them so far.
+func (m *Metrics) Operations() Operations {
+	var ops Operations
+	for kind := range ops {
+		ops[kind] = KindCount{
+			Applied:  atomic.LoadInt64(&m.applied[kind]),
+			Rejected: atomic.LoadInt64(&m.rejected[kind]),
+			Lost:     atomic.LoadInt64(&m.lost[kind]),
+		}
+	}
+	return ops
+}
+
+// sum totals a per-kind counter.
+func sum(counts *[itemimage.OperationKinds]int64) int64 {
+	var total int64
+	for kind := range counts {
+		total += atomic.LoadInt64(&counts[kind])
+	}
+	return total
 }
 
 // RecordPace records the write rate the table is currently allowing, in write capacity
@@ -106,9 +161,9 @@ func (m *Metrics) Retries() int64 {
 	return atomic.LoadInt64(&m.retries)
 }
 
-// LostItems returns the current lost items count
+// LostItems returns the items of every kind given up so far.
 func (m *Metrics) LostItems() int64 {
-	return atomic.LoadInt64(&m.lostItems)
+	return sum(&m.lost)
 }
 
 // BytesRead returns the export bytes read behind every item written so far
@@ -128,13 +183,63 @@ func (m *Metrics) RecordProcessingTime(d time.Duration) {
 	m.processingTime += d
 }
 
+// KindCount is what happened to the operations of one kind.
+// Fields are ordered largest-to-smallest for memory alignment.
+type KindCount struct {
+	Applied  int64 `json:"applied"`  // Taken by the table
+	Rejected int64 `json:"rejected"` // Refused or handed back, and sent again
+	Lost     int64 `json:"lost"`     // Given up with a batch that failed
+}
+
+// Operations is what happened to each kind of operation, indexed by OperationType. It
+// is how a restore is checked against its export: an incremental export says how many
+// items it inserted, changed and deleted, and a restore that applied none of its deletes
+// looks, by its total alone, like one that is nearly done.
+type Operations [itemimage.OperationKinds]KindCount
+
+// MarshalJSON renders the kinds by name, every kind present, so a reader need not know
+// the numbering and a kind the export did not hold reads as zero rather than missing.
+func (o Operations) MarshalJSON() ([]byte, error) {
+	byName := make(map[string]KindCount, len(o))
+	for kind, count := range o {
+		byName[itemimage.OperationType(kind).String()] = count
+	}
+	return json.Marshal(byName)
+}
+
+// reportOrder is the order kinds are named in: inserts, then changes, then deletes, the
+// order an operator reads an incremental export in.
+var reportOrder = [itemimage.OperationKinds]itemimage.OperationType{itemimage.OpPut, itemimage.OpUpdate, itemimage.OpDelete}
+
+// String renders the kinds that occurred as "put 12 update 3 delete 1", or "none" when
+// nothing has been applied.
+func (o Operations) String() string {
+	var b strings.Builder
+	for _, kind := range reportOrder {
+		count := o[kind]
+		if count.Applied == 0 {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		fmt.Fprintf(&b, "%s %d", kind, count.Applied)
+	}
+	if b.Len() == 0 {
+		return "none"
+	}
+	return b.String()
+}
+
 // Report is the outcome of a restore, printed at the end and uploaded when asked for.
 type Report struct {
 	StartTime time.Time     `json:"startTime"` // When the restore operation started
 	EndTime   time.Time     `json:"endTime"`   // When the restore operation completed
 	Duration  time.Duration `json:"duration"`  // Wall clock time the operation took
-	// ProcessingTime is the time workers spent writing, summed across the pool. Held
-	// against Duration it separates a restore limited by DynamoDB from one limited by S3.
+	// ProcessingTime is the time batches spent with the writer, from when each was handed
+	// over, a wait for a free slot included, to when it was answered, summed over batches
+	// in flight at the same time. Held against Duration it says how much of the restore
+	// was spent waiting on the table.
 	ProcessingTime time.Duration `json:"processingTime"`
 	TotalItems     int64         `json:"totalItems"`     // Items written to the table; skipped lines are not counted
 	BatchesWritten int64         `json:"batchesWritten"` // Number of batches written to DynamoDB
@@ -148,6 +253,8 @@ type Report struct {
 	BytesRead    int64   `json:"bytesRead"`  // Export bytes read behind the items written
 	Throughput   float64 `json:"throughput"` // Items processed per second
 	ByteRate     float64 `json:"byteRate"`   // Bytes per second
+	// Operations is what happened to each kind of operation: put, update and delete.
+	Operations Operations `json:"operations"`
 }
 
 // GenerateReport renders the counters into a Report as of now. The skipped-line count
@@ -162,7 +269,7 @@ func (m *Metrics) GenerateReport(skipped int64) Report {
 	endTime := time.Now()
 	duration := endTime.Sub(m.startTime)
 
-	totalItems := atomic.LoadInt64(&m.recordsProcessed)
+	totalItems := m.Processed()
 	bytesRead := atomic.LoadInt64(&m.bytesRead)
 
 	m.mu.RLock()
@@ -186,7 +293,8 @@ func (m *Metrics) GenerateReport(skipped int64) Report {
 		CorruptCount:   skipped,
 		Throttles:      atomic.LoadInt64(&m.throttles),
 		Retries:        atomic.LoadInt64(&m.retries),
-		LostItems:      atomic.LoadInt64(&m.lostItems),
+		LostItems:      m.LostItems(),
+		Operations:     m.Operations(),
 		BytesRead:      bytesRead,
 		Throughput:     throughput,
 		ByteRate:       byteRate,
@@ -209,12 +317,17 @@ func (r Report) MarshalJSON() ([]byte, error) {
 
 // String renders the report for the console.
 func (r Report) String() string {
+	// A report with nothing applied has no breakdown worth a pair of brackets.
+	breakdown := ""
+	if kinds := r.Operations.String(); kinds != "none" {
+		breakdown = " (" + kinds + ")"
+	}
 	mbRead := float64(r.BytesRead) / (1024 * 1024)
 	mbPerSec := r.ByteRate / (1024 * 1024)
 
 	return fmt.Sprintf(
 		"Restore completed in %s\n"+
-			"Total items: %d in %d batches\n"+
+			"Total items: %d in %d batches%s\n"+
 			"Corrupt items: %d\n"+
 			"Throughput: %.2f items/sec (%.2f MB/s)\n"+
 			"Data read: %.2f MB\n"+
@@ -222,6 +335,7 @@ func (r Report) String() string {
 		r.Duration,
 		r.TotalItems,
 		r.BatchesWritten,
+		breakdown,
 		r.CorruptCount,
 		r.Throughput,
 		mbPerSec,

@@ -18,6 +18,24 @@ const (
 	OpUpdate                      // Replace an item that existed before the export window
 )
 
+// OperationKinds is how many kinds of operation there are, for a count kept per kind in
+// an array indexed by OperationType.
+const OperationKinds = 3
+
+// String names the kind the way a report does: put, delete or update. A value outside
+// the known kinds reads as its number, so a report never mislabels one.
+func (t OperationType) String() string {
+	switch t {
+	case OpPut:
+		return "put"
+	case OpDelete:
+		return "delete"
+	case OpUpdate:
+		return "update"
+	}
+	return fmt.Sprintf("kind %d", uint8(t))
+}
+
 // Operation is one record of an export, with everything needed to apply it to the
 // target table. An update carries the item's full new state in NewImage, since that is
 // what an incremental export records, so it is applied the same way a put is.

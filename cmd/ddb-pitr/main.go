@@ -23,6 +23,7 @@ import (
 	"github.com/gurre/ddb-pitr/config"
 	"github.com/gurre/ddb-pitr/coordinator"
 	"github.com/gurre/ddb-pitr/itemimage"
+	"github.com/gurre/ddb-pitr/lease"
 	"github.com/gurre/ddb-pitr/manifest"
 	"github.com/gurre/ddb-pitr/metrics"
 	"github.com/gurre/ddb-pitr/writer"
@@ -44,16 +45,30 @@ var (
 const (
 	exitFailed  = 1
 	exitSkipped = 3
+	// exitHeld is the status of a restore that did not start because another restore
+	// holds the table. Nothing was written; the remedy is to wait for the other or stop it.
+	exitHeld = 4
 )
 
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		if errors.Is(err, coordinator.ErrRecordsSkipped) {
-			os.Exit(exitSkipped)
-		}
-		os.Exit(exitFailed)
+		os.Exit(exitStatus(err))
 	}
+}
+
+// exitStatus is the status a failed run exits with, which tells a script what to do
+// next: nothing will change a restore that skipped records, a table another restore
+// holds needs that restore to finish or be stopped, and anything else is worth running
+// again.
+func exitStatus(err error) int {
+	switch {
+	case errors.Is(err, coordinator.ErrRecordsSkipped):
+		return exitSkipped
+	case errors.Is(err, lease.ErrLeaseHeld):
+		return exitHeld
+	}
+	return exitFailed
 }
 
 // errNothingToDo is returned by parseArgs when the command line asked only for the
@@ -80,9 +95,8 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 	region := fs.String("region", "", "AWS region; resolved from your AWS environment when omitted")
 	resumeKey := fs.String("resume", "", "S3 URI to record progress in; defaults to a key in the export's own bucket")
 	noResume := fs.Bool("no-resume", false, "Record no progress, so an interrupted restore starts over")
-	maxWorkers := fs.Int("workers", 10, "Concurrent writes to the target table")
 	readers := fs.Int("readers", 50, "Data files read at once, which is how widely writes are spread over the table's partitions")
-	batchSize := fs.Int("batch", 25, "Largest number of items in one DynamoDB write (max 25)")
+	maxInFlight := fs.Int("max-in-flight", writer.DefaultMaxInFlight, "Most writes to the table in flight at once, 1 to 4096; the restore settles below this unless latency to the table holds it here")
 	reportS3URI := fs.String("report", "", "S3 URI for the final report")
 	dryRun := fs.Bool("dry-run", false, "Read and measure the whole export without writing to the table")
 	shutdownTimeout := fs.Duration("shutdown-timeout", 5*time.Minute, "How long an interrupted restore has to record where it stopped")
@@ -111,9 +125,8 @@ func parseArgs(args []string, out io.Writer) (*config.Config, error) {
 		ExportS3URI:     *exportS3URI,
 		Region:          *region,
 		ResumeKey:       *resumeKey,
-		MaxWorkers:      *maxWorkers,
 		Readers:         *readers,
-		BatchSize:       *batchSize,
+		MaxInFlight:     *maxInFlight,
 		ReportS3URI:     *reportS3URI,
 		DryRun:          *dryRun,
 		NoResume:        *noResume,
@@ -170,13 +183,14 @@ func run() error {
 	if awsCfg.Region == "" {
 		return fmt.Errorf("no AWS region: pass --region or set one in your AWS environment")
 	}
-	// Each pool gets as many pooled connections as it has members. The SDK keeps ten
-	// idle connections per host by default, so beyond that every request would open a
-	// fresh one and pay for a TLS handshake it then throws away, which caps a restore
-	// well below what its worker count asked for.
+	// Each pool keeps as many idle connections as it may have requests in flight. The SDK
+	// keeps ten idle connections per host by default, so beyond that every request would
+	// open a fresh one and pay for a TLS handshake it then throws away, which caps a
+	// restore well below what it could write. The writer settles its own concurrency far
+	// below its ceiling, and idle connections it never opened cost nothing.
 	dynamoHTTP := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
-		t.MaxIdleConnsPerHost = cfg.MaxWorkers
-		t.MaxIdleConns = cfg.MaxWorkers
+		t.MaxIdleConnsPerHost = cfg.MaxInFlight
+		t.MaxIdleConns = cfg.MaxInFlight
 	})
 	s3HTTP := awshttp.NewBuildableClient().WithTransportOptions(func(t *http.Transport) {
 		t.MaxIdleConnsPerHost = cfg.Readers
@@ -213,11 +227,11 @@ func run() error {
 
 	// Create writer callbacks that wire to metrics
 	writerCallbacks := writer.Callbacks{
-		OnThrottle: m.RecordThrottle,
-		OnRetry:    m.RecordRetry,
-		OnLost:     func(count int) { m.RecordLost(int64(count)) },
-		OnWrite:    func(items, bytes int) { m.RecordBytes(int64(bytes)) },
-		OnPace:     m.RecordPace,
+		OnThrottle:    m.RecordThrottle,
+		OnRetry:       m.RecordRetry,
+		OnLost:        func(kind itemimage.OperationType, n int) { m.RecordLost(kind, int64(n)) },
+		OnPace:        m.RecordPace,
+		OnConcurrency: m.RecordConcurrency,
 	}
 
 	// Create and initialize required components for the coordinator
@@ -225,23 +239,69 @@ func run() error {
 	streamer := s3streamer.NewS3Streamer(rawS3Client)
 	jsonDecoder := itemimage.NewJSONDecoder()
 
+	// The table is claimed before anything else reads or writes on its behalf, so a
+	// second restore of it stops here with the table untouched, and the checkpoint the
+	// coordinator loads is the one the previous holder finished saving. From here the
+	// restore runs under the claim's context, which ends the moment the claim can no
+	// longer be shown to be this restore's, and every write to the table or to the
+	// checkpoint checks the claim just before it is sent. A dry run writes neither and
+	// claims nothing; any other restore without somewhere to claim the table is a wiring
+	// mistake, since it would run unguarded.
+	var claim claimChecker = unclaimed{}
+	if !cfg.DryRun {
+		uri := cfg.LeaseURI(awsCfg.Region)
+		if uri == "" {
+			return fmt.Errorf("no bucket to claim table %s in; a restore that writes must claim its table", cfg.TableName)
+		}
+		host, hostErr := os.Hostname()
+		if hostErr != nil {
+			// Only the operator reading a refusal sees the host; the claim does not
+			// depend on it.
+			host = "unknown host"
+		}
+		// The lease bounds and retries its own requests, within how long it may go
+		// unrenewed; SDK retries inside that would spend the margin unseen.
+		leaseClient := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+			o.RetryMaxAttempts = 1
+		})
+		held, acquireErr := lease.Acquire(ctx, leaseClient, uri, lease.Holder{
+			Host:    host,
+			Table:   cfg.TableName,
+			Export:  cfg.ExportS3URI,
+			Version: version,
+			PID:     os.Getpid(),
+		}, lease.WithNotices(os.Stderr))
+		if acquireErr != nil {
+			return acquireErr
+		}
+		defer func() {
+			if releaseErr := held.Release(context.Background()); releaseErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: %v\n", releaseErr)
+			}
+		}()
+		ctx = held.Context()
+		claim = held
+	}
+
 	// A dry run reads, decodes and measures the whole export but writes nothing. Which
 	// writer is wired in is the only thing that decides that, so there is no path by
 	// which a dry run reaches the table.
-	var ddbWriter writer.Writer
+	var ddbWriter coordinator.Submitter
 	if cfg.DryRun {
-		ddbWriter = writer.NewDiscard(writerCallbacks)
+		ddbWriter = writer.NewDiscard()
 	} else {
-		ddbWriter = writer.NewDynamoDBWriter(dynamoClient, cfg.TableName, cfg.BatchSize, writerCallbacks)
+		ddbWriter = writer.NewDynamoDBWriter(&fencedTable{table: dynamoClient, claim: claim}, cfg.TableName, writerCallbacks,
+			writer.WithMaxInFlight(cfg.MaxInFlight))
 	}
 
 	if cfg.ResumeKey != "" && cfg.DryRun {
 		fmt.Fprintln(os.Stderr, "dry run: --resume is not used, since a dry run records no progress")
 	}
-	checkpointStore, err := newCheckpointStore(cfg, s3Client)
+	store, err := newCheckpointStore(cfg, s3Client)
 	if err != nil {
 		return err
 	}
+	checkpointStore := &fencedStore{store: store, claim: claim}
 
 	// Create report uploader if report URI is provided. The variable is declared as the
 	// interface the coordinator expects: a nil *S3ReportUploader would otherwise arrive
@@ -272,11 +332,19 @@ func run() error {
 		fmt.Printf("Starting restore of table %s from %s\n", cfg.TableName, cfg.ExportS3URI)
 	}
 	if err := coord.Run(ctx); err != nil {
+		// A restore that lost its claim stopped because another may now hold the table,
+		// which an operator must hear as that rather than as an interruption.
+		if cause := context.Cause(ctx); errors.Is(cause, lease.ErrLeaseLost) {
+			return fmt.Errorf("restore stopped: %w; another restore may be writing the table, so make sure none is before running this one again: %w", cause, err)
+		}
 		// A run that skipped records did finish, and one that was interrupted was
 		// stopped rather than broken. Wrapping either as a failure would contradict
 		// what the message and the exit status say about what to do next.
-		if errors.Is(err, coordinator.ErrRecordsSkipped) || errors.Is(err, coordinator.ErrInterrupted) {
+		if errors.Is(err, coordinator.ErrRecordsSkipped) {
 			return err
+		}
+		if errors.Is(err, coordinator.ErrInterrupted) {
+			return fmt.Errorf("%w; run the same command again to carry on", err)
 		}
 		return fmt.Errorf("restore operation failed: %w", err)
 	}
@@ -287,4 +355,54 @@ func run() error {
 		fmt.Println("Restore operation completed successfully")
 	}
 	return nil
+}
+
+// claimChecker says whether this restore may still write, which is whether it can still
+// show that it holds the table.
+type claimChecker interface {
+	Check() error
+}
+
+// unclaimed stands for a dry run, which writes neither the table nor a checkpoint that
+// a claim would guard.
+type unclaimed struct{}
+
+func (unclaimed) Check() error { return nil }
+
+// fencedTable refuses to send a write once the restore's claim on the table has lapsed.
+// It checks just before every request, including the ones the writer sends again after
+// a wait or a partial acceptance, so a restore stops at the next write however long its
+// batches were in flight when the claim lapsed.
+type fencedTable struct {
+	table aws.DynamoDBClient
+	claim claimChecker
+}
+
+// BatchWriteItem sends params unless the claim can no longer be relied on.
+func (f *fencedTable) BatchWriteItem(ctx context.Context, params *dynamodb.BatchWriteItemInput, optFns ...func(*dynamodb.Options)) (*dynamodb.BatchWriteItemOutput, error) {
+	if err := f.claim.Check(); err != nil {
+		return nil, err
+	}
+	return f.table.BatchWriteItem(ctx, params, optFns...)
+}
+
+// fencedStore refuses to save progress once the restore's claim on the table has lapsed.
+// A restore that lost its claim may share its checkpoint with the one that took over,
+// and a late save would overwrite progress that is no longer its to record.
+type fencedStore struct {
+	store checkpoint.Store
+	claim claimChecker
+}
+
+// Load reads the checkpoint; reading needs no claim.
+func (f *fencedStore) Load(ctx context.Context) (checkpoint.State, error) {
+	return f.store.Load(ctx)
+}
+
+// Save records state unless the claim can no longer be relied on.
+func (f *fencedStore) Save(ctx context.Context, state checkpoint.State) error {
+	if err := f.claim.Check(); err != nil {
+		return err
+	}
+	return f.store.Save(ctx, state)
 }

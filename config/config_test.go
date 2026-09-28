@@ -11,9 +11,8 @@ func validConfig() *Config {
 		TableName:       "test-table",
 		ExportS3URI:     "s3://test-bucket/prefix",
 		Region:          "us-west-2",
-		MaxWorkers:      10,
 		Readers:         10,
-		BatchSize:       25,
+		MaxInFlight:     16,
 		ShutdownTimeout: time.Minute,
 	}
 }
@@ -181,9 +180,8 @@ func TestValidateReportsTheFirstProblem(t *testing.T) {
 	}{
 		{"table name", func(c *Config) { c.TableName = "" }, "table name"},
 		{"export URI", func(c *Config) { c.ExportS3URI = "" }, "export S3 URI"},
-		{"max workers", func(c *Config) { c.MaxWorkers = 0 }, "max workers"},
 		{"readers", func(c *Config) { c.Readers = 0 }, "readers"},
-		{"batch size", func(c *Config) { c.BatchSize = 26 }, "batch size"},
+		{"max in flight", func(c *Config) { c.MaxInFlight = 0 }, "max in flight"},
 		{"resume URI", func(c *Config) { c.ResumeKey = "/tmp/checkpoint.json" }, "resume S3 URI"},
 		{"report URI", func(c *Config) { c.ReportS3URI = "http://bucket/report" }, "report S3 URI"},
 		{"shutdown timeout", func(c *Config) { c.ShutdownTimeout = 0 }, "shutdown timeout"},
@@ -243,33 +241,6 @@ func TestExportURIIsCheckedInOrder(t *testing.T) {
 	}
 }
 
-func TestInvalidMaxWorkers(t *testing.T) {
-	testCases := []int{0, -1, -100}
-	for _, workers := range testCases {
-		t.Run("workers", func(t *testing.T) {
-			cfg := validConfig()
-			cfg.MaxWorkers = workers
-			if err := cfg.Validate(); err == nil {
-				t.Errorf("expected error for invalid max workers: %d", workers)
-			}
-		})
-	}
-}
-
-// TestValidMaxWorkers verifies a single worker is accepted. It is the smallest pool that
-// can make progress, and rejecting it would force concurrency the operator did not ask for.
-func TestValidMaxWorkers(t *testing.T) {
-	for _, workers := range []int{1, 10, 100} {
-		t.Run("workers", func(t *testing.T) {
-			cfg := validConfig()
-			cfg.MaxWorkers = workers
-			if err := cfg.Validate(); err != nil {
-				t.Errorf("expected valid max workers %d to pass, got: %v", workers, err)
-			}
-		})
-	}
-}
-
 // TestValidShutdownTimeout verifies one second, the shortest allowed grace period, is
 // accepted so an operator can ask for a fast shutdown.
 func TestValidShutdownTimeout(t *testing.T) {
@@ -279,31 +250,6 @@ func TestValidShutdownTimeout(t *testing.T) {
 			cfg.ShutdownTimeout = timeout
 			if err := cfg.Validate(); err != nil {
 				t.Errorf("expected valid shutdown timeout %s to pass, got: %v", timeout, err)
-			}
-		})
-	}
-}
-
-func TestInvalidBatchSize(t *testing.T) {
-	testCases := []int{0, -1, 26, 100}
-	for _, size := range testCases {
-		t.Run("size", func(t *testing.T) {
-			cfg := validConfig()
-			cfg.BatchSize = size
-			if err := cfg.Validate(); err == nil {
-				t.Errorf("expected error for invalid batch size: %d", size)
-			}
-		})
-	}
-}
-
-func TestValidBatchSizes(t *testing.T) {
-	for _, size := range []int{1, 10, 25} {
-		t.Run("size", func(t *testing.T) {
-			cfg := validConfig()
-			cfg.BatchSize = size
-			if err := cfg.Validate(); err != nil {
-				t.Errorf("expected valid batch size %d to pass, got: %v", size, err)
 			}
 		})
 	}
@@ -348,5 +294,45 @@ func TestInvalidShutdownTimeout(t *testing.T) {
 				t.Errorf("expected error for invalid shutdown timeout: %v", timeout)
 			}
 		})
+	}
+}
+
+// TestLeaseURIClaimsTheTableWhateverTheExport verifies two restores into one table from
+// different exports find the same claim. Applying two exports to one table at once is
+// what can put back data a newer export replaced, so they must exclude each other.
+func TestLeaseURIClaimsTheTableWhateverTheExport(t *testing.T) {
+	first := (&Config{TableName: "orders", ExportS3URI: "s3://backups/AWSDynamoDB/0123-abc"}).LeaseURI("eu-west-1")
+	second := (&Config{TableName: "orders", ExportS3URI: "s3://backups/AWSDynamoDB/4567-def"}).LeaseURI("eu-west-1")
+	if first != second || first != "s3://backups/ddb-pitr/leases/eu-west-1.orders.json" {
+		t.Errorf("LeaseURI() = %q and %q, want both s3://backups/ddb-pitr/leases/eu-west-1.orders.json", first, second)
+	}
+}
+
+// TestLeaseURISeparatesRegions verifies same-named tables in two regions, which are two
+// tables, do not block each other.
+func TestLeaseURISeparatesRegions(t *testing.T) {
+	cfg := &Config{TableName: "orders", ExportS3URI: "s3://backups/AWSDynamoDB/0123-abc"}
+	if cfg.LeaseURI("eu-west-1") == cfg.LeaseURI("us-east-1") {
+		t.Error("tables in two regions share one claim")
+	}
+}
+
+// TestLeaseURIFollowsWhereProgressIsWritable verifies the claim goes where --resume
+// points, which is the bucket an operator of a read-only export named as writable, and
+// that --no-resume still claims the table: not recording progress does not make two
+// restores of one table safe. Only a dry run, which cannot write the table, claims
+// nothing.
+func TestLeaseURIFollowsWhereProgressIsWritable(t *testing.T) {
+	cfg := &Config{TableName: "orders", ExportS3URI: "s3://backups/AWSDynamoDB/0123-abc", ResumeKey: "s3://mine/progress/r.json"}
+	if got, want := cfg.LeaseURI("eu-west-1"), "s3://mine/ddb-pitr/leases/eu-west-1.orders.json"; got != want {
+		t.Errorf("LeaseURI() with --resume = %q, want %q", got, want)
+	}
+	cfg = &Config{TableName: "orders", ExportS3URI: "s3://backups/AWSDynamoDB/0123-abc", NoResume: true}
+	if got := cfg.LeaseURI("eu-west-1"); got == "" {
+		t.Error("LeaseURI() with --no-resume claims nothing")
+	}
+	cfg = &Config{TableName: "orders", ExportS3URI: "s3://backups/AWSDynamoDB/0123-abc", DryRun: true}
+	if got := cfg.LeaseURI("eu-west-1"); got != "" {
+		t.Errorf("LeaseURI() for a dry run = %q, want no claim", got)
 	}
 }

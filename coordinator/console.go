@@ -15,7 +15,7 @@ import (
 // worth nothing once the restore ends. A message is a record of something that happened
 // and has to survive being piped to a file.
 //
-// Every write is serialised, because both pools report failures while the reporter is
+// Every write is serialised, because readers and batches report failures while the reporter is
 // rewriting the line.
 type console struct {
 	progress io.Writer

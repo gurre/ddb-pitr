@@ -8,10 +8,12 @@
 # 4. Triggers an INCREMENTAL export to S3
 # 5. Creates a target table and restores data using ddb-pitr
 # 6. Validates that source and target tables match exactly
-# 7. Restores the FULL export again into a third table, interrupts it part-way, and
-#    resumes it from its checkpoint to prove an interrupted restore completes
+# 7. Restores the FULL export again into a third table, slowed by provisioning it small,
+#    checks a second restore of that table is refused while the first runs, interrupts
+#    the first part-way and resumes it from its checkpoint to prove it completes
 #
-# Cost and duration: this creates three on-demand tables and two PITR exports, writes
+# Cost and duration: this creates three tables, two on-demand and one provisioned small
+# and switched to on-demand part-way, and two PITR exports, writes
 # ITEM_COUNT * ITEM_SIZE bytes to S3, and restores the data three times. It takes at
 # least 20 minutes whatever the size, because DynamoDB requires a warm-up before the
 # first export and 15 minutes between export times.
@@ -112,9 +114,12 @@ cleanup() {
 trap cleanup EXIT
 
 # create_table_like creates an empty table with the same key schema and indexes as an
-# existing one, which is what a restore target has to be.
+# existing one, which is what a restore target has to be. It is on-demand unless a write
+# capacity is given, in which case the table and each of its global indexes are
+# provisioned at that many write units: that is how a restore is made slow enough to
+# interrupt without asking it to be slow.
 create_table_like() {
-    local source_table="$1" new_table="$2" desc create_input
+    local source_table="$1" new_table="$2" wcu="${3:-}" desc create_input billing
 
     desc=$(aws dynamodb describe-table \
         --table-name "${source_table}" \
@@ -122,10 +127,17 @@ create_table_like() {
         --output json \
         --query 'Table.{AttributeDefinitions:AttributeDefinitions,KeySchema:KeySchema,LocalSecondaryIndexes:LocalSecondaryIndexes,GlobalSecondaryIndexes:GlobalSecondaryIndexes}')
 
-    create_input=$(echo "${desc}" | jq --arg name "${new_table}" '
-        . + {TableName: $name, BillingMode: "PAY_PER_REQUEST"}
+    billing="PAY_PER_REQUEST"
+    if [[ -n "${wcu}" ]]; then
+        billing="PROVISIONED"
+    fi
+    create_input=$(echo "${desc}" | jq --arg name "${new_table}" --arg billing "${billing}" --arg wcu "${wcu:-0}" '
+        {ReadCapacityUnits: 50, WriteCapacityUnits: ($wcu | tonumber)} as $pt
+        | . + {TableName: $name, BillingMode: $billing}
+        | if $billing == "PROVISIONED" then . + {ProvisionedThroughput: $pt} else . end
         | if .GlobalSecondaryIndexes then
-            .GlobalSecondaryIndexes |= map(del(.ProvisionedThroughput, .IndexStatus, .IndexSizeBytes, .ItemCount, .IndexArn, .Backfilling, .WarmThroughput, .OnDemandThroughput))
+            .GlobalSecondaryIndexes |= map(del(.ProvisionedThroughput, .IndexStatus, .IndexSizeBytes, .ItemCount, .IndexArn, .Backfilling, .WarmThroughput, .OnDemandThroughput)
+                | if $billing == "PROVISIONED" then . + {ProvisionedThroughput: $pt} else . end)
           else . end
         | if .LocalSecondaryIndexes then
             .LocalSecondaryIndexes |= map(del(.IndexSizeBytes, .ItemCount, .IndexArn))
@@ -449,32 +461,33 @@ if [[ ${VERIFY_FAILED} -ne 0 ]]; then
     exit 1
 fi
 
-# Phase 10: Interrupt a restore and resume it
+# Phase 10: Interrupt a restore and resume it, and try to run a second one beside it
 #
 # The FULL export is restored again into its own table, interrupted part-way, and then
-# resumed from the checkpoint the interrupted run left behind. The restart deliberately
-# uses different reader, worker and batch settings, because a resume is only worth
-# having if it does not depend on how the run before it was configured.
+# resumed from the checkpoint the interrupted run left behind. The table starts with
+# little provisioned capacity, which is what makes the restore slow enough to interrupt:
+# the restore has nothing to be told, and settles on the rate the table accepts. While it
+# runs, a second restore of the same table is started and must refuse to start. Before
+# resuming, the table is switched to on-demand, so the resume also shows a restore held
+# to a small rate climbing when the capacity is there.
 echo ""
 echo "=== Phase 10: Interrupted restore resumes and completes ==="
 
 CHECKPOINT_KEY="${S3_PREFIX}/resume-checkpoint.json"
 CHECKPOINT_URI="s3://${S3_BUCKET}/${CHECKPOINT_KEY}"
+RESUME_WCU="${RESUME_WCU:-20}"
 
-echo "Creating resume table ${RESUME_TABLE}..."
-create_table_like "${SOURCE_TABLE}" "${RESUME_TABLE}"
+echo "Creating resume table ${RESUME_TABLE} at ${RESUME_WCU} write units..."
+create_table_like "${SOURCE_TABLE}" "${RESUME_TABLE}" "${RESUME_WCU}"
 
-# One file read at a time and one item per request, so the restore is slow enough to
-# have a window to interrupt in.
+# One file read at a time, so the restore is narrow as well as slow.
 echo "Starting a restore to interrupt..."
 "${BIN_DIR}/ddb-pitr" \
     -table "${RESUME_TABLE}" \
     -export "${FULL_MANIFEST_URI}" \
     -region "${REGION}" \
     -resume "${CHECKPOINT_URI}" \
-    -readers 1 \
-    -workers 1 \
-    -batch 1 &
+    -readers 1 &
 PITR_PID=$!
 
 # Interrupt once the checkpoint describes work that was actually done, not merely once
@@ -492,6 +505,30 @@ for _ in $(seq 1 600); do
     kill -0 "${PITR_PID}" 2>/dev/null || break
     sleep 0.2
 done
+
+# A second restore of a table another restore is writing must stop before it writes
+# anything and say why with its own exit status. It records progress somewhere else, so
+# what stops it is the claim on the table rather than a shared checkpoint.
+SECOND_RESULT="SKIPPED (the first restore was not running)"
+if [[ ${CHECKPOINT_SEEN} -eq 1 ]] && kill -0 "${PITR_PID}" 2>/dev/null; then
+    echo "Starting a second restore of ${RESUME_TABLE} while the first runs..."
+    SECOND_RC=0
+    "${BIN_DIR}/ddb-pitr" \
+        -table "${RESUME_TABLE}" \
+        -export "${FULL_MANIFEST_URI}" \
+        -region "${REGION}" \
+        -resume "s3://${S3_BUCKET}/${S3_PREFIX}/second-checkpoint.json" || SECOND_RC=$?
+    if [[ ${SECOND_RC} -ne 4 ]]; then
+        echo "ERROR: a second restore of a table being restored exited ${SECOND_RC}, expected 4"
+        exit 1
+    fi
+    if ! kill -0 "${PITR_PID}" 2>/dev/null; then
+        echo "ERROR: the first restore stopped while the second was being refused"
+        exit 1
+    fi
+    echo "Second restore refused while the first held the table"
+    SECOND_RESULT="SUCCESS"
+fi
 
 # SIGTERM rather than SIGINT: a shell ignores SIGINT in the commands it starts in the
 # background, so a wrapper around the binary would never see one. SIGTERM is also what
@@ -525,9 +562,14 @@ else
     fi
 fi
 
-# Resume at the default reader count, worker count and batch size, none of which the
-# interrupted run used: a resume is only worth having if it does not depend on how the
-# run before it was shaped.
+# The rest of the restore runs on-demand, so the resume finishes in minutes rather than
+# at the rate the small table allowed. The wait returns once the table is active again.
+echo "Switching ${RESUME_TABLE} to on-demand..."
+aws dynamodb update-table --table-name "${RESUME_TABLE}" --billing-mode PAY_PER_REQUEST --region "${REGION}" > /dev/null
+aws dynamodb wait table-exists --table-name "${RESUME_TABLE}" --region "${REGION}"
+
+# Resume at the default reader count, which the interrupted run did not use: a resume
+# is only worth having if it does not depend on how the run before it was shaped.
 echo "Resuming from ${CHECKPOINT_URI}..."
 RESUME_LOG=$(mktemp)
 "${BIN_DIR}/ddb-pitr" \
@@ -576,3 +618,4 @@ echo "  - FULL export and restore: SUCCESS"
 echo "  - INCREMENTAL export and restore: SUCCESS"
 echo "  - Data integrity: VERIFIED (${SAMPLE_SIZE} samples)"
 echo "  - Interrupted restore and resume: ${RESUME_RESULT}"
+echo "  - Second restore of a table being restored refused: ${SECOND_RESULT}"

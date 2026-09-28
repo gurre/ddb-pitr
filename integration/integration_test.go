@@ -34,9 +34,8 @@ func TestFullIntegrationFlow(t *testing.T) {
 		TableName:       "test-table",
 		ExportS3URI:     "s3://test-bucket/AWSDynamoDB/01768385930622-efd1a093/manifest-summary.json",
 		Region:          "us-west-2",
-		MaxWorkers:      1,
 		Readers:         1,
-		BatchSize:       25,
+		MaxInFlight:     16,
 		ShutdownTimeout: 5 * time.Second,
 	}
 
@@ -119,9 +118,8 @@ func TestEndToEndWithCoordinator(t *testing.T) {
 		TableName:       "test-table",
 		ExportS3URI:     "s3://test-bucket/AWSDynamoDB/01768385930622-efd1a093/manifest-summary.json",
 		Region:          "us-west-2",
-		MaxWorkers:      1,
 		Readers:         1,
-		BatchSize:       25,
+		MaxInFlight:     16,
 		ShutdownTimeout: 1 * time.Second,
 		DryRun:          true,
 	}
@@ -133,7 +131,7 @@ func TestEndToEndWithCoordinator(t *testing.T) {
 	manifestLoader := manifest.NewS3Loader(mockS3)
 	streamer := s3streamer.NewS3Streamer(mockS3)
 	jsonDecoder := itemimage.NewJSONDecoder() // Use real decoder
-	ddbWriter := writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, cfg.BatchSize, writer.Callbacks{})
+	ddbWriter := writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, writer.Callbacks{})
 	checkpointStore := checkpoint.NewMemoryStore()
 
 	coord := coordinator.NewCoordinator(
@@ -346,7 +344,7 @@ func TestDataCorrectnessAfterOperations(t *testing.T) {
 	manifestLoader := manifest.NewS3Loader(mockS3)
 	streamer := s3streamer.NewS3Streamer(mockS3)
 	decoder := itemimage.NewJSONDecoder()
-	ddbWriter := writer.NewDynamoDBWriter(mockDynamoDB, tableName, 25, writer.Callbacks{})
+	ddbWriter := writer.NewDynamoDBWriter(mockDynamoDB, tableName, writer.Callbacks{})
 
 	ctx := context.Background()
 
@@ -380,7 +378,7 @@ func TestDataCorrectnessAfterOperations(t *testing.T) {
 				continue
 			}
 			if len(ops) > 0 {
-				if err := ddbWriter.WriteBatch(ctx, ops); err != nil {
+				if err := writeAll(ctx, ddbWriter, ops); err != nil {
 					t.Fatalf("Failed to write batch: %v", err)
 				}
 			}
@@ -538,16 +536,15 @@ func loadFixtures(t *testing.T) *mock.S3Client {
 }
 
 // restoreConfig is a validated configuration for restoring the given export with one
-// worker, so the order items reach the table is the order of the file.
+// reader, so the order items reach the batcher is the order of the file.
 func restoreConfig(t *testing.T, exportURI string) *config.Config {
 	t.Helper()
 	cfg := &config.Config{
 		TableName:       "test-table",
 		ExportS3URI:     exportURI,
 		Region:          "us-west-2",
-		MaxWorkers:      1,
 		Readers:         1,
-		BatchSize:       1,
+		MaxInFlight:     16,
 		ShutdownTimeout: time.Second,
 	}
 	if err := cfg.Validate(); err != nil {
@@ -593,7 +590,7 @@ func TestResumeSkipsLinesAlreadyWrittenAgainstTheRealStreamer(t *testing.T) {
 	mockDynamoDB := mock.NewDynamoDBClient()
 	coord := coordinator.NewCoordinator(cfg, manifest.NewS3Loader(mockS3), streamer,
 		itemimage.NewJSONDecoder(),
-		writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, cfg.BatchSize, writer.Callbacks{}),
+		writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, writer.Callbacks{}),
 		store, nil, metrics.NewMetrics())
 
 	if err := coord.Run(ctx); err != nil {
@@ -652,21 +649,50 @@ func TestStreamerReadsEachByteOfTheObjectOnce(t *testing.T) {
 	}
 }
 
-// failingWriter passes batches through to another writer until failFrom, counting from
-// one, and refuses every batch from then on. It stands in for a restore whose table
-// stopped accepting writes part-way through.
+// failingWriter lets the first operation it is given through to another writer and
+// refuses the rest of that batch, as a table short of capacity would, then fails every
+// batch after it. It stands in for a restore whose table stopped accepting writes
+// part-way through, with work written, work turned away, and work never sent.
 type failingWriter struct {
-	inner    writer.Writer
-	failFrom int
-	calls    int
+	inner coordinator.Submitter
+	calls int
 }
 
-func (f *failingWriter) WriteBatch(ctx context.Context, ops []itemimage.Operation) error {
+func (f *failingWriter) Submit(ctx context.Context, ops []itemimage.Operation, done func(writer.Rejection, error)) error {
 	f.calls++
-	if f.calls >= f.failFrom {
-		return fmt.Errorf("table unavailable")
+	if f.calls > 1 {
+		go done(writer.Rejection{}, fmt.Errorf("table unavailable"))
+		return nil
 	}
-	return f.inner.WriteBatch(ctx, ops)
+	refused := make([]int, 0, len(ops)-1)
+	for i := 1; i < len(ops); i++ {
+		refused = append(refused, i)
+	}
+	return f.inner.Submit(ctx, ops[:1], func(r writer.Rejection, err error) {
+		done(writer.Rejection{Refused: append(r.Refused, refused...)}, err)
+	})
+}
+
+// writeAll writes ops through w a batch at a time, waiting for each, and fails on the
+// first batch that fails or that the table does not take whole.
+func writeAll(ctx context.Context, w coordinator.Submitter, ops []itemimage.Operation) error {
+	for start := 0; start < len(ops); start += writer.MaxBatch {
+		end := min(start+writer.MaxBatch, len(ops))
+		result := make(chan error, 1)
+		err := w.Submit(ctx, ops[start:end], func(r writer.Rejection, err error) {
+			if err == nil && len(r.Refused)+len(r.HandedBack) > 0 {
+				err = fmt.Errorf("table did not take %d operations", len(r.Refused)+len(r.HandedBack))
+			}
+			result <- err
+		})
+		if err != nil {
+			return err
+		}
+		if err := <-result; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // TestInterruptedRestoreResumesWithoutRewritingItems verifies a restore that fails
@@ -682,9 +708,9 @@ func TestInterruptedRestoreResumesWithoutRewritingItems(t *testing.T) {
 	cfg := restoreConfig(t, fullExportURI)
 	mockDynamoDB := mock.NewDynamoDBClient()
 	store := checkpoint.NewMemoryStore()
-	realWriter := writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, cfg.BatchSize, writer.Callbacks{},
+	realWriter := writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, writer.Callbacks{},
 		writer.WithBackoff(writer.NewExponentialBackoff(time.Millisecond, time.Millisecond)))
-	run := func(w writer.Writer) error {
+	run := func(w coordinator.Submitter) error {
 		return coordinator.NewCoordinator(cfg, manifest.NewS3Loader(mockS3), s3streamer.NewS3Streamer(mockS3),
 			itemimage.NewJSONDecoder(), w, store, nil, metrics.NewMetrics(),
 			coordinator.WithStreamBackoff(writer.NewExponentialBackoff(time.Millisecond, time.Millisecond)),
@@ -692,7 +718,7 @@ func TestInterruptedRestoreResumesWithoutRewritingItems(t *testing.T) {
 	}
 
 	// The first run writes one item and then loses its table.
-	if err := run(&failingWriter{inner: realWriter, failFrom: 2}); err == nil {
+	if err := run(&failingWriter{inner: realWriter}); err == nil {
 		t.Fatal("expected the first run to fail")
 	}
 	if got := len(mockDynamoDB.GetBatchWrites()); got != 1 {
@@ -706,8 +732,14 @@ func TestInterruptedRestoreResumesWithoutRewritingItems(t *testing.T) {
 	if got := len(mockDynamoDB.GetTableContents(cfg.TableName)); got != 3 {
 		t.Errorf("expected all 3 items in the table, got %d", got)
 	}
-	if got := len(mockDynamoDB.GetBatchWrites()); got != 3 {
-		t.Errorf("expected 3 batch writes across both runs, one per item, got %d", got)
+	written := 0
+	for _, call := range mockDynamoDB.GetBatchWrites() {
+		for _, requests := range call.RequestItems {
+			written += len(requests)
+		}
+	}
+	if written != 3 {
+		t.Errorf("expected 3 items written across both runs, each once, got %d", written)
 	}
 }
 
@@ -724,16 +756,14 @@ func TestRestoreSpreadAcrossManyReadersWritesEveryItemOnce(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	contents := func(readers, workers, batch int) map[string]map[string]types.AttributeValue {
+	contents := func(readers int) map[string]map[string]types.AttributeValue {
 		t.Helper()
 		mockS3 := loadFixtures(t)
 		cfg := restoreConfig(t, fullExportURI)
 		cfg.Readers = readers
-		cfg.MaxWorkers = workers
-		cfg.BatchSize = batch
 
 		mockDynamoDB := mock.NewDynamoDBClient()
-		w := writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, cfg.BatchSize, writer.Callbacks{},
+		w := writer.NewDynamoDBWriter(mockDynamoDB, cfg.TableName, writer.Callbacks{},
 			writer.WithBackoff(writer.NewExponentialBackoff(time.Millisecond, time.Millisecond)))
 		err := coordinator.NewCoordinator(cfg, manifest.NewS3Loader(mockS3), s3streamer.NewS3Streamer(mockS3),
 			itemimage.NewJSONDecoder(), w, checkpoint.NewMemoryStore(), nil, metrics.NewMetrics(),
@@ -760,8 +790,8 @@ func TestRestoreSpreadAcrossManyReadersWritesEveryItemOnce(t *testing.T) {
 		return table
 	}
 
-	serial := contents(1, 1, 1)
-	spread := contents(8, 4, 25)
+	serial := contents(1)
+	spread := contents(8)
 
 	if len(spread) != len(serial) {
 		t.Fatalf("reading 8 files at once left %d items, reading one at a time left %d",
@@ -771,5 +801,66 @@ func TestRestoreSpreadAcrossManyReadersWritesEveryItemOnce(t *testing.T) {
 		if _, ok := spread[key]; !ok {
 			t.Errorf("item %q is missing when the export is read 8 files at a time", key)
 		}
+	}
+}
+
+// incrementalWithEveryKind is an incremental export holding one insert, two changes and
+// two deletes.
+const incrementalWithEveryKind = "s3://test-bucket/AWSDynamoDB/01768388186000-4a2fc3ff/manifest-summary.json"
+
+// TestReportCountsWhatWasAppliedByKind verifies a restore of an incremental export
+// reports how many inserts, changes and deletes it applied, and that the counts are
+// those the export holds. This is what an operator checks a restore of an incremental
+// export against: a total alone cannot tell a restore that applied every delete from
+// one that applied none.
+func TestReportCountsWhatWasAppliedByKind(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	mockS3 := loadFixtures(t)
+	cfg := restoreConfig(t, incrementalWithEveryKind)
+	m := metrics.NewMetrics()
+
+	err := coordinator.NewCoordinator(cfg, manifest.NewS3Loader(mockS3), s3streamer.NewS3Streamer(mockS3),
+		itemimage.NewJSONDecoder(), writer.NewDynamoDBWriter(mock.NewDynamoDBClient(), cfg.TableName, writer.Callbacks{}),
+		checkpoint.NewMemoryStore(), nil, m).Run(ctx)
+	if err != nil {
+		t.Fatalf("restore failed: %v", err)
+	}
+
+	want := metrics.Operations{
+		itemimage.OpPut:    {Applied: 1},
+		itemimage.OpUpdate: {Applied: 2},
+		itemimage.OpDelete: {Applied: 2},
+	}
+	if got := m.GenerateReport(0).Operations; got != want {
+		t.Errorf("operations = %+v, want %+v", got, want)
+	}
+}
+
+// TestDryRunReportsTheSameBreakdownAsARestore verifies a dry run of an export reports
+// the same counts by kind as restoring it does. A dry run is how an operator learns what
+// a restore will do before pointing it at a table, so its figures have to be the
+// restore's figures.
+func TestDryRunReportsTheSameBreakdownAsARestore(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	breakdown := func(w coordinator.Submitter) metrics.Operations {
+		t.Helper()
+		mockS3 := loadFixtures(t)
+		cfg := restoreConfig(t, incrementalWithEveryKind)
+		m := metrics.NewMetrics()
+		err := coordinator.NewCoordinator(cfg, manifest.NewS3Loader(mockS3), s3streamer.NewS3Streamer(mockS3),
+			itemimage.NewJSONDecoder(), w, checkpoint.NewMemoryStore(), nil, m).Run(ctx)
+		if err != nil {
+			t.Fatalf("run failed: %v", err)
+		}
+		return m.GenerateReport(0).Operations
+	}
+
+	dry := breakdown(writer.NewDiscard())
+	restored := breakdown(writer.NewDynamoDBWriter(mock.NewDynamoDBClient(), "test-table", writer.Callbacks{}))
+	if dry != restored {
+		t.Errorf("dry run reported %+v, the restore %+v", dry, restored)
 	}
 }

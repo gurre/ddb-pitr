@@ -2,6 +2,7 @@ package writer
 
 import (
 	"context"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -93,7 +94,7 @@ func TestWriteCostChargesAKilobyteAUnit(t *testing.T) {
 	}
 }
 
-// TestPacerCutsTheRateOnceWithinAWindow verifies repeated refusals in quick succession
+// TestPacerCutsTheRateOnceWithinAWindow verifies repeated refusals within one window
 // step the rate down once rather than once each.
 //
 // A batch is deliberately spread across partitions, so one hot partition hands items
@@ -104,18 +105,17 @@ func TestPacerCutsTheRateOnceWithinAWindow(t *testing.T) {
 	clock := newTestClock()
 	p := newTestPacer(clock)
 
-	// A first refusal with nothing observed yet puts the rate at the floor, so start
-	// from a rate there is somewhere to fall from.
 	p.setRateLocked(clock.Now(), 64)
-	p.achieved = 64
-
-	p.throttled()
-	p.throttled()
-	p.throttled()
+	p.take(1, 1) // Opens a window.
+	p.refused(10)
+	p.refused(10)
+	p.refused(10)
+	clock.advance(paceWindow)
+	p.take(1, 1) // Closes it.
 
 	rate, _ := p.current()
-	if rate != 32 {
-		t.Errorf("expected three refusals in one window to halve the rate once to 32, got %v", rate)
+	if !near(rate, 44.8) {
+		t.Errorf("expected three refusals in one window to cut the rate once to 44.8, got %v", rate)
 	}
 }
 
@@ -126,15 +126,12 @@ func TestPacerCutsAgainInTheNextWindow(t *testing.T) {
 	clock := newTestClock()
 	p := newTestPacer(clock)
 	p.setRateLocked(clock.Now(), 64)
-	p.achieved = 64
-
-	p.throttled()
-	clock.advance(paceWindow)
-	p.throttled()
+	refuseWindow(p, clock)
+	refuseWindow(p, clock)
 
 	rate, _ := p.current()
-	if rate != 16 {
-		t.Errorf("expected a refusal in each of two windows to reach 16, got %v", rate)
+	if !near(rate, 31.36) {
+		t.Errorf("expected a refusal in each of two windows to reach 31.36, got %v", rate)
 	}
 }
 
@@ -146,10 +143,10 @@ func TestPacerRaisesTheRateAfterASaturatedWindow(t *testing.T) {
 	clock := newTestClock()
 	p := newTestPacer(clock)
 
-	p.throttled() // The table refuses, putting the rate at the floor of one unit.
+	p.setRateLocked(clock.Now(), 1) // Held to one unit a second.
 	clock.advance(paceWindow)
 	p.take(1, 1) // Opens the first clean window.
-	p.settle(1, 1)
+	p.settle(1, 1, 0)
 	clock.advance(paceWindow)
 	p.take(1, 1) // Closes it, having used the whole allowance.
 
@@ -170,7 +167,7 @@ func TestPacerHoldsTheRateWhenTheAllowanceGoesUnused(t *testing.T) {
 
 	clock.advance(paceWindow)
 	p.take(1, 1) // Opens a window.
-	p.settle(1, 1)
+	p.settle(1, 1, 0)
 	clock.advance(paceWindow)
 	p.take(1, 1) // Closes it, having used one unit of a hundred.
 
@@ -187,9 +184,8 @@ func TestPacerNeverStopsAltogether(t *testing.T) {
 	clock := newTestClock()
 	p := newTestPacer(clock)
 
-	for i := 0; i < 10; i++ {
-		p.throttled()
-		clock.advance(paceWindow)
+	for range 20 {
+		refuseWindow(p, clock)
 	}
 
 	rate, paced := p.current()
@@ -206,13 +202,13 @@ func TestPacerNeverStopsAltogether(t *testing.T) {
 func TestPacerChargesWhatTheTableActuallyConsumed(t *testing.T) {
 	clock := newTestClock()
 	p := newTestPacer(clock)
-	p.throttled() // Rate at the floor: one unit a second.
+	p.setRateLocked(clock.Now(), 1) // One unit a second.
 	clock.advance(paceWindow)
 
 	if n, _ := p.take(1, 1); n != 1 {
 		t.Fatalf("expected the accrued unit to be spendable, got %d", n)
 	}
-	p.settle(1, 5) // The table charged five units for what was estimated at one.
+	p.settle(1, 5, 0) // The table charged five units for what was estimated at one.
 
 	_, wait := p.take(1, 1)
 	if wait != 5*time.Second {
@@ -301,77 +297,50 @@ func (c *capacityClient) requestSizes() []int {
 	return append([]int(nil), c.sizes...)
 }
 
-// TestWriteBatchShrinksRequestsToWhatTheTableAccepts verifies a request that the table
-// refuses most of is followed by requests the table can take whole.
-//
-// This is the failure a small provisioned table produces: twenty-five items go out,
-// twenty-three come back, and a writer that keeps resending twenty-three collects the
-// same refusal until the restore is nothing but refusals. Sizing the next request to
-// the rate the table was observed to accept is what ends that.
-func TestWriteBatchShrinksRequestsToWhatTheTableAccepts(t *testing.T) {
-	const accepts = 2
-	client := &capacityClient{limit: accepts}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{},
-		WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
-
-	if err := w.WriteBatch(context.Background(), putOps(10)); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
-	}
-
-	sizes := client.requestSizes()
-	if len(sizes) < 2 {
-		t.Fatalf("expected the refused items to be resent, got %v", sizes)
-	}
-	if sizes[0] != 10 {
-		t.Errorf("expected the first request to carry all 10 items, got %d", sizes[0])
-	}
-	for i, size := range sizes[1:] {
-		if size > accepts {
-			t.Errorf("request %d carried %d items, more than the %d the table accepts",
-				i+1, size, accepts)
-		}
-	}
-}
-
-// TestWriteBatchSendsFullRequestsUntilTheTableRefuses verifies a table that accepts
+// TestSubmitSendsFullRequestsUntilTheTableRefuses verifies a table that accepts
 // everything is written to at full batch size with no waiting. Holding back a table
 // that has capacity would make every restore slower to guard against the small ones.
-func TestWriteBatchSendsFullRequestsUntilTheTableRefuses(t *testing.T) {
+func TestSubmitSendsFullRequestsUntilTheTableRefuses(t *testing.T) {
 	client := &capacityClient{limit: 25}
 	clock := newTestClock()
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{},
+	w := NewDynamoDBWriter(client, "test-table", Callbacks{},
 		WithBackoff(&instantBackoff{}), withPaceClock(clock))
 
-	if err := w.WriteBatch(context.Background(), putOps(50)); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
+	if err := writeAndWait(context.Background(), w, putOps(25)); err != nil {
+		t.Fatalf("Submit failed: %v", err)
 	}
 
 	sizes := client.requestSizes()
-	if len(sizes) != 2 || sizes[0] != 25 || sizes[1] != 25 {
-		t.Errorf("expected two full requests of 25, got %v", sizes)
+	if len(sizes) != 1 || sizes[0] != 25 {
+		t.Errorf("expected one full request of 25, got %v", sizes)
 	}
 	if waits := clock.waits(); len(waits) != 0 {
 		t.Errorf("expected no waiting against a table that accepts everything, got %v", waits)
 	}
 }
 
-// TestWriteBatchReportsThePaceItSettledOn verifies the rate the table is being held to
+// TestSubmitReportsThePaceItSettledOn verifies the rate the table is being held to
 // reaches the caller. An operator watching a restore crawl needs to see the limit that
 // is holding it, or the only visible symptom is a number that will not move.
-func TestWriteBatchReportsThePaceItSettledOn(t *testing.T) {
-	client := &capacityClient{limit: 2}
+func TestSubmitReportsThePaceItSettledOn(t *testing.T) {
+	client := &scriptedClient{batchErrs: []error{throttle(), nil}}
+	clock := newTestClock()
 	var paces []float64
 	var mu sync.Mutex
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{
+	w := NewDynamoDBWriter(client, "test-table", Callbacks{
 		OnPace: func(rate float64) {
 			mu.Lock()
 			defer mu.Unlock()
 			paces = append(paces, rate)
 		},
-	}, WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
+	}, WithBackoff(&instantBackoff{}), withPaceClock(clock))
 
-	if err := w.WriteBatch(context.Background(), putOps(10)); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
+	// The first batch is refused; the second is sent after the window it fell in closed.
+	for range 2 {
+		if err := writeAndWait(context.Background(), w, putOps(10)); err != nil {
+			t.Fatalf("Submit failed: %v", err)
+		}
+		clock.advance(paceWindow)
 	}
 
 	mu.Lock()
@@ -394,10 +363,10 @@ func TestPacerClimbsBackWhenTheTableReportsNoCapacity(t *testing.T) {
 	clock := newTestClock()
 	p := newTestPacer(clock)
 
-	p.throttled() // Rate at the floor: one unit a second.
+	p.setRateLocked(clock.Now(), 1) // One unit a second.
 	clock.advance(paceWindow)
 	p.take(1, 1) // Opens the first clean window.
-	p.settle(1, 0)
+	p.settle(1, 0, 0)
 	clock.advance(paceWindow)
 	p.take(1, 1) // Closes it.
 
@@ -426,98 +395,36 @@ func TestPacerGrantsRatherThanSpinningOnAnUnmeasurableWait(t *testing.T) {
 	}
 }
 
-// TestPacerCutsToHalfOfWhatTheTableWasTaking verifies the first refusal steps down from
-// the rate the table had been accepting, not from nothing.
+// TestPacerCutsFromWhatTheTableWasTaking verifies the first cut steps down from the rate
+// the restore was sending at, not from nothing.
 //
 // A large table that throttles once during a burst would otherwise be held to the floor
 // of one unit a second and have to climb all the way back, turning a moment's pressure
 // into minutes of a restore running at a thousandth of the table's capacity.
-func TestPacerCutsToHalfOfWhatTheTableWasTaking(t *testing.T) {
+func TestPacerCutsFromWhatTheTableWasTaking(t *testing.T) {
 	clock := newTestClock()
 	p := newTestPacer(clock)
 
-	p.take(1, 25)                   // The first write, where measurement starts.
-	p.settle(1000, 1000)            // A thousand units go through...
-	clock.advance(10 * time.Second) // ...over ten seconds, so a hundred a second.
-
-	p.throttled()
+	p.take(1, 25)                   // Opens a window.
+	p.settle(1000, 1000, 0)         // A thousand units go through...
+	p.refused(1000)                 // ...and as many are refused...
+	clock.advance(10 * time.Second) // ...over ten seconds: two hundred a second sent.
+	p.take(1, 25)                   // Closes it.
 
 	rate, _ := p.current()
-	if rate != 50 {
-		t.Errorf("expected the rate cut to half of the 100/s observed, got %v", rate)
+	if !near(rate, 140) {
+		t.Errorf("expected the rate cut to seven tenths of the 200/s sent, got %v", rate)
 	}
 }
 
-// pickyClient accepts only the last item of each call and hands every other one back,
-// which is what a table does when the items of one write fall on partitions with
-// different amounts of capacity left. It records the key of each item it accepted.
-type pickyClient struct {
-	accepted []string
-	mu       sync.Mutex
-}
-
-func (c *pickyClient) BatchWriteItem(ctx context.Context, params *dynamodb.BatchWriteItemInput, _ ...func(*dynamodb.Options)) (*dynamodb.BatchWriteItemOutput, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	out := &dynamodb.BatchWriteItemOutput{}
-	for table, requests := range params.RequestItems {
-		last := len(requests) - 1
-		c.accepted = append(c.accepted, itemKey(requests[last]))
-		if last > 0 {
-			out.UnprocessedItems = map[string][]types.WriteRequest{
-				table: append([]types.WriteRequest(nil), requests[:last]...),
-			}
-		}
-	}
-	return out, nil
-}
-
-// itemKey reads the partition key out of a write request, which is what identifies the
-// item the request carries.
-func itemKey(r types.WriteRequest) string {
-	return r.PutRequest.Item["PK"].(*types.AttributeValueMemberS).Value
-}
-
-// TestWriteBatchResendsTheItemsTheTableRejected verifies the items resent after a
-// partial acceptance are the ones the table actually rejected.
-//
-// DynamoDB hands back a subset of the write in no particular order, and it overlaps
-// whatever the writer held back for want of capacity. Resending the wrong subset writes
-// some items twice and never writes the others, and nothing reports it: the restore
-// finishes clean with items missing from the table.
-func TestWriteBatchResendsTheItemsTheTableRejected(t *testing.T) {
-	const items = 10
-	client := &pickyClient{}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{},
-		WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
-
-	if err := w.WriteBatch(context.Background(), putOps(items)); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
-	}
-
-	client.mu.Lock()
-	defer client.mu.Unlock()
-	seen := make(map[string]int, items)
-	for _, key := range client.accepted {
-		seen[key]++
-	}
-	for _, op := range putOps(items) {
-		key := op.NewImage["PK"].(*types.AttributeValueMemberS).Value
-		if seen[key] != 1 {
-			t.Errorf("item %s was written %d times, want once", key, seen[key])
-		}
-	}
-}
-
-// TestWriteBatchFillsARequestToTheCapacityAvailable verifies a request carries as many
+// TestSubmitFillsARequestToTheCapacityAvailable verifies a request carries as many
 // items as the capacity on hand pays for. The per-item cost is what converts a rate
 // into a request size, so an estimate that drifts high sends needlessly small requests
 // and one that drifts low sends ones the table refuses.
-func TestWriteBatchFillsARequestToTheCapacityAvailable(t *testing.T) {
+func TestSubmitFillsARequestToTheCapacityAvailable(t *testing.T) {
 	clock := newTestClock()
 	client := &capacityClient{limit: 25}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{},
+	w := NewDynamoDBWriter(client, "test-table", Callbacks{},
 		WithBackoff(&instantBackoff{}), withPaceClock(clock))
 
 	// The table is being held to ten units a second, with a second's worth banked, and
@@ -525,8 +432,8 @@ func TestWriteBatchFillsARequestToTheCapacityAvailable(t *testing.T) {
 	w.pacer.setRateLocked(clock.Now(), 10)
 	clock.advance(time.Second)
 
-	if err := w.WriteBatch(context.Background(), putOps(10)); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
+	if err := writeAndWait(context.Background(), w, putOps(10)); err != nil {
+		t.Fatalf("Submit failed: %v", err)
 	}
 
 	if sizes := client.requestSizes(); len(sizes) != 1 || sizes[0] != 10 {
@@ -534,17 +441,17 @@ func TestWriteBatchFillsARequestToTheCapacityAvailable(t *testing.T) {
 	}
 }
 
-// TestWriteBatchAsksWhatEachWriteConsumed verifies every write asks the table what it
+// TestSubmitAsksWhatEachWriteConsumed verifies every write asks the table what it
 // cost. Without it the restore paces on its own estimate of item sizes for the whole
 // run, and an export whose lines are a poor guide to the items would be held at a rate
 // that has nothing to do with the table.
-func TestWriteBatchAsksWhatEachWriteConsumed(t *testing.T) {
+func TestSubmitAsksWhatEachWriteConsumed(t *testing.T) {
 	client := &capacityClient{limit: 25}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{},
+	w := NewDynamoDBWriter(client, "test-table", Callbacks{},
 		WithBackoff(&instantBackoff{}), withPaceClock(newTestClock()))
 
-	if err := w.WriteBatch(context.Background(), putOps(30)); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
+	if err := writeAndWait(context.Background(), w, putOps(25)); err != nil {
+		t.Fatalf("Submit failed: %v", err)
 	}
 
 	client.mu.Lock()
@@ -554,22 +461,22 @@ func TestWriteBatchAsksWhatEachWriteConsumed(t *testing.T) {
 	}
 }
 
-// TestWriteBatchClimbsBackWhileTheTableKeepsUp verifies a restore held to a rate raises
+// TestSubmitClimbsBackWhileTheTableKeepsUp verifies a restore held to a rate raises
 // it again while the table accepts everything at that rate. A rate that only ever fell
 // would hold a restore at the worst moment the table ever had, and capacity added
 // during a long restore, by autoscaling or a partition split, would go unused.
-func TestWriteBatchClimbsBackWhileTheTableKeepsUp(t *testing.T) {
+func TestSubmitClimbsBackWhileTheTableKeepsUp(t *testing.T) {
 	clock := newTestClock()
 	client := &capacityClient{limit: 25}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{},
+	w := NewDynamoDBWriter(client, "test-table", Callbacks{},
 		WithBackoff(&instantBackoff{}), withPaceClock(clock))
 	w.pacer.setRateLocked(clock.Now(), 10)
 
 	// Four seconds of writing the whole allowance, none of it refused.
 	for i := 0; i < 4; i++ {
 		clock.advance(time.Second)
-		if err := w.WriteBatch(context.Background(), putOps(10)); err != nil {
-			t.Fatalf("WriteBatch failed: %v", err)
+		if err := writeAndWait(context.Background(), w, putOps(10)); err != nil {
+			t.Fatalf("Submit failed: %v", err)
 		}
 	}
 
@@ -609,23 +516,23 @@ func TestWallClockSleepWaitsAndHonoursCancellation(t *testing.T) {
 	}
 }
 
-// TestWriteBatchChargesTheCapacityTheTableReported verifies the capacity a response
+// TestSubmitChargesTheCapacityTheTableReported verifies the capacity a response
 // reports is what the restore is charged, not what it guessed.
 //
 // The export line an item was decoded from is only a guide to what DynamoDB will
 // measure. A restore that kept spending against its own guess would drift away from the
 // rate the table actually granted and sit in a permanent refusal.
-func TestWriteBatchChargesTheCapacityTheTableReported(t *testing.T) {
+func TestSubmitChargesTheCapacityTheTableReported(t *testing.T) {
 	clock := newTestClock()
 	// Each item is estimated at one unit but costs four.
 	client := &capacityClient{limit: 25, charge: 4}
-	w := NewDynamoDBWriter(client, "test-table", 25, Callbacks{},
+	w := NewDynamoDBWriter(client, "test-table", Callbacks{},
 		WithBackoff(&instantBackoff{}), withPaceClock(clock))
 	w.pacer.setRateLocked(clock.Now(), 10)
 	clock.advance(time.Second)
 
-	if err := w.WriteBatch(context.Background(), putOps(10)); err != nil {
-		t.Fatalf("WriteBatch failed: %v", err)
+	if err := writeAndWait(context.Background(), w, putOps(10)); err != nil {
+		t.Fatalf("Submit failed: %v", err)
 	}
 
 	// Ten units were banked and forty were charged, so the next request waits for the
@@ -644,7 +551,7 @@ func TestPacerDropsBankedCapacityWhenTheRateFalls(t *testing.T) {
 	clock := newTestClock()
 	p := newTestPacer(clock)
 	p.setRateLocked(clock.Now(), 100)
-	p.achieved = 100
+	p.take(1, 1)               // Opens a window.
 	clock.advance(time.Second) // A hundred units accrue.
 
 	// One small request, so most of the hundred stays banked.
@@ -652,11 +559,12 @@ func TestPacerDropsBankedCapacityWhenTheRateFalls(t *testing.T) {
 		t.Fatalf("expected the request granted from the banked capacity, got %d", n)
 	}
 
-	p.throttled() // Which halves the rate to fifty.
+	p.refused(10) // Which cuts the rate to seventy when the window closes.
+	clock.advance(paceWindow)
 
 	n, _ := p.take(1, 100)
-	if n > 50 {
-		t.Errorf("expected the next request held to the new rate of 50, got %d", n)
+	if n > 70 {
+		t.Errorf("expected the next request held to the new rate of 70, got %d", n)
 	}
 }
 
@@ -687,18 +595,345 @@ func TestPacerSizesTheRequestByWhatEachItemCosts(t *testing.T) {
 func TestPacerMeasuresTheRateOverTheWindowsLength(t *testing.T) {
 	clock := newTestClock()
 	p := newTestPacer(clock)
-	p.setRateLocked(clock.Now(), 10)
-	clock.advance(time.Second)
-
-	p.take(1, 1)    // Opens a window.
-	p.settle(1, 20) // Twenty units go through it...
+	p.take(1, 1)         // Opens a window.
+	p.settle(40, 20, 20) // Half of forty units go through it...
 	clock.advance(4 * time.Second)
-	p.take(1, 1) // ...over four seconds, so five a second.
-
-	p.throttled()
+	p.take(1, 1) // ...over four seconds: ten a second sent, five taken.
 
 	rate, _ := p.current()
-	if rate != 2.5 {
-		t.Errorf("expected the rate cut to half of the 5/s observed, got %v", rate)
+	if !near(rate, 7) {
+		t.Errorf("expected the rate cut to seven tenths of the 10/s sent, got %v", rate)
+	}
+}
+
+// TestPacerLeavesANarrowHandBackAlone verifies a window in which the table handed back
+// a hot partition's share of the writes leaves the rate alone. Batches mix items from
+// every file being read, so one hot partition hands back a few items out of many; cutting
+// the whole table's rate over it would slow every cold partition to the hot one's pace.
+func TestPacerLeavesANarrowHandBackAlone(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+
+	p.take(1, 25) // Opens a window.
+	p.settle(1000, 985, 15)
+	clock.advance(paceWindow)
+	p.take(1, 25) // Closes it.
+
+	if rate, paced := p.current(); paced {
+		t.Errorf("expected 1.5%% handed back to leave writes unlimited, got a rate of %v", rate)
+	}
+}
+
+// TestPacerHoldsToWhatTheTableAcceptedWhenPartIsHandedBack verifies a window that had a
+// tenth of its writes handed back sets the rate to what the table accepted, rather than
+// halving it. The table took nine tenths of what was sent, and holding to that loses
+// nothing it would have taken.
+func TestPacerHoldsToWhatTheTableAcceptedWhenPartIsHandedBack(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+
+	p.take(1, 25)
+	p.settle(100, 90, 10)
+	clock.advance(paceWindow)
+	p.take(1, 25)
+
+	if rate, _ := p.current(); !near(rate, 90) {
+		t.Errorf("expected the rate held to the 90/s the table accepted, got %v", rate)
+	}
+}
+
+// TestPacerCutsAHeavyHandBackByNoMoreThanARefusal verifies a window in which most writes
+// were handed back cuts the rate by no more than a refusal would. A burst that meets a
+// table mid-split can have most of one window handed back, and dropping the rate to what
+// that window accepted would throw away capacity the next window has again.
+func TestPacerCutsAHeavyHandBackByNoMoreThanARefusal(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+
+	p.take(1, 25)
+	p.settle(100, 20, 80)
+	clock.advance(paceWindow)
+	p.take(1, 25)
+
+	if rate, _ := p.current(); !near(rate, 70) {
+		t.Errorf("expected the rate cut to seven tenths of the 100/s sent, got %v", rate)
+	}
+}
+
+// FuzzPacerPartialCutIsBounded checks, for any share handed back, that a window's cut
+// keeps at least paceBackoff of what was being sent and never raises the rate above it,
+// and that a share within partialFloor cuts nothing at all.
+func FuzzPacerPartialCutIsBounded(f *testing.F) {
+	f.Add(1000.0, 0.01)
+	f.Add(1000.0, 0.1)
+	f.Add(40.0, 0.9)
+	f.Fuzz(func(t *testing.T, sent, share float64) {
+		if !(sent >= 1 && sent <= 1e7) || !(share >= 0 && share < 1) {
+			t.Skip()
+		}
+		clock := newTestClock()
+		p := newTestPacer(clock)
+		p.take(1, 25)
+		p.settle(sent, sent*(1-share), sent*share)
+		clock.advance(paceWindow)
+		p.take(1, 25)
+
+		rate, paced := p.current()
+		// Judged the way the pacer judges it, on units, so rounding cannot split the two.
+		if sent*share <= partialFloor*sent {
+			if paced {
+				t.Fatalf("share %v within the floor cut the rate to %v", share, rate)
+			}
+			return
+		}
+		if rate < paceBackoff*sent*(1-1e-9) || rate > sent*(1+1e-9) {
+			t.Fatalf("share %v of %v/s cut the rate to %v, outside [%v, %v]", share, sent, rate, paceBackoff*sent, sent)
+		}
+	})
+}
+
+// TestPacerRecoversToWhereItWasCutFromWithinTheRecoveryTime verifies a restore cut by a
+// refusal is back at the rate it was cut from after recoverySeconds of writing at its
+// allowance. A cut is a response to a moment's pressure; staying below the table's
+// capacity long after it has passed is throughput thrown away.
+func TestPacerRecoversToWhereItWasCutFromWithinTheRecoveryTime(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 100)
+	refuseWindow(p, clock) // 100 -> 70, aiming back at 100.
+
+	for range int(recoverySeconds) + 1 {
+		saturateWindow(p, clock)
+	}
+
+	if rate, _ := p.current(); rate < 99 || rate > 101 {
+		t.Errorf("expected the rate back at the 100/s it was cut from, got %v", rate)
+	}
+}
+
+// TestPacerHoldsItsRecoveryWhileTheRestoreCannotKeepUp verifies time spent below the
+// allowance does not count towards recovery. A restore held back by its readers has not
+// shown the table takes more, and a recovery that ran on the clock regardless would
+// arrive at the old peak on credit the table never granted.
+func TestPacerHoldsItsRecoveryWhileTheRestoreCannotKeepUp(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 100)
+	refuseWindow(p, clock) // 100 -> 70, aiming back at 100.
+
+	for range 10 {
+		clock.advance(paceWindow)
+		p.take(1, 1)
+		p.settle(1, 1, 0)
+	}
+	saturateWindow(p, clock)
+	saturateWindow(p, clock)
+
+	// One saturated window since the cut is one step along the curve, not ten.
+	if rate, _ := p.current(); rate > 90 {
+		t.Errorf("expected recovery to have advanced one window, got a rate of %v", rate)
+	}
+}
+
+// saturateWindow spends a second writing everything the pacer allows, with the table
+// accepting all of it, and closes the previous window on the way in.
+func saturateWindow(p *pacer, clock *testClock) {
+	clock.advance(paceWindow)
+	n, _ := p.take(1, 1<<30)
+	p.settle(float64(n), float64(n), 0)
+}
+
+// near reports whether two rates agree to within rounding.
+func near(got, want float64) bool {
+	return math.Abs(got-want) < 1e-6*math.Max(1, math.Abs(want))
+}
+
+// refuseWindow spends one window with the table refusing every call, and closes it.
+func refuseWindow(p *pacer, clock *testClock) {
+	p.take(1, 1)
+	p.refused(10)
+	clock.advance(paceWindow)
+	p.take(1, 1)
+}
+
+// TestPacerFollowsTheRecoveryCurveBetweenCutAndPeak verifies the first saturated window
+// after a cut climbs most of the way back quickly, along the curve, rather than creeping
+// by a fixed step or jumping straight back to where the table last refused.
+func TestPacerFollowsTheRecoveryCurveBetweenCutAndPeak(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 100)
+	refuseWindow(p, clock) // 100 -> 70, aiming back at 100.
+
+	saturateWindow(p, clock)
+	saturateWindow(p, clock) // Closes the first saturated window.
+
+	// One window along a curve that reaches 100 after recoverySeconds: 100 - 0.3·100·(1-4)³/4³.
+	if rate, _ := p.current(); !near(rate, 100-30*27.0/64) {
+		t.Errorf("rate after one saturated window = %v, want %v", rate, 100-30*27.0/64)
+	}
+}
+
+// TestPacerGrowsARateItWasNeverCutToByAQuarter verifies a rate set without a cut, and so
+// with no peak to aim for, still grows while the table keeps up.
+func TestPacerGrowsARateItWasNeverCutToByAQuarter(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 100)
+
+	saturateWindow(p, clock)
+	saturateWindow(p, clock)
+	if rate, _ := p.current(); !near(rate, 125) {
+		t.Errorf("rate = %v, want 125", rate)
+	}
+}
+
+// TestPacerDoesNotRaiseTheRateInAWindowWithRefusals verifies a window in which the table
+// refused a call, beyond a hot partition's share, is cut rather than counted towards
+// climbing back, however much of its allowance it used. The refusal is what that window
+// showed about the table.
+func TestPacerDoesNotRaiseTheRateInAWindowWithRefusals(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 100)
+	p.take(1, 1) // Opens a window.
+	p.refused(10)
+	p.settle(100, 100, 0)
+	clock.advance(paceWindow)
+	p.take(1, 1) // Closes it.
+
+	if rate, _ := p.current(); !near(rate, 100*100.0/110) {
+		t.Errorf("rate = %v after a window with a tenth refused, want %v", rate, 100*100.0/110)
+	}
+}
+
+// TestPacerJudgesSaturationOverTheWindowsLength verifies a window longer than a second is
+// judged saturated by what it used per second. Judged by its total, a quiet stretch
+// between writes would read as a table keeping up and raise the rate on no evidence.
+func TestPacerJudgesSaturationOverTheWindowsLength(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 10)
+	p.take(1, 1)
+	p.settle(10, 10, 0) // Ten units over two seconds: half the allowance.
+	clock.advance(2 * paceWindow)
+	p.take(1, 1)
+
+	if rate, _ := p.current(); rate != 10 {
+		t.Errorf("rate = %v after a half-used window, want 10", rate)
+	}
+}
+
+// TestPacerNeverRaisesTheRateOnAHandBack verifies a window with items handed back never
+// ends with a higher rate than it started with, even when the table took more than the
+// restore was held to. Items handed back are the table saying less, not more.
+func TestPacerNeverRaisesTheRateOnAHandBack(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 50)
+	p.take(1, 1)
+	p.settle(100, 90, 10)
+	clock.advance(paceWindow)
+	p.take(1, 1)
+
+	if rate, _ := p.current(); rate > 50 {
+		t.Errorf("rate = %v after a hand-back, above the 50 it was held to", rate)
+	}
+}
+
+// TestPacerLeavesAHandBackAtTheFloorAlone verifies a share handed back exactly at the
+// floor is still taken for one hot partition.
+func TestPacerLeavesAHandBackAtTheFloorAlone(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.take(1, 1)
+	p.settle(100, 98, 100*partialFloor)
+	clock.advance(paceWindow)
+	p.take(1, 1)
+
+	if _, paced := p.current(); paced {
+		t.Error("a hand-back at the floor limited writes")
+	}
+}
+
+// TestPacerMeasuresAHandBackWithoutReportedCapacity verifies a table that does not report
+// what it consumed is still held to what it accepted, counted from what was sent less
+// what came back. Counting what came back as accepted would pace the restore above the
+// table.
+func TestPacerMeasuresAHandBackWithoutReportedCapacity(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.take(1, 1)
+	p.settle(100, 0, 10)
+	clock.advance(paceWindow)
+	p.take(1, 1)
+
+	if rate, _ := p.current(); !near(rate, 90) {
+		t.Errorf("rate = %v, want the 90 the table accepted", rate)
+	}
+}
+
+// TestPacerReportsEachChangeOnce verifies the rate reaches the callback once per change,
+// whether the change came from a refusal or from a window closing, so the progress line
+// shows the rate settle rather than flicker, and shows it at all when a window changed it.
+func TestPacerReportsEachChangeOnce(t *testing.T) {
+	clock := newTestClock()
+	var reported []float64
+	p := newTestPacer(clock)
+	p.onPace = func(rate float64) { reported = append(reported, rate) }
+
+	p.admit(context.Background(), 1, 1) // Opens a window.
+	p.settle(100, 90, 10)
+	clock.advance(paceWindow)
+	p.admit(context.Background(), 1, 1) // Closes it: held to 90.
+	p.admit(context.Background(), 1, 1) // No change.
+
+	if len(reported) != 1 || !near(reported[0], 90) {
+		t.Errorf("reported %v, want [90]", reported)
+	}
+}
+
+// TestPacerHoldsNoMoreThanASecondsWorth verifies capacity does not bank up while nothing
+// is written. A restore that paused for a minute would otherwise send a minute's worth at
+// once into a table that takes a second's.
+func TestPacerHoldsNoMoreThanASecondsWorth(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 10)
+	clock.advance(time.Minute)
+
+	if n, _ := p.take(1, 1000); n != 10 {
+		t.Errorf("took %d after a minute idle at 10/s, want 10", n)
+	}
+}
+
+// TestPacerWaitsInProportionToTheRate verifies the wait for capacity is the shortfall
+// divided by the rate, so a faster table means a shorter wait.
+func TestPacerWaitsInProportionToTheRate(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.setRateLocked(clock.Now(), 4)
+	p.tokens = -3
+
+	if _, wait := p.take(1, 1); wait != time.Second {
+		t.Errorf("wait = %s for four units at 4/s, want 1s", wait)
+	}
+}
+
+// TestPacerCutsInTheUnitsTheTableCharges verifies a window with items handed back holds
+// the rate to what the table accepted in the units the table charged, when those differ
+// from the restore's estimate. The bucket is charged in the table's units, so a rate set
+// in the estimate's would let through twice what the table took, or half.
+func TestPacerCutsInTheUnitsTheTableCharges(t *testing.T) {
+	clock := newTestClock()
+	p := newTestPacer(clock)
+	p.take(1, 1)
+	// Estimated at 100 units, a tenth handed back, and the ninety taken charged at 45.
+	p.settle(100, 45, 10)
+	clock.advance(paceWindow)
+	p.take(1, 1)
+
+	if rate, _ := p.current(); !near(rate, 45) {
+		t.Errorf("rate = %v, want the 45/s the table charged for what it took", rate)
 	}
 }

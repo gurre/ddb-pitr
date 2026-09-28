@@ -1,6 +1,6 @@
 module github.com/gurre/ddb-pitr
 
-go 1.24.2
+go 1.25
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.36.4
